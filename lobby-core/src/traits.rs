@@ -3,8 +3,8 @@ use std::collections::HashMap;
 
 use crate::error::Result;
 use crate::types::{
-    MatchDifficulty, MatchInfo, MatchReport, MatchStatus, OpenSkillRating, PlayerInfo, QueueEntry,
-    SteamId,
+    MatchDifficulty, MatchInfo, MatchReport, MatchStatus, OpenSkillRating, PlayerInfo,
+    PlayerState, QueueEntry, SteamId,
 };
 
 /// Game-specific callbacks. Implement for your game type.
@@ -65,6 +65,8 @@ pub trait PlayerStore: Send + Sync {
         mode: &str,
         rating: &OpenSkillRating,
     ) -> Result<()>;
+    async fn set_player_state(&self, steam_id: SteamId, state: PlayerState) -> Result<()>;
+    async fn update_heartbeat(&self, steam_id: SteamId) -> Result<()>;
 }
 
 #[async_trait]
@@ -85,6 +87,8 @@ pub trait MatchStore: Send + Sync {
     ) -> Result<()>;
     /// Record the first player's acceptance timestamp.
     async fn mark_accepted(&self, token: &str) -> Result<()>;
+    /// Record the first player's P2P connection timestamp.
+    async fn mark_started(&self, token: &str) -> Result<()>;
 }
 
 #[async_trait]
@@ -101,6 +105,12 @@ pub trait QueueStore: Send + Sync {
 #[async_trait]
 pub trait RatingStore: Send + Sync {
     async fn get_rating(&self, steam_id: SteamId, mode: &str) -> Result<OpenSkillRating>;
+    async fn update_rating(
+        &self,
+        steam_id: SteamId,
+        mode: &str,
+        rating: &OpenSkillRating,
+    ) -> Result<()>;
 }
 
 #[async_trait]

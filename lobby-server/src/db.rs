@@ -156,6 +156,32 @@ impl PlayerStore for PostgresStore {
         .map_err(map_db_error)?;
         Ok(())
     }
+
+    async fn set_player_state(&self, steam_id: SteamId, state: PlayerState) -> Result<()> {
+        let state_str = match state {
+            PlayerState::InMenus => "InMenus",
+            PlayerState::Queueing => "Queueing",
+            PlayerState::MatchAccepted => "MatchAccepted",
+            PlayerState::InMatch => "InMatch",
+            PlayerState::Reporting => "Reporting",
+        };
+        sqlx::query("UPDATE player_state SET state = $1 WHERE steam_id = $2")
+            .bind(state_str)
+            .bind(steam_id as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(map_db_error)?;
+        Ok(())
+    }
+
+    async fn update_heartbeat(&self, steam_id: SteamId) -> Result<()> {
+        sqlx::query("UPDATE player_state SET last_heartbeat = NOW() WHERE steam_id = $1")
+            .bind(steam_id as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(map_db_error)?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -311,6 +337,15 @@ impl MatchStore for PostgresStore {
             .map_err(map_db_error)?;
         Ok(())
     }
+
+    async fn mark_started(&self, token: &str) -> Result<()> {
+        sqlx::query("UPDATE matches SET started_at = NOW() WHERE match_token = $1")
+            .bind(token)
+            .execute(&self.pool)
+            .await
+            .map_err(map_db_error)?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -378,5 +413,22 @@ impl QueueStore for PostgresStore {
 impl RatingStore for PostgresStore {
     async fn get_rating(&self, steam_id: SteamId, mode: &str) -> Result<OpenSkillRating> {
         <Self as PlayerStore>::get_rating(self, steam_id, mode).await
+    }
+
+    async fn update_rating(&self, steam_id: SteamId, mode: &str, rating: &OpenSkillRating) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO ratings (steam_id, game_mode, mu, sigma, last_updated) \
+             VALUES ($1, $2, $3, $4, NOW()) \
+             ON CONFLICT (steam_id, game_mode) DO UPDATE SET \
+               mu = EXCLUDED.mu, sigma = EXCLUDED.sigma, last_updated = EXCLUDED.last_updated"
+        )
+        .bind(steam_id as i64)
+        .bind(mode)
+        .bind(rating.mu)
+        .bind(rating.sigma)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_error)?;
+        Ok(())
     }
 }

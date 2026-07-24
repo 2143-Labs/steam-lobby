@@ -115,43 +115,61 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
         .enter_menus(steam_id, &state.store)
         .await;
 
-    // Message loop
+    // Spawn outbound message forwarder — takes ownership of sender
+    let mut outbound_task = tokio::spawn(async move {
+        while let Some(server_msg) = rx.recv().await {
+            let json = serde_json::to_string(&server_msg).unwrap();
+            if sender.send(Message::Text(json.into())).await.is_err() {
+                break; // Socket closed
+            }
+        }
+    });
+
+    // Message loop — select between client messages and outbound task
     loop {
-        let msg = timeout(Duration::from_secs(60), receiver.next()).await;
-        match msg {
-            Ok(Some(Ok(Message::Text(text)))) => {
-                let cm: ClientMessage = match serde_json::from_str(&text) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        let _ = tx.send(ServerMessage::Error {
-                            code: "invalid_message".into(),
-                            message: "Could not parse message".into(),
-                        });
-                        continue;
+        tokio::select! {
+            msg = timeout(Duration::from_secs(60), receiver.next()) => {
+                match msg {
+                    Ok(Some(Ok(Message::Text(text)))) => {
+                        let cm: ClientMessage = match serde_json::from_str(&text) {
+                            Ok(m) => m,
+                            Err(_) => {
+                                let _ = tx.send(ServerMessage::Error {
+                                    code: "invalid_message".into(),
+                                    message: "Could not parse message".into(),
+                                });
+                                continue;
+                            }
+                        };
+                        handle_client_message(
+                            cm,
+                            steam_id,
+                            &state,
+                            &tx,
+                        )
+                        .await;
                     }
-                };
-                handle_client_message(
-                    cm,
-                    steam_id,
-                    &state,
-                    &mut sender,
-                    &tx,
-                    &display_name,
-                )
-                .await;
+                    Ok(Some(Ok(Message::Close(_)))) | Err(_) => {
+                        // Disconnect or timeout
+                        break;
+                    }
+                    _ => {
+                        // Ping/pong or other — ignore
+                    }
+                }
             }
-            Ok(Some(Ok(Message::Close(_)))) | Err(_) => {
-                // Disconnect
-                let _ = state.player_manager.handle_disconnect(steam_id, &state.store).await;
-                let mut connections = state.connections.lock().await;
-                connections.remove(&steam_id);
+            _ = &mut outbound_task => {
+                // Outbound task died (socket closed, send-side error)
                 break;
-            }
-            _ => {
-                // Ping/pong or other — ignore
             }
         }
     }
+
+    // Cleanup
+    let _ = state.player_manager.handle_disconnect(steam_id, &state.store).await;
+    let mut connections = state.connections.lock().await;
+    connections.remove(&steam_id);
+    outbound_task.abort();
 }
 
 async fn authenticate(
@@ -221,9 +239,7 @@ async fn handle_client_message(
     cm: ClientMessage,
     steam_id: SteamId,
     state: &Arc<AppState>,
-    sender: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
     tx: &mpsc::UnboundedSender<ServerMessage>,
-    _display_name: &str,
 ) {
     match cm {
         ClientMessage::BeginMatchmaking { mode, difficulty } => {

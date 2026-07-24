@@ -63,6 +63,18 @@ impl PlayerStore for MockStore {
         self.ratings.lock().insert((steam_id, mode.to_string()), rating.clone());
         Ok(())
     }
+
+    async fn set_player_state(&self, steam_id: SteamId, state: PlayerState) -> Result<()> {
+        let mut p = self.players.lock();
+        if let Some(info) = p.get_mut(&steam_id) { info.state = state; }
+        Ok(())
+    }
+
+    async fn update_heartbeat(&self, steam_id: SteamId) -> Result<()> {
+        let mut p = self.players.lock();
+        if let Some(info) = p.get_mut(&steam_id) { info.last_heartbeat = Utc::now(); }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -110,6 +122,12 @@ impl MatchStore for MockStore {
         if let Some(mi) = m.get_mut(token) { mi.accepted_at = Some(Utc::now()); }
         Ok(())
     }
+
+    async fn mark_started(&self, token: &str) -> Result<()> {
+        let mut m = self.matches.lock();
+        if let Some(mi) = m.get_mut(token) { mi.started_at = Some(Utc::now()); }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -135,6 +153,11 @@ impl QueueStore for MockStore {
 impl RatingStore for MockStore {
     async fn get_rating(&self, steam_id: SteamId, mode: &str) -> Result<OpenSkillRating> {
         <Self as PlayerStore>::get_rating(self, steam_id, mode).await
+    }
+
+    async fn update_rating(&self, steam_id: SteamId, mode: &str, rating: &OpenSkillRating) -> Result<()> {
+        self.ratings.lock().insert((steam_id, mode.to_string()), rating.clone());
+        Ok(())
     }
 }
 
@@ -173,9 +196,13 @@ async fn full_match_lifecycle() {
     mgr.accept_match(&m.match_token, 100, &store).await.unwrap();
     mgr.accept_match(&m.match_token, 200, &store).await.unwrap();
 
-    // Transition directly to Reporting for testing
-    store.matches.lock().get_mut(&m.match_token).unwrap().status = MatchStatus::Reporting;
-    store.matches.lock().get_mut(&m.match_token).unwrap().started_at = Some(Utc::now());
+    // Connect both players via P2P — real two-phase flow
+    mgr.mark_connected(&m.match_token, 100, &store).await.unwrap();
+    mgr.mark_connected(&m.match_token, 200, &store).await.unwrap();
+
+    // Verify match transitioned to Reporting
+    let updated = store.get_match(&m.match_token).await.unwrap().unwrap();
+    assert_eq!(updated.status, MatchStatus::Reporting);
 
     // First report — Alice says she won
     let first = mgr.submit_report(MatchReport {

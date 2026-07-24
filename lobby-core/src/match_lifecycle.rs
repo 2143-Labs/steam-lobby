@@ -43,8 +43,12 @@ impl<CB: GameCallbacks> MatchManager<CB> {
             return Err(LobbyError::NotParticipant(token.to_string()));
         }
         if m.started_at.is_some() {
+            // Second player — both connected, transition to Reporting
             match_store.update_match_status(token, MatchStatus::Reporting).await?;
             self.callbacks.on_players_connected(&m).await?;
+        } else {
+            // First player — mark timestamp
+            match_store.mark_started(token).await?;
         }
         Ok(())
     }
@@ -75,6 +79,8 @@ impl<CB: GameCallbacks> MatchManager<CB> {
             let rating_b = rating_store.get_rating(m.player_b, &m.game_mode).await?;
             let sk = if winner_a == Some(m.player_a) { Outcomes::WIN } else if winner_a == Some(m.player_b) { Outcomes::LOSS } else { Outcomes::DRAW };
             let (new_a, new_b) = mmr::update_ratings(&rating_a, &rating_b, sk);
+            rating_store.update_rating(m.player_a, &m.game_mode, &new_a).await?;
+            rating_store.update_rating(m.player_b, &m.game_mode, &new_b).await?;
             let mu_change_a = new_a.mu - rating_a.mu;
             match_store.update_match(token, MatchStatus::Resolved, Utc::now()).await?;
             let outcome = if winner_a == Some(m.player_a) {
@@ -98,6 +104,8 @@ impl<CB: GameCallbacks> MatchManager<CB> {
             let rating_b = rating_store.get_rating(m.player_b, &m.game_mode).await?;
             let sk = if winner_a == Some(m.player_a) { Outcomes::WIN } else if winner_a == Some(m.player_b) { Outcomes::LOSS } else { Outcomes::DRAW };
             let (new_a, new_b) = mmr::update_ratings(&rating_a, &rating_b, sk);
+            rating_store.update_rating(m.player_a, &m.game_mode, &new_a).await?;
+            rating_store.update_rating(m.player_b, &m.game_mode, &new_b).await?;
             let mu_change_a = new_a.mu - rating_a.mu;
             match_store.update_match(token, MatchStatus::Resolved, Utc::now()).await?;
             let outcome = if winner_a == Some(m.player_a) {

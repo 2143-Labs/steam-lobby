@@ -56,19 +56,6 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         }
     }
 
-    async fn set_state(
-        &self,
-        steam_id: SteamId,
-        target: PlayerState,
-        player_store: &dyn PlayerStore,
-    ) -> Result<()> {
-        let current = player_store.get_player_state(steam_id).await?;
-        let current_state = current.as_ref().map(|p| p.state);
-        self.check_transition(current_state, target)?;
-        player_store.upsert_player(steam_id, "").await?;
-        // state stored externally; the store handles it
-        Ok(())
-    }
 
     pub async fn enter_menus(
         &self,
@@ -79,6 +66,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         if current.is_none() {
             // First login — create with InMenus.
             player_store.upsert_player(steam_id, "").await?;
+            player_store.set_player_state(steam_id, PlayerState::InMenus).await?;
         }
         self.callbacks.on_player_in_menu(steam_id).await?;
         Ok(())
@@ -104,6 +92,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         self.callbacks
             .on_player_queueing(steam_id, "ranked_1v1", difficulty)
             .await?;
+        player_store.set_player_state(steam_id, PlayerState::Queueing).await?;
         Ok(())
     }
 
@@ -124,6 +113,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
             });
         }
         self.callbacks.on_player_cancel_queue(steam_id).await?;
+        player_store.set_player_state(steam_id, PlayerState::InMenus).await?;
         Ok(())
     }
 
@@ -143,6 +133,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
                 to: PlayerState::MatchAccepted,
             });
         }
+        player_store.set_player_state(steam_id, PlayerState::MatchAccepted).await?;
         Ok(())
     }
 
@@ -162,6 +153,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
                 to: PlayerState::InMatch,
             });
         }
+        player_store.set_player_state(steam_id, PlayerState::InMatch).await?;
         Ok(())
     }
 
@@ -181,6 +173,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
                 to: PlayerState::Reporting,
             });
         }
+        player_store.set_player_state(steam_id, PlayerState::Reporting).await?;
         Ok(())
     }
 
@@ -200,6 +193,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
                 to: PlayerState::InMenus,
             });
         }
+        player_store.set_player_state(steam_id, PlayerState::InMenus).await?;
         Ok(())
     }
 
@@ -209,6 +203,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         player_store: &dyn PlayerStore,
     ) -> Result<()> {
         self.callbacks.on_heartbeat(steam_id).await?;
+        player_store.update_heartbeat(steam_id).await?;
         Ok(())
     }
 
@@ -218,6 +213,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         player_store: &dyn PlayerStore,
     ) -> Result<()> {
         self.callbacks.on_player_disconnected(steam_id).await?;
+        player_store.set_player_state(steam_id, PlayerState::InMenus).await?;
         Ok(())
     }
 }
