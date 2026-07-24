@@ -1,0 +1,223 @@
+use async_trait::async_trait;
+use chrono::Utc;
+use std::collections::HashMap;
+
+use crate::error::{LobbyError, Result};
+use crate::traits::{GameCallbacks, PlayerStore};
+use crate::types::{MatchDifficulty, PlayerInfo, PlayerState, SteamId};
+
+/// Valid state transitions.
+fn valid_transitions() -> HashMap<PlayerState, Vec<PlayerState>> {
+    use PlayerState::*;
+    HashMap::from([
+        (InMenus, vec![Queueing]),
+        (Queueing, vec![InMenus, MatchAccepted]),
+        (MatchAccepted, vec![InMatch]),
+        (InMatch, vec![Reporting]),
+        (Reporting, vec![InMenus]),
+    ])
+}
+
+pub struct PlayerManager<CB: GameCallbacks> {
+    callbacks: CB,
+}
+
+impl<CB: GameCallbacks> PlayerManager<CB> {
+    pub fn new(callbacks: CB) -> Self {
+        Self { callbacks }
+    }
+
+    fn check_transition(
+        &self,
+        current: Option<PlayerState>,
+        target: PlayerState,
+    ) -> Result<PlayerState> {
+        let current = match current {
+            Some(s) => s,
+            None => {
+                // No current state — only allowed if target is InMenus (first login).
+                if target != PlayerState::InMenus {
+                    return Err(LobbyError::PlayerNotFound(0)); // caller fills in steam_id
+                }
+                return Ok(target);
+            }
+        };
+        let allowed = valid_transitions()
+            .get(&current)
+            .cloned()
+            .unwrap_or_default();
+        if allowed.contains(&target) {
+            Ok(target)
+        } else {
+            Err(LobbyError::InvalidStateTransition {
+                from: current,
+                to: target,
+            })
+        }
+    }
+
+    async fn set_state(
+        &self,
+        steam_id: SteamId,
+        target: PlayerState,
+        player_store: &dyn PlayerStore,
+    ) -> Result<()> {
+        let current = player_store.get_player_state(steam_id).await?;
+        let current_state = current.as_ref().map(|p| p.state);
+        self.check_transition(current_state, target)?;
+        player_store.upsert_player(steam_id, "").await?;
+        // state stored externally; the store handles it
+        Ok(())
+    }
+
+    pub async fn enter_menus(
+        &self,
+        steam_id: SteamId,
+        player_store: &dyn PlayerStore,
+    ) -> Result<()> {
+        let current = player_store.get_player_state(steam_id).await?;
+        if current.is_none() {
+            // First login — create with InMenus.
+            player_store.upsert_player(steam_id, "").await?;
+        }
+        self.callbacks.on_player_in_menu(steam_id).await?;
+        Ok(())
+    }
+
+    pub async fn begin_matchmaking(
+        &self,
+        steam_id: SteamId,
+        difficulty: MatchDifficulty,
+        player_store: &dyn PlayerStore,
+    ) -> Result<()> {
+        let current = player_store.get_player_state(steam_id).await?;
+        let current_state = current
+            .as_ref()
+            .map(|p| p.state)
+            .unwrap_or(PlayerState::InMenus);
+        if current_state != PlayerState::InMenus {
+            return Err(LobbyError::InvalidStateTransition {
+                from: current_state,
+                to: PlayerState::Queueing,
+            });
+        }
+        self.callbacks
+            .on_player_queueing(steam_id, "ranked_1v1", difficulty)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn cancel_matchmaking(
+        &self,
+        steam_id: SteamId,
+        player_store: &dyn PlayerStore,
+    ) -> Result<()> {
+        let current = player_store.get_player_state(steam_id).await?;
+        let current_state = current
+            .as_ref()
+            .map(|p| p.state)
+            .ok_or(LobbyError::PlayerNotFound(steam_id))?;
+        if current_state != PlayerState::Queueing {
+            return Err(LobbyError::InvalidStateTransition {
+                from: current_state,
+                to: PlayerState::InMenus,
+            });
+        }
+        self.callbacks.on_player_cancel_queue(steam_id).await?;
+        Ok(())
+    }
+
+    pub async fn match_accepted(
+        &self,
+        steam_id: SteamId,
+        player_store: &dyn PlayerStore,
+    ) -> Result<()> {
+        let current = player_store.get_player_state(steam_id).await?;
+        let current_state = current
+            .as_ref()
+            .map(|p| p.state)
+            .ok_or(LobbyError::PlayerNotFound(steam_id))?;
+        if current_state != PlayerState::Queueing {
+            return Err(LobbyError::InvalidStateTransition {
+                from: current_state,
+                to: PlayerState::MatchAccepted,
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn p2p_connected(
+        &self,
+        steam_id: SteamId,
+        player_store: &dyn PlayerStore,
+    ) -> Result<()> {
+        let current = player_store.get_player_state(steam_id).await?;
+        let current_state = current
+            .as_ref()
+            .map(|p| p.state)
+            .ok_or(LobbyError::PlayerNotFound(steam_id))?;
+        if current_state != PlayerState::MatchAccepted {
+            return Err(LobbyError::InvalidStateTransition {
+                from: current_state,
+                to: PlayerState::InMatch,
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn begin_reporting(
+        &self,
+        steam_id: SteamId,
+        player_store: &dyn PlayerStore,
+    ) -> Result<()> {
+        let current = player_store.get_player_state(steam_id).await?;
+        let current_state = current
+            .as_ref()
+            .map(|p| p.state)
+            .ok_or(LobbyError::PlayerNotFound(steam_id))?;
+        if current_state != PlayerState::InMatch {
+            return Err(LobbyError::InvalidStateTransition {
+                from: current_state,
+                to: PlayerState::Reporting,
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn reporting_complete(
+        &self,
+        steam_id: SteamId,
+        player_store: &dyn PlayerStore,
+    ) -> Result<()> {
+        let current = player_store.get_player_state(steam_id).await?;
+        let current_state = current
+            .as_ref()
+            .map(|p| p.state)
+            .ok_or(LobbyError::PlayerNotFound(steam_id))?;
+        if current_state != PlayerState::Reporting {
+            return Err(LobbyError::InvalidStateTransition {
+                from: current_state,
+                to: PlayerState::InMenus,
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn heartbeat(
+        &self,
+        steam_id: SteamId,
+        player_store: &dyn PlayerStore,
+    ) -> Result<()> {
+        self.callbacks.on_heartbeat(steam_id).await?;
+        Ok(())
+    }
+
+    pub async fn handle_disconnect(
+        &self,
+        steam_id: SteamId,
+        player_store: &dyn PlayerStore,
+    ) -> Result<()> {
+        self.callbacks.on_player_disconnected(steam_id).await?;
+        Ok(())
+    }
+}

@@ -1,0 +1,20 @@
+[package]
+name = "lobby-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lobby-core = { path = "../lobby-core" }
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "migrate"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+jsonwebtoken = "9"
+reqwest = { version = "0.12", features = ["json"] }
+futures-util = "0.3"
+async-trait = "0.1"
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = "1"
+serde_json = "1"

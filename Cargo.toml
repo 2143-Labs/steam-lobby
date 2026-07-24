@@ -1,0 +1,3 @@
+[workspace]
+members = ["lobby-core", "lobby-server", "lobby-macros"]
+resolver = "2"

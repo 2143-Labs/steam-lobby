@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lobby
+      POSTGRES_PASSWORD: lobby
+      POSTGRES_DB: lobby
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  lobby:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://lobby:lobby@db:5432/lobby
+      STEAM_API_KEY: "${STEAM_API_KEY}"
+      STEAM_APP_ID: "480"
+      JWT_SECRET: "${JWT_SECRET:-dev-secret-change-me}"
+      RUST_LOG: info,lobby_server=debug
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
