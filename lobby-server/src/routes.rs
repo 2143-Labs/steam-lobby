@@ -6,8 +6,8 @@ use axum::response::{IntoResponse, Redirect};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use lobby_core::traits::PlayerStore;
 use crate::state::AppState;
+use lobby_core::traits::PlayerStore;
 
 pub async fn health() -> &'static str {
     "ok"
@@ -23,17 +23,8 @@ pub async fn steam_login(
     Query(query): Query<LoginQuery>,
 ) -> impl IntoResponse {
     let return_to = query.return_to.unwrap_or_else(|| "/".to_string());
-    let redirect_url = state
-        .steam_auth
-        .openid_redirect_url(&return_to, &return_to);
+    let redirect_url = state.steam_auth.openid_redirect_url(&return_to, &return_to);
     Redirect::temporary(&redirect_url)
-}
-
-#[derive(Deserialize)]
-pub struct CallbackParams {
-    #[serde(flatten)]
-    params: HashMap<String, String>,
-    return_to: Option<String>,
 }
 
 pub async fn steam_callback(

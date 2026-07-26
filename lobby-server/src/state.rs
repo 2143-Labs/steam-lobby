@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use lobby_core::traits::GameCallbacks;
 use tokio::sync::{mpsc, Mutex};

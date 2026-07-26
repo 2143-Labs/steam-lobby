@@ -1,22 +1,6 @@
-use async_trait::async_trait;
-use chrono::Utc;
-use std::collections::HashMap;
-
 use crate::error::{LobbyError, Result};
 use crate::traits::{GameCallbacks, PlayerStore};
-use crate::types::{MatchDifficulty, PlayerInfo, PlayerState, SteamId};
-
-/// Valid state transitions.
-fn valid_transitions() -> HashMap<PlayerState, Vec<PlayerState>> {
-    use PlayerState::*;
-    HashMap::from([
-        (InMenus, vec![Queueing]),
-        (Queueing, vec![InMenus, MatchAccepted]),
-        (MatchAccepted, vec![InMatch]),
-        (InMatch, vec![Reporting]),
-        (Reporting, vec![InMenus]),
-    ])
-}
+use crate::types::{MatchDifficulty, PlayerState, SteamId};
 
 pub struct PlayerManager<CB: GameCallbacks> {
     callbacks: CB,
@@ -27,36 +11,6 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         Self { callbacks }
     }
 
-    fn check_transition(
-        &self,
-        current: Option<PlayerState>,
-        target: PlayerState,
-    ) -> Result<PlayerState> {
-        let current = match current {
-            Some(s) => s,
-            None => {
-                // No current state — only allowed if target is InMenus (first login).
-                if target != PlayerState::InMenus {
-                    return Err(LobbyError::PlayerNotFound(0)); // caller fills in steam_id
-                }
-                return Ok(target);
-            }
-        };
-        let allowed = valid_transitions()
-            .get(&current)
-            .cloned()
-            .unwrap_or_default();
-        if allowed.contains(&target) {
-            Ok(target)
-        } else {
-            Err(LobbyError::InvalidStateTransition {
-                from: current,
-                to: target,
-            })
-        }
-    }
-
-
     pub async fn enter_menus(
         &self,
         steam_id: SteamId,
@@ -66,7 +20,9 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         if current.is_none() {
             // First login — create with InMenus.
             player_store.upsert_player(steam_id, "").await?;
-            player_store.set_player_state(steam_id, PlayerState::InMenus).await?;
+            player_store
+                .set_player_state(steam_id, PlayerState::InMenus)
+                .await?;
         }
         self.callbacks.on_player_in_menu(steam_id).await?;
         Ok(())
@@ -92,7 +48,9 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         self.callbacks
             .on_player_queueing(steam_id, "ranked_1v1", difficulty)
             .await?;
-        player_store.set_player_state(steam_id, PlayerState::Queueing).await?;
+        player_store
+            .set_player_state(steam_id, PlayerState::Queueing)
+            .await?;
         Ok(())
     }
 
@@ -113,7 +71,9 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
             });
         }
         self.callbacks.on_player_cancel_queue(steam_id).await?;
-        player_store.set_player_state(steam_id, PlayerState::InMenus).await?;
+        player_store
+            .set_player_state(steam_id, PlayerState::InMenus)
+            .await?;
         Ok(())
     }
 
@@ -133,7 +93,9 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
                 to: PlayerState::MatchAccepted,
             });
         }
-        player_store.set_player_state(steam_id, PlayerState::MatchAccepted).await?;
+        player_store
+            .set_player_state(steam_id, PlayerState::MatchAccepted)
+            .await?;
         Ok(())
     }
 
@@ -153,7 +115,9 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
                 to: PlayerState::InMatch,
             });
         }
-        player_store.set_player_state(steam_id, PlayerState::InMatch).await?;
+        player_store
+            .set_player_state(steam_id, PlayerState::InMatch)
+            .await?;
         Ok(())
     }
 
@@ -173,7 +137,9 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
                 to: PlayerState::Reporting,
             });
         }
-        player_store.set_player_state(steam_id, PlayerState::Reporting).await?;
+        player_store
+            .set_player_state(steam_id, PlayerState::Reporting)
+            .await?;
         Ok(())
     }
 
@@ -193,15 +159,13 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
                 to: PlayerState::InMenus,
             });
         }
-        player_store.set_player_state(steam_id, PlayerState::InMenus).await?;
+        player_store
+            .set_player_state(steam_id, PlayerState::InMenus)
+            .await?;
         Ok(())
     }
 
-    pub async fn heartbeat(
-        &self,
-        steam_id: SteamId,
-        player_store: &dyn PlayerStore,
-    ) -> Result<()> {
+    pub async fn heartbeat(&self, steam_id: SteamId, player_store: &dyn PlayerStore) -> Result<()> {
         self.callbacks.on_heartbeat(steam_id).await?;
         player_store.update_heartbeat(steam_id).await?;
         Ok(())
@@ -213,7 +177,9 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         player_store: &dyn PlayerStore,
     ) -> Result<()> {
         self.callbacks.on_player_disconnected(steam_id).await?;
-        player_store.set_player_state(steam_id, PlayerState::InMenus).await?;
+        player_store
+            .set_player_state(steam_id, PlayerState::InMenus)
+            .await?;
         Ok(())
     }
 }

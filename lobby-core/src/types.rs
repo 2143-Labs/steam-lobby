@@ -52,8 +52,8 @@ pub struct PlayerInfo {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenSkillRating {
-    pub mu: f64,     // skill estimate, default 25.0
-    pub sigma: f64,  // uncertainty, default 25.0/3.0 ≈ 8.333
+    pub mu: f64,    // skill estimate, default 25.0
+    pub sigma: f64, // uncertainty, default 25.0/3.0 ≈ 8.333
     pub last_updated: DateTime<Utc>,
 }
 
@@ -76,7 +76,7 @@ pub struct MatchInfo {
 pub struct MatchReport {
     pub match_token: String,
     pub reporting_player: SteamId,
-    pub winner: Option<SteamId>, // None = draw
+    pub winner: Option<SteamId>,   // None = draw
     pub demo_hash: Option<String>, // SHA-256 hex
 }
 

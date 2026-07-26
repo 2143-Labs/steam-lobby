@@ -9,5 +9,6 @@ pkgs.mkShell {
     gcc
     pkg-config
     openssl
+    just
   ];
 }

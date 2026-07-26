@@ -60,7 +60,10 @@ pub async fn tick_loop(state: Arc<AppState>) {
             }
         }
         let _ = state.matchmaking_queue.cleanup_stale(&state.store).await;
-        let _ = state.match_manager.expire_pending_accepts(&state.store).await;
+        let _ = state
+            .match_manager
+            .expire_pending_accepts(&state.store)
+            .await;
         let _ = state
             .match_manager
             .expire_pending_reports(&state.store)

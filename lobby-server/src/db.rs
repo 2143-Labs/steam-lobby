@@ -3,8 +3,8 @@ use chrono::{DateTime, Duration, Utc};
 use lobby_core::error::{LobbyError, Result};
 use lobby_core::traits::{MatchStore, PlayerStore, QueueStore, RatingStore};
 use lobby_core::types::{
-    MatchDifficulty, MatchInfo, MatchReport, MatchStatus, OpenSkillRating, PlayerInfo,
-    PlayerState, QueueEntry, SteamId,
+    MatchDifficulty, MatchInfo, MatchReport, MatchStatus, OpenSkillRating, PlayerInfo, PlayerState,
+    QueueEntry, SteamId,
 };
 use sqlx::PgPool;
 
@@ -317,15 +317,13 @@ impl MatchStore for PostgresStore {
         ended_at: DateTime<Utc>,
     ) -> Result<()> {
         let status_str = format!("{:?}", status);
-        sqlx::query(
-            "UPDATE matches SET status = $1, ended_at = $2 WHERE match_token = $3",
-        )
-        .bind(&status_str)
-        .bind(ended_at)
-        .bind(token)
-        .execute(&self.pool)
-        .await
-        .map_err(map_db_error)?;
+        sqlx::query("UPDATE matches SET status = $1, ended_at = $2 WHERE match_token = $3")
+            .bind(&status_str)
+            .bind(ended_at)
+            .bind(token)
+            .execute(&self.pool)
+            .await
+            .map_err(map_db_error)?;
         Ok(())
     }
 
@@ -415,12 +413,17 @@ impl RatingStore for PostgresStore {
         <Self as PlayerStore>::get_rating(self, steam_id, mode).await
     }
 
-    async fn update_rating(&self, steam_id: SteamId, mode: &str, rating: &OpenSkillRating) -> Result<()> {
+    async fn update_rating(
+        &self,
+        steam_id: SteamId,
+        mode: &str,
+        rating: &OpenSkillRating,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT INTO ratings (steam_id, game_mode, mu, sigma, last_updated) \
              VALUES ($1, $2, $3, $4, NOW()) \
              ON CONFLICT (steam_id, game_mode) DO UPDATE SET \
-               mu = EXCLUDED.mu, sigma = EXCLUDED.sigma, last_updated = EXCLUDED.last_updated"
+               mu = EXCLUDED.mu, sigma = EXCLUDED.sigma, last_updated = EXCLUDED.last_updated",
         )
         .bind(steam_id as i64)
         .bind(mode)

@@ -1,0 +1,7 @@
+/target
+.git
+*.md
+justfile
+.env.example
+.env
+shell.nix

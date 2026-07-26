@@ -3,8 +3,8 @@ use std::collections::HashMap;
 
 use crate::error::Result;
 use crate::types::{
-    MatchDifficulty, MatchInfo, MatchReport, MatchStatus, OpenSkillRating, PlayerInfo,
-    PlayerState, QueueEntry, SteamId,
+    MatchDifficulty, MatchInfo, MatchReport, MatchStatus, OpenSkillRating, PlayerInfo, PlayerState,
+    QueueEntry, SteamId,
 };
 
 /// Game-specific callbacks. Implement for your game type.
@@ -96,10 +96,7 @@ pub trait QueueStore: Send + Sync {
     async fn enqueue(&self, entry: &QueueEntry) -> Result<()>;
     async fn dequeue(&self, steam_id: SteamId, mode: &str) -> Result<()>;
     async fn get_queue(&self, mode: &str) -> Result<Vec<QueueEntry>>;
-    async fn remove_stale_queue_entries(
-        &self,
-        timeout: chrono::Duration,
-    ) -> Result<()>;
+    async fn remove_stale_queue_entries(&self, timeout: chrono::Duration) -> Result<()>;
 }
 
 #[async_trait]

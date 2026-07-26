@@ -1,22 +1,17 @@
-use async_trait::async_trait;
 use chrono::Utc;
 use uuid::Uuid;
 
 use crate::error::Result;
 use crate::traits::{GameCallbacks, MatchStore, PlayerStore, QueueStore, RatingStore};
-use crate::types::{MatchDifficulty, MatchInfo, MatchStatus, QueueEntry, SteamId};
+use crate::types::{MatchInfo, MatchStatus};
 
 pub struct MatchmakingQueue<CB: GameCallbacks> {
     callbacks: CB,
-    match_accept_timeout: chrono::Duration,
 }
 
 impl<CB: GameCallbacks> MatchmakingQueue<CB> {
-    pub fn new(callbacks: CB, match_accept_timeout: chrono::Duration) -> Self {
-        Self {
-            callbacks,
-            match_accept_timeout,
-        }
+    pub fn new(callbacks: CB) -> Self {
+        Self { callbacks }
     }
 
     /// tick scans the queue for a mode, pairs compatible players using expanding MMR bands.
@@ -27,7 +22,7 @@ impl<CB: GameCallbacks> MatchmakingQueue<CB> {
         queue_store: &dyn QueueStore,
         match_store: &dyn MatchStore,
         player_store: &dyn PlayerStore,
-        rating_store: &dyn RatingStore,
+        _rating_store: &dyn RatingStore,
     ) -> Result<Option<MatchInfo>> {
         let mut queue = queue_store.get_queue(mode).await?;
         // Sort by queued_at ASC (longest waiting first)
@@ -45,9 +40,7 @@ impl<CB: GameCallbacks> MatchmakingQueue<CB> {
             // Skip desynced players
             if let Some(state) = player_store.get_player_state(player_a.steam_id).await? {
                 if state.state != crate::types::PlayerState::Queueing {
-                    queue_store
-                        .dequeue(player_a.steam_id, mode)
-                        .await?;
+                    queue_store.dequeue(player_a.steam_id, mode).await?;
                     continue;
                 }
             }
@@ -61,20 +54,15 @@ impl<CB: GameCallbacks> MatchmakingQueue<CB> {
 
             // Find first compatible opponent
             let mut opponent_idx = None;
-            for j in 0..queue.len() {
+            for (j, player_b) in queue.iter().enumerate() {
                 if i == j {
                     continue;
                 }
-                let player_b = &queue[j];
 
                 // Skip if opponent is also desynced
-                if let Some(state) =
-                    player_store.get_player_state(player_b.steam_id).await?
-                {
+                if let Some(state) = player_store.get_player_state(player_b.steam_id).await? {
                     if state.state != crate::types::PlayerState::Queueing {
-                        queue_store
-                            .dequeue(player_b.steam_id, mode)
-                            .await?;
+                        queue_store.dequeue(player_b.steam_id, mode).await?;
                         continue;
                     }
                 }

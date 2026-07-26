@@ -3,7 +3,6 @@ use std::sync::Arc;
 use axum::{extract::State, routing::get, Router};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing_subscriber;
 
 mod db;
 mod routes;
@@ -18,6 +17,7 @@ use steam_auth::SteamAuthService;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = dotenvy::dotenv(); // load .env if present, silent skip otherwise
     tracing_subscriber::fmt::init();
 
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
@@ -42,9 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(300);
 
     if steam_api_key.is_empty() {
-        tracing::warn!(
-            "STEAM_API_KEY not set — OpenID auth will work, ticket auth will not"
-        );
+        tracing::warn!("STEAM_API_KEY not set — OpenID auth will work, ticket auth will not");
     }
 
     let pool = sqlx::PgPool::connect(&db_url).await.expect("DB connection");
@@ -52,13 +50,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let store = PostgresStore::new(pool);
     let steam_auth = SteamAuthService::new(steam_api_key, app_id, jwt_secret);
-    let callbacks = state::DefaultCallbacks::default();
-    let player_manager =
-        lobby_core::player::PlayerManager::new(callbacks.clone());
-    let matchmaking_queue = lobby_core::queue::MatchmakingQueue::new(
-        callbacks.clone(),
-        chrono::Duration::seconds(match_accept_timeout as i64),
-    );
+    let callbacks = state::DefaultCallbacks;
+    let player_manager = lobby_core::player::PlayerManager::new(callbacks.clone());
+    let matchmaking_queue = lobby_core::queue::MatchmakingQueue::new(callbacks.clone());
     let match_manager = lobby_core::match_lifecycle::MatchManager::new(
         callbacks,
         match_accept_timeout,
@@ -94,10 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Dev-mode test token endpoint (before with_state)
     if std::env::var("STEAM_API_KEY").unwrap_or_default() == "test" {
-        router = router.route(
-            "/auth/test-token",
-            axum::routing::post(routes::test_token),
-        );
+        router = router.route("/auth/test-token", axum::routing::post(routes::test_token));
     }
 
     let app = router

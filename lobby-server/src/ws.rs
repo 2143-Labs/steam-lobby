@@ -13,13 +13,26 @@ use crate::state::AppState;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    Auth { session_token: String },
-    AuthTicket { ticket: String },
-    BeginMatchmaking { mode: String, difficulty: String },
+    Auth {
+        session_token: String,
+    },
+    AuthTicket {
+        ticket: String,
+    },
+    BeginMatchmaking {
+        mode: String,
+        difficulty: String,
+    },
     CancelMatchmaking,
-    AcceptMatch { match_token: String },
-    DeclineMatch { match_token: String },
-    P2pConnected { match_token: String },
+    AcceptMatch {
+        match_token: String,
+    },
+    DeclineMatch {
+        match_token: String,
+    },
+    P2pConnected {
+        match_token: String,
+    },
     MatchReport {
         match_token: String,
         winner: Option<u64>,
@@ -30,6 +43,8 @@ pub enum ClientMessage {
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// Outbound messages sent over WebSocket connections.
+#[allow(dead_code)] // QueueStatus, MatchAccepted, MatchStarted reserved for future use
 pub enum ServerMessage {
     AuthOk {
         steam_id: u64,
@@ -166,7 +181,10 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
     }
 
     // Cleanup
-    let _ = state.player_manager.handle_disconnect(steam_id, &state.store).await;
+    let _ = state
+        .player_manager
+        .handle_disconnect(steam_id, &state.store)
+        .await;
     let mut connections = state.connections.lock().await;
     connections.remove(&steam_id);
     outbound_task.abort();
@@ -213,12 +231,15 @@ async fn authenticate(
     };
 
     match cm {
-        ClientMessage::Auth { session_token } => {
-            state.steam_auth.validate_session_token(&session_token).map_err(|_| ())
-        }
-        ClientMessage::AuthTicket { ticket } => {
-            state.steam_auth.verify_ticket(&ticket).await.map_err(|_| ())
-        }
+        ClientMessage::Auth { session_token } => state
+            .steam_auth
+            .validate_session_token(&session_token)
+            .map_err(|_| ()),
+        ClientMessage::AuthTicket { ticket } => state
+            .steam_auth
+            .verify_ticket(&ticket)
+            .await
+            .map_err(|_| ()),
         _ => {
             let _ = sender
                 .send(Message::Text(
@@ -254,15 +275,13 @@ async fn handle_client_message(
                 .await;
 
             // Create queue entry
-            let rating = state
-                .store
-                .get_rating(steam_id, &mode)
-                .await
-                .unwrap_or(lobby_core::types::OpenSkillRating {
+            let rating = state.store.get_rating(steam_id, &mode).await.unwrap_or(
+                lobby_core::types::OpenSkillRating {
                     mu: 25.0,
                     sigma: 25.0 / 3.0,
                     last_updated: chrono::Utc::now(),
-                });
+                },
+            );
 
             let entry = lobby_core::types::QueueEntry {
                 steam_id,
@@ -274,7 +293,10 @@ async fn handle_client_message(
             let _ = state.store.enqueue(&entry).await;
         }
         ClientMessage::CancelMatchmaking => {
-            let _ = state.player_manager.cancel_matchmaking(steam_id, &state.store).await;
+            let _ = state
+                .player_manager
+                .cancel_matchmaking(steam_id, &state.store)
+                .await;
             let _ = state.store.dequeue(steam_id, "ranked_1v1").await;
         }
         ClientMessage::AcceptMatch { match_token } => {

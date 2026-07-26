@@ -55,7 +55,7 @@ fn draw_minimal_change() {
     // Both should move toward each other slightly
     assert!(new_a.mu > a.mu); // lower moves up
     assert!(new_b.mu < b.mu); // higher moves down
-    // Sigma decreases
+                              // Sigma decreases
     assert!(new_a.sigma < a.sigma);
 }
 
@@ -72,7 +72,7 @@ fn underdog_win_large_shift() {
         last_updated: chrono::Utc::now(),
     };
 
-    let (new_weak, new_strong) = mmr::update_ratings(&weak, &strong, Outcomes::WIN);
+    let (new_weak, _new_strong) = mmr::update_ratings(&weak, &strong, Outcomes::WIN);
 
     // Underdog gains more than in equal match
     let delta = new_weak.mu - weak.mu;

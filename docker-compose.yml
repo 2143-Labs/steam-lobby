@@ -9,6 +9,11 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lobby"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
 
   lobby:
     build: .
@@ -16,12 +21,13 @@ services:
       - "8080:8080"
     environment:
       DATABASE_URL: postgres://lobby:lobby@db:5432/lobby
-      STEAM_API_KEY: "${STEAM_API_KEY}"
+      STEAM_API_KEY: "${STEAM_API_KEY:-test}"
       STEAM_APP_ID: "480"
       JWT_SECRET: "${JWT_SECRET:-dev-secret-change-me}"
       RUST_LOG: info,lobby_server=debug
     depends_on:
-      - db
+      db:
+        condition: service_healthy
 
 volumes:
   pgdata:

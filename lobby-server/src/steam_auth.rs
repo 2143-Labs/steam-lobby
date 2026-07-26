@@ -48,7 +48,10 @@ impl SteamAuthService {
     /// Verify OpenID callback params.
     pub async fn verify_openid(&self, params: &HashMap<String, String>) -> Result<SteamId> {
         let mut verify_params = params.clone();
-        verify_params.insert("openid.mode".to_string(), "check_authentication".to_string());
+        verify_params.insert(
+            "openid.mode".to_string(),
+            "check_authentication".to_string(),
+        );
 
         let resp = self
             .http_client
@@ -64,7 +67,9 @@ impl SteamAuthService {
             .map_err(|e| LobbyError::SteamAuthFailed(e.to_string()))?;
 
         if !body.contains("is_valid:true") {
-            return Err(LobbyError::SteamAuthFailed("OpenID validation failed".into()));
+            return Err(LobbyError::SteamAuthFailed(
+                "OpenID validation failed".into(),
+            ));
         }
 
         let claimed_id = params
@@ -72,11 +77,9 @@ impl SteamAuthService {
             .ok_or_else(|| LobbyError::SteamAuthFailed("missing claimed_id".into()))?;
 
         let prefix = "https://steamcommunity.com/openid/id/";
-        let steam_id_str = claimed_id
-            .strip_prefix(prefix)
-            .ok_or_else(|| {
-                LobbyError::SteamAuthFailed(format!("unexpected claimed_id: {claimed_id}"))
-            })?;
+        let steam_id_str = claimed_id.strip_prefix(prefix).ok_or_else(|| {
+            LobbyError::SteamAuthFailed(format!("unexpected claimed_id: {claimed_id}"))
+        })?;
 
         steam_id_str
             .parse::<u64>()
@@ -157,12 +160,8 @@ impl SteamAuthService {
 
     /// Validate a JWT session token and return the SteamID.
     pub fn validate_session_token(&self, token: &str) -> Result<SteamId> {
-        let data = decode::<Claims>(
-            token,
-            &self.jwt_decoding_key,
-            &Validation::default(),
-        )
-        .map_err(|e| LobbyError::SteamAuthFailed(e.to_string()))?;
+        let data = decode::<Claims>(token, &self.jwt_decoding_key, &Validation::default())
+            .map_err(|e| LobbyError::SteamAuthFailed(e.to_string()))?;
         data.claims
             .sub
             .parse::<u64>()
