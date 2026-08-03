@@ -17,9 +17,14 @@ Install Rust (`rustup`), OpenSSL (system package manager), and `just` (`cargo in
 cp .env.example .env
 nix-shell shell.nix     # enter dev shell (provides cargo, rustc, just)
 just db-up              # start PostgreSQL in Docker
-just test               # run all tests (8 pass)
+just test               # run unit tests (8 pass)
+just itest              # run integration tests against Postgres (3 pass)
 just run                # start server on :8080
 ```
+
+To emulate multiple users without Steam, open `web/index.html` in two browser
+tabs (distinct steam IDs), connect both, then start matchmaking in each — no
+real Steam API calls involved.
 
 ## Quickstart (non-NixOS)
 
@@ -66,9 +71,13 @@ When `STEAM_API_KEY=test`, the dev-only token endpoint is enabled. Get a JWT and
 TOKEN=$(curl -s -X POST http://localhost:8080/auth/test-token \
   -H 'Content-Type: application/json' \
   -d '{"steam_id": 12345}' | jq -r '.token')
-
 wscat -c "ws://localhost:8080/ws" -H "Authorization: Bearer $TOKEN"
 ```
+
+The Rust reference client (`lobby-client`) has a helper for this flow:
+`LobbyClient::authenticate_test_token(steam_id, base_url)` — POSTs
+`/auth/test-token` and authenticates over WebSocket in one call. The
+integration tests in `lobby-server/tests/` use it to emulate players.
 
 Then send: `{"type":"begin_matchmaking","mode":"ranked_1v1","difficulty":"normal"}`
 
@@ -104,6 +113,8 @@ All communication happens over a single WebSocket connection at `/ws`. Messages 
 | `auth_ok` | `steam_id: u64`, `display_name: String` | Authentication succeeded |
 | `match_found` | `match_token: String`, `opponent: { steam_id, display_name }`, `timeout_ms: u64` | A match is ready — accept or it expires |
 | `error` | `message: String` | An error occurred processing a message |
+| `match_result` | `match_token: String`, `outcome: Value` | A report resolved the match (`Win`/`Loss`/`Draw`/`Disputed` with mu change) |
+| `match_declined` | `match_token: String` | Your opponent declined the found match |
 
 ### Typical flow
 
@@ -129,7 +140,9 @@ Client                           Server
 | Recipe | What it does |
 |--------|-------------|
 | `just build` | Compile all crates |
-| `just test` | Run all 8 tests |
+| `just test` | Run all 8 unit tests |
+| `just itest` | Run 3 DB-backed integration tests (needs `just db-up`) |
+| `just test-verbose` | Run all tests with `--nocapture` |
 | `just lint` | Clippy with `-D warnings` |
 | `just fmt` | Auto-format with rustfmt |
 | `just fmt-check` | Check formatting without changing files |
@@ -139,6 +152,7 @@ Client                           Server
 | `just up` | Full Docker stack (lobby + db, builds the image) |
 | `just down` | Stop the full Docker stack |
 | `just clean` | Remove build artifacts (`cargo clean`) |
+
 ## Architecture
 
 - **lobby-core** — traits, types, MMR algorithm, queue logic, match lifecycle
@@ -146,11 +160,48 @@ Client                           Server
 - **lobby-client** — async Rust client library (reference implementation for the WS protocol)
 - **lobby-macros** — proc macros used by lobby-core
 
+## Testing
+
+**Unit tests** (no Postgres needed): `just test` — 8 tests covering the match
+lifecycle and the Weng-Lin rating algorithm, using in-memory mock stores.
+
+**Integration tests** (Postgres needed): `just db-up` then `just itest` — 3
+tests that start the real server in-process (`lobby-server/src/lib.rs`'s
+`build_app`), run it against PostgreSQL, and drive it with `lobby-client`:
+
+- `full_match_lifecycle` — two players queue, match, accept, connect, report;
+  asserts the match resolves, ratings update, and a `match_results` row is written.
+- `dispute_on_winner_mismatch` — players report different winners; asserts the
+  match is marked `Disputed` and no outcome is persisted.
+- `queue_cancel` — a player cancels matchmaking; asserts no match ever arrives.
+
+The tests use a shared `lobby_test` database (auto-created on first run,
+truncated before each test). It is intentionally never dropped — the next run
+just truncates again. `just db-up` must be running or the tests fail fast with a
+connection error.
+
+## Web Demo
+
+`web/index.html` is a zero-dependency browser client (native `fetch` +
+`WebSocket`, no build step) that emulates a player. To test multiple users
+locally:
+
+1. `just db-up` + `just run` (with `STEAM_API_KEY=test` from `.env.example`).
+2. Open `web/index.html` in two browser tabs.
+3. Give each tab a distinct steam ID, click **Connect** on both.
+4. Click **Start Matchmaking** in both — each tab shows the other as its
+   opponent.
+5. **Accept** on both, then **P2P Connected**, then report a result.
+
+The event log shows every JSON message sent and received — a live protocol
+reference. No Steam account or API key is involved.
+
 ## Contributing
 
 ```bash
 just lint     # clippy with -D warnings
-just test     # all tests must pass
+just test     # all unit tests must pass
+just itest    # integration tests must pass (Postgres running)
 just fmt      # format with rustfmt
 ```
 

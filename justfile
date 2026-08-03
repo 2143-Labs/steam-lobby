@@ -14,6 +14,10 @@ test:
 test-verbose:
   nix-shell shell.nix --run "cargo test --workspace -- --nocapture"
 
+# run DB-backed integration tests (needs `just db-up` first)
+itest:
+  nix-shell shell.nix --run "cargo test -p lobby-server --test integration -- --nocapture"
+
 # lint with clippy
 lint:
   nix-shell shell.nix --run "cargo clippy --all-targets -- -D warnings"
