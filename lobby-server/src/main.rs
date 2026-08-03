@@ -30,12 +30,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .parse()
             .unwrap_or(300),
         public_url: std::env::var("PUBLIC_URL").ok().filter(|s| !s.is_empty()),
+        auth_dev_mode: std::env::var("AUTH_DEV_MODE")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
+        jwt_ttl_secs: std::env::var("JWT_TTL_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(86400),
+        cors_origins: std::env::var("CORS_ORIGINS")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
 
     let (app, _state) = build_app(config).await;
     let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await?;
     tracing::info!("listening on {host}:{port}");
-    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 

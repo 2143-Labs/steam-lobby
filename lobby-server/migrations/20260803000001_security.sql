@@ -1,0 +1,10 @@
+ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE matches ADD COLUMN accepted_a BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE matches ADD COLUMN accepted_b BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE matches ADD COLUMN connected_a BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE matches ADD COLUMN connected_b BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE match_reports ADD CONSTRAINT demo_hash_len CHECK (demo_hash IS NULL OR length(demo_hash) <= 64);
+ALTER TABLE match_reports ADD CONSTRAINT match_reports_winner_fk FOREIGN KEY (winner) REFERENCES users(steam_id);
+CREATE INDEX match_reports_token_idx ON match_reports (match_token);
+CREATE INDEX matches_status_idx ON matches (status);
+CREATE INDEX matchmaking_queue_mode_idx ON matchmaking_queue (game_mode);

@@ -16,6 +16,7 @@ pub struct TestHarness {
     _lock_guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
+
 pub async fn setup() -> TestHarness {
     let _lock_guard = DB_LOCK.lock().await;
 
@@ -56,19 +57,27 @@ pub async fn setup() -> TestHarness {
         db_url: test_url.to_string(),
         steam_api_key: "test".into(),
         app_id: 480,
-        jwt_secret: "integration-test-secret".into(),
+        jwt_secret: "integration-test-secret-0123456789abcdef".into(),
         host: "127.0.0.1".into(),
         port: 0,
         match_accept_timeout_secs: 30,
         report_timeout_secs: 300,
-        public_url: None,
+        public_url: Some("https://lobby.example.com".into()),
+        auth_dev_mode: true,
+        jwt_ttl_secs: 86400,
+        cors_origins: vec!["https://lobby.example.com".into()],
     };
 
     let (app, state) = build_app(config).await; // runs migrations + spawns ticker
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind port 0");
     let addr = listener.local_addr().expect("local addr");
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("server");
     });
 
     TestHarness {

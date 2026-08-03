@@ -1,9 +1,14 @@
+use std::collections::{HashMap, HashSet};
+
 use chrono::Utc;
 use uuid::Uuid;
 
 use crate::error::Result;
 use crate::traits::{GameCallbacks, MatchStore, PlayerStore, QueueStore, RatingStore};
 use crate::types::{MatchInfo, MatchStatus};
+
+/// Do not re-pair the same two accounts within this window after a resolved match.
+const SAME_PAIR_COOLDOWN_SECS: i64 = 300;
 
 pub struct MatchmakingQueue<CB: GameCallbacks> {
     callbacks: CB,
@@ -34,11 +39,18 @@ impl<CB: GameCallbacks> MatchmakingQueue<CB> {
 
         let now = Utc::now();
 
+        // Pre-fetch every queued player's state once (O(n) DB reads instead of O(n²)).
+        let ids: HashSet<u64> = queue.iter().map(|e| e.steam_id).collect();
+        let mut states: HashMap<u64, Option<crate::types::PlayerInfo>> = HashMap::new();
+        for id in ids {
+            states.insert(id, player_store.get_player_state(id).await?);
+        }
+
         for i in 0..queue.len() {
             let player_a = &queue[i];
 
             // Skip desynced players
-            if let Some(state) = player_store.get_player_state(player_a.steam_id).await? {
+            if let Some(state) = states.get(&player_a.steam_id).cloned().flatten() {
                 if state.state != crate::types::PlayerState::Queueing {
                     queue_store.dequeue(player_a.steam_id, mode).await?;
                     continue;
@@ -60,11 +72,24 @@ impl<CB: GameCallbacks> MatchmakingQueue<CB> {
                 }
 
                 // Skip if opponent is also desynced
-                if let Some(state) = player_store.get_player_state(player_b.steam_id).await? {
+                if let Some(state) = states.get(&player_b.steam_id).cloned().flatten() {
                     if state.state != crate::types::PlayerState::Queueing {
                         queue_store.dequeue(player_b.steam_id, mode).await?;
                         continue;
                     }
+                }
+
+                // Same-pair cooldown: don't immediately re-pair two accounts that
+                // just resolved a match against each other.
+                if match_store
+                    .recent_match_between(
+                        player_a.steam_id,
+                        player_b.steam_id,
+                        now - chrono::Duration::seconds(SAME_PAIR_COOLDOWN_SECS),
+                    )
+                    .await?
+                {
+                    continue;
                 }
 
                 if player_b.mu >= lo && player_b.mu <= hi {
@@ -92,6 +117,10 @@ impl<CB: GameCallbacks> MatchmakingQueue<CB> {
                     accepted_at: None,
                     started_at: None,
                     ended_at: None,
+                    accepted_a: false,
+                    accepted_b: false,
+                    connected_a: false,
+                    connected_b: false,
                 };
 
                 // Check if game-specific logic rejects this match

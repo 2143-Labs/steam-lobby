@@ -15,11 +15,12 @@ Install Rust (`rustup`), OpenSSL (system package manager), and `just` (`cargo in
 
 ```bash
 cp .env.example .env
-nix-shell shell.nix     # enter dev shell (provides cargo, rustc, just)
-just db-up              # start PostgreSQL in Docker
-just test               # run unit tests (8 pass)
-just itest              # run integration tests against Postgres (3 pass)
-just run                # start server on :8080
+openssl rand -base64 48   # paste the output into JWT_SECRET in .env
+nix-shell shell.nix       # enter dev shell (provides cargo, rustc, just)
+just db-up                # start PostgreSQL in Docker
+just test                 # run unit tests
+just itest                # run integration tests against Postgres (9 pass)
+just run                  # start server on :8080
 ```
 
 To emulate multiple users without Steam, open `web/index.html` in two browser
@@ -30,6 +31,7 @@ real Steam API calls involved.
 
 ```bash
 cp .env.example .env
+openssl rand -base64 48   # paste the output into JWT_SECRET in .env
 cargo install just
 just db-up
 just test
@@ -44,42 +46,49 @@ just run
 | GET | `/auth/steam/login` | Steam OpenID login redirect |
 | GET | `/auth/steam/callback` | Steam OpenID callback |
 | GET | `/ws` | WebSocket upgrade (game protocol) |
-| POST | `/auth/ticket` | Steam ticket auth -> JWT |
-| POST | `/auth/test-token` | Dev-only: JWT for any steam_id (only when `STEAM_API_KEY=test`) |
-
-## Environment Variables
+| POST | `/auth/ticket` | Steam ticket auth -> JWT (rate-limited 10/min per IP) |
+| POST | `/auth/test-token` | Dev-only: JWT for any steam_id (only when `AUTH_DEV_MODE=true`) |
+| POST | `/auth/logout` | Revoke the current session token (all earlier tokens die) |
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DATABASE_URL` | `postgres://lobby:lobby@localhost:5432/lobby` | PostgreSQL connection string |
-| `JWT_SECRET` | — | Secret for signing JWTs |
-| `STEAM_API_KEY` | `test` | Steam Web API key; `test` enables `/auth/test-token` |
+| `JWT_SECRET` | — | Required, ≥32 random bytes — signs session JWTs (compose fails fast without it) |
+| `STEAM_API_KEY` | — | Steam Web API key; empty = OpenID works, ticket auth disabled |
 | `STEAM_APP_ID` | `480` | Steam App ID for the game |
+| `AUTH_DEV_MODE` | `false` | `true` enables the unauthenticated `/auth/test-token` dev endpoint — never in production |
+| `JWT_TTL_S` | `86400` | Seconds a session JWT stays valid |
+| `CORS_ORIGINS` | — | Comma-separated browser origins allowed to call the API (the web demo origin) |
 | `MATCH_ACCEPT_TIMEOUT_S` | `30` | Seconds players have to accept a match |
 | `REPORT_TIMEOUT_S` | `300` | Seconds after match ends to report outcome |
 | `RUST_LOG` | `info,lobby_server=debug` | Tracing log level |
 | `LOBBY_HOST` | `0.0.0.0` | Bind address |
 | `LOBBY_PORT` | `8080` | Bind port |
-| `PUBLIC_URL` | — | Public origin for OpenID `return_to` validation; unset = relative paths only |
+| `PUBLIC_URL` | — | Required for Steam OpenID login (absolute public origin); login returns `400` without it |
 
-> **Production:** Set `STEAM_API_KEY` to a real [Steam Web API key](https://steamcommunity.com/dev/apikey). The `/auth/test-token` endpoint is disabled automatically when the key is not `"test"`. Change `JWT_SECRET` to a strong random value.
+> **Production:** `JWT_SECRET` is required (≥32 random bytes) and `AUTH_DEV_MODE`
+> must stay `false`. Set `STEAM_API_KEY` to a real [Steam Web API
+> key](https://steamcommunity.com/dev/apikey) only if you need ticket auth; the
+> OpenID browser login needs no key at all.
+
 
 ### How to tell which auth mode the server is in
 
 The server logs the active mode at startup:
 
 ```
-INFO lobby_server: auth mode: TEST  — /auth/test-token enabled, no Steam verification
+INFO lobby_server: auth mode: TEST  — /auth/test-token enabled
 INFO lobby_server: auth mode: STEAM — ticket + OpenID verification against Steam (appid 480)
 ```
 
-Or probe it: `POST /auth/test-token` returns a JWT in TEST mode and `404` in STEAM
-mode. Note the web demo (`web/index.html`) only works in TEST mode — its Connect
-button uses the test-token endpoint.
+Or probe it: `POST /auth/test-token` returns a JWT when `AUTH_DEV_MODE=true` and
+`404` otherwise. The web demo (`web/index.html`) needs `AUTH_DEV_MODE=true` and
+your demo origin listed in `CORS_ORIGINS`; its Connect button uses the
+test-token endpoint (or a `#token=` fragment from a Steam login, if present).
 
 ## WebSocket Quick Test
 
-When `STEAM_API_KEY=test`, the dev-only token endpoint is enabled. Get a JWT and connect:
+With `AUTH_DEV_MODE=true`, the dev-only token endpoint is enabled. Get a JWT and connect:
 
 ```bash
 TOKEN=$(curl -s -X POST http://localhost:8080/auth/test-token \
@@ -95,6 +104,11 @@ integration tests in `lobby-server/tests/` use it to emulate players.
 
 Then send: `{"type":"begin_matchmaking","mode":"ranked_1v1","difficulty":"normal"}`
 
+The token is only ever sent in the first WS `auth` frame (or delivered as a URL
+**fragment** — `#token=…` — after Steam OpenID login), never as a query
+parameter.
+
+
 ## Steam Ticket Auth (production)
 
 In production (`STEAM_API_KEY` = a real key) clients authenticate with a Steam
@@ -109,24 +123,34 @@ docs, `GetAuthTicketForWebApi` → `AuthenticateUserTicket`:
    with `identity=matchmaking` (`lobby-server/src/steam_auth.rs`).
 2. Wait for `GetTicketForWebApiResponse_t`, hex-encode the binary ticket, and
    send `{"type":"auth_ticket","ticket":"<hex>"}` over the WebSocket (or
-   `POST /auth/ticket` with the same JSON body).
+   `POST /auth/ticket` with the same JSON body). Tickets that are not hex (or
+   longer than 8192 chars) are rejected locally before any Steam API call, and
+   both ticket paths are rate-limited per IP (10/min).
 3. `STEAM_APP_ID` must be the app that minted the ticket — the game's real
    appid. The default `480` (Spacewar) only works for testing.
-
 OpenID browser login requires `PUBLIC_URL` set to the public origin (e.g.
-`https://lobby.example.com`). The `return_to` parameter is validated: it must
-be a relative path or match `PUBLIC_URL`'s origin, otherwise the server answers
-`400`. With `PUBLIC_URL` unset, absolute `return_to` values are rejected.
+`https://lobby.example.com`) — the login endpoint answers `400` without it.
+Each login gets a one-time random `state`, bound to the exact `return_to`;
+replaying a callback, or presenting a `return_to` that does not match the
+issued state, is rejected. The session JWT is delivered as a URL **fragment**
+(`#token=…`), never as a query parameter.
 
 Transport note: the server is plain HTTP by design — terminate TLS at a reverse
 proxy (nginx/Caddy) in front of it. Without TLS the JWT and tickets travel in
 cleartext.
 
+**Security notes:** `JWT_SECRET` is required and must be ≥32 random bytes
+(`docker compose` fails fast without it, never falling back to a known value).
+The Postgres port is not published outside the compose network, and the
+container runs as a non-root user (`app`) with all capabilities dropped. TLS
+must terminate at a reverse proxy in front of the server — JWTs and tickets
+otherwise travel cleartext. The web demo requires `AUTH_DEV_MODE=true` and its
+origin listed in `CORS_ORIGINS`; production deployments must keep
+`AUTH_DEV_MODE=false`.
+
 ## How It Works
 
 Players connect over WebSocket and authenticate with a JWT (obtained via Steam OpenID or the dev token endpoint). Once authenticated, a player enters the queue with a difficulty (Easy/Normal/Hard) at their current MMR.
-
-A ticker runs every 2 seconds, pairing the longest-waiting player with the nearest opponent within an expanding MMR band. The band starts at 50 and grows by 25 every 10 seconds of wait time, capped at 400. Difficulty applies an MMR offset (±150) so Easy players match with slightly higher-rated opponents and Hard players with lower-rated ones.
 
 When a match is found, both players receive a `MatchFound` message. Both must accept before the match transitions to `InProgress`. After the match, each player submits a report (winner + optional demo hash). If both agree, ratings update via the Weng-Lin algorithm (a modern Bayesian system with uncertainty tracking). If they disagree or demo hashes mismatch, the match is disputed.
 
@@ -181,8 +205,8 @@ Client                           Server
 | Recipe | What it does |
 |--------|-------------|
 | `just build` | Compile all crates |
-| `just test` | Run all 8 unit tests |
-| `just itest` | Run 3 DB-backed integration tests (needs `just db-up`) |
+| `just test` | Run all unit tests (10) + doc test |
+| `just itest` | Run 9 DB-backed integration tests (needs `just db-up`) |
 | `just test-verbose` | Run all tests with `--nocapture` |
 | `just lint` | Clippy with `-D warnings` |
 | `just fmt` | Auto-format with rustfmt |
@@ -194,24 +218,30 @@ Client                           Server
 | `just down` | Stop the full Docker stack |
 | `just clean` | Remove build artifacts (`cargo clean`) |
 
-## Architecture
-
-- **lobby-core** — traits, types, MMR algorithm, queue logic, match lifecycle
-- **lobby-server** — axum HTTP server, WebSocket handler, PostgreSQL store, ticker loop
 - **lobby-client** — async Rust client library (reference implementation for the WS protocol)
 - **lobby-macros** — proc macros used by lobby-core
 
 ## Testing
 
-**Unit tests** (no Postgres needed): `just test` — 8 tests covering the match
-lifecycle and the Weng-Lin rating algorithm, using in-memory mock stores.
+**Unit tests** (no Postgres needed): `just test` — 10 tests covering the match
+lifecycle (accept/connect/report/expiry, winner validation, double-accept
+idempotency, auto-loss on report timeout) and the Weng-Lin rating algorithm,
+using in-memory mock stores.
 
-**Integration tests** (Postgres needed): `just db-up` then `just itest` — 3
+**Integration tests** (Postgres needed): `just db-up` then `just itest` — 9
 tests that start the real server in-process (`lobby-server/src/lib.rs`'s
 `build_app`), run it against PostgreSQL, and drive it with `lobby-client`:
 
 - `full_match_lifecycle` — two players queue, match, accept, connect, report;
   asserts the match resolves, ratings update, and a `match_results` row is written.
+- `dispute_on_winner_mismatch` — players report different winners; asserts the
+  match is marked `Disputed` and no outcome is persisted.
+- `queue_cancel` — a player cancels matchmaking; asserts no match ever arrives.
+- `rate_limited_test_token` — the dev token endpoint rate-limits per IP.
+- `logout_revokes_token` — a logged-out token no longer authenticates a WebSocket.
+- `ws_frame_size_limit` — oversized WS frames are rejected.
+- `replaced_connection_keeps_new` — a second connection replaces the first.
+- `ws_origin_restriction` — non-allowlisted browser origins get 403 on `/ws`.
 - `dispute_on_winner_mismatch` — players report different winners; asserts the
   match is marked `Disputed` and no outcome is persisted.
 - `queue_cancel` — a player cancels matchmaking; asserts no match ever arrives.
@@ -227,7 +257,7 @@ connection error.
 `WebSocket`, no build step) that emulates a player. To test multiple users
 locally:
 
-1. `just db-up` + `just run` (with `STEAM_API_KEY=test` from `.env.example`).
+1. `just db-up` + `just run` (with `AUTH_DEV_MODE=true` in `.env`).
 2. Open `web/index.html` in two browser tabs.
 3. Give each tab a distinct steam ID, click **Connect** on both.
 4. Click **Start Matchmaking** in both — each tab shows the other as its

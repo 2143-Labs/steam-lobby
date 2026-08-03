@@ -67,6 +67,8 @@ pub trait PlayerStore: Send + Sync {
     ) -> Result<()>;
     async fn set_player_state(&self, steam_id: SteamId, state: PlayerState) -> Result<()>;
     async fn update_heartbeat(&self, steam_id: SteamId) -> Result<()>;
+    async fn get_token_version(&self, steam_id: SteamId) -> Result<u32>;
+    async fn bump_token_version(&self, steam_id: SteamId) -> Result<()>;
 }
 
 #[async_trait]
@@ -85,12 +87,12 @@ pub trait MatchStore: Send + Sync {
         status: MatchStatus,
         ended_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()>;
-    /// Record the first player's acceptance timestamp.
-    /// Returns true if this call claimed the slot (first accept); false if it was already set.
-    async fn mark_accepted(&self, token: &str) -> Result<bool>;
-    /// Record the first player's P2P connection timestamp.
-    /// Returns true if this call claimed the slot (first connection); false if it was already set.
-    async fn mark_started(&self, token: &str) -> Result<bool>;
+    /// Record one player's acceptance.
+    /// Returns true when, after this call, BOTH players have accepted.
+    async fn mark_accepted(&self, token: &str, steam_id: SteamId) -> Result<bool>;
+    /// Record one player's P2P connection.
+    /// Returns true when, after this call, BOTH players have connected.
+    async fn mark_started(&self, token: &str, steam_id: SteamId) -> Result<bool>;
     /// Persist a resolved match outcome record.
     async fn write_match_result(
         &self,
@@ -98,6 +100,27 @@ pub trait MatchStore: Send + Sync {
         outcome: &str,
         mu_change_a: Option<f64>,
         mu_change_b: Option<f64>,
+    ) -> Result<()>;
+    /// True if the pair has a Resolved match that ended at/after `since`.
+    async fn recent_match_between(
+        &self,
+        a: SteamId,
+        b: SteamId,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool>;
+    /// Atomically apply a full match resolution (ratings, result record, status).
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_match(
+        &self,
+        token: &str,
+        game_mode: &str,
+        player_a: SteamId,
+        player_b: SteamId,
+        outcome: &str,
+        mu_change_a: Option<f64>,
+        mu_change_b: Option<f64>,
+        rating_a: &OpenSkillRating,
+        rating_b: &OpenSkillRating,
     ) -> Result<()>;
 }
 

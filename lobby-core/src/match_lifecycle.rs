@@ -37,10 +37,8 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         if steam_id != m.player_a && steam_id != m.player_b {
             return Err(LobbyError::NotParticipant(token.to_string()));
         }
-        if match_store.mark_accepted(token).await? {
-            // First player to accept — keep status PendingAccept until the second accepts.
-        } else {
-            // Second player — both accepted, transition to InProgress.
+        if match_store.mark_accepted(token, steam_id).await? {
+            // Both players have now accepted — transition to InProgress.
             match_store
                 .update_match_status(token, MatchStatus::InProgress)
                 .await?;
@@ -65,12 +63,11 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         if steam_id != m.player_a && steam_id != m.player_b {
             return Err(LobbyError::NotParticipant(token.to_string()));
         }
-        if match_store.mark_started(token).await? {
-            // First player to connect — keep status InProgress until the second connects.
-        } else {
-            // Second player — both connected, transition to Reporting.
+        if match_store.mark_started(token, steam_id).await? {
+            // Both players have now connected — transition to Reporting.
+            // Use update_match (sets ended_at) so the report-timeout expiry path is reachable.
             match_store
-                .update_match_status(token, MatchStatus::Reporting)
+                .update_match(&m.match_token, MatchStatus::Reporting, Utc::now())
                 .await?;
             self.callbacks.on_players_connected(&m).await?;
         }
@@ -93,6 +90,16 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         }
         if report.reporting_player != m.player_a && report.reporting_player != m.player_b {
             return Err(LobbyError::NotParticipant(token.to_string()));
+        }
+        if let Some(h) = &report.demo_hash {
+            if h.len() > 64 {
+                return Err(LobbyError::InvalidReport(token.clone()));
+            }
+        }
+        if let Some(w) = report.winner {
+            if w != m.player_a && w != m.player_b {
+                return Err(LobbyError::InvalidReport(token.clone()));
+            }
         }
         match_store.submit_report(&report).await?;
         let reports = match_store.get_reports(token).await?;
@@ -118,20 +125,21 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                 Outcomes::DRAW
             };
             let (new_a, new_b) = mmr::update_ratings(&rating_a, &rating_b, sk);
-            rating_store
-                .update_rating(m.player_a, &m.game_mode, &new_a)
-                .await?;
-            rating_store
-                .update_rating(m.player_b, &m.game_mode, &new_b)
-                .await?;
             let outcome_str = if winner_a == Some(m.player_a) { "Win" } else if winner_a == Some(m.player_b) { "Loss" } else { "Draw" };
             let mu_change_b = new_b.mu - rating_b.mu;
             let mu_change_a = new_a.mu - rating_a.mu;
             match_store
-                .write_match_result(token, outcome_str, Some(mu_change_a), Some(mu_change_b))
-                .await?;
-            match_store
-                .update_match(token, MatchStatus::Resolved, Utc::now())
+                .resolve_match(
+                    token,
+                    &m.game_mode,
+                    m.player_a,
+                    m.player_b,
+                    outcome_str,
+                    Some(mu_change_a),
+                    Some(mu_change_b),
+                    &new_a,
+                    &new_b,
+                )
                 .await?;
             let outcome = if winner_a == Some(m.player_a) {
                 MatchOutcome::Win {
@@ -153,7 +161,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                 .update_match(token, MatchStatus::Disputed, Utc::now())
                 .await?;
             Ok(MatchOutcome::Disputed)
-        } else if !agree {
+        } else {
             let missing = ra.demo_hash.is_none() || rb.demo_hash.is_none();
             match_store
                 .update_match(token, MatchStatus::Disputed, Utc::now())
@@ -163,47 +171,6 @@ impl<CB: GameCallbacks> MatchManager<CB> {
             } else {
                 Ok(MatchOutcome::Disputed)
             }
-        } else {
-            let rating_a = rating_store.get_rating(m.player_a, &m.game_mode).await?;
-            let rating_b = rating_store.get_rating(m.player_b, &m.game_mode).await?;
-            let sk = if winner_a == Some(m.player_a) {
-                Outcomes::WIN
-            } else if winner_a == Some(m.player_b) {
-                Outcomes::LOSS
-            } else {
-                Outcomes::DRAW
-            };
-            let (new_a, new_b) = mmr::update_ratings(&rating_a, &rating_b, sk);
-            rating_store
-                .update_rating(m.player_a, &m.game_mode, &new_a)
-                .await?;
-            rating_store
-                .update_rating(m.player_b, &m.game_mode, &new_b)
-                .await?;
-            let outcome_str = if winner_a == Some(m.player_a) { "Win" } else if winner_a == Some(m.player_b) { "Loss" } else { "Draw" };
-            let mu_change_b = new_b.mu - rating_b.mu;
-            let mu_change_a = new_a.mu - rating_a.mu;
-            match_store
-                .write_match_result(token, outcome_str, Some(mu_change_a), Some(mu_change_b))
-                .await?;
-            match_store
-                .update_match(token, MatchStatus::Resolved, Utc::now())
-                .await?;
-            let outcome = if winner_a == Some(m.player_a) {
-                MatchOutcome::Win {
-                    mu_change: mu_change_a,
-                }
-            } else if winner_a == Some(m.player_b) {
-                MatchOutcome::Loss {
-                    mu_change: mu_change_a,
-                }
-            } else {
-                MatchOutcome::Draw {
-                    mu_change: mu_change_a,
-                }
-            };
-            self.callbacks.on_match_ended(&m, &outcome).await?;
-            Ok(outcome)
         }
     }
 
@@ -213,7 +180,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
             .await?;
         let now = Utc::now();
         for m in &matches {
-            if (now - m.created_at).num_seconds() as u64 > self.match_accept_timeout_secs {
+            if (now - m.created_at).num_seconds().max(0) as u64 > self.match_accept_timeout_secs {
                 match_store
                     .update_match_status(&m.match_token, MatchStatus::Disputed)
                     .await?;
@@ -222,22 +189,67 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         Ok(())
     }
 
-    pub async fn expire_pending_reports(&self, match_store: &dyn MatchStore) -> Result<()> {
+    pub async fn expire_pending_reports(
+        &self,
+        match_store: &dyn MatchStore,
+        rating_store: &dyn RatingStore,
+    ) -> Result<()> {
         let matches = match_store
             .get_matches_by_status(MatchStatus::Reporting)
             .await?;
         let now = Utc::now();
         for m in &matches {
             if let Some(ended_at) = m.ended_at {
-                if (now - ended_at).num_seconds() as u64 > self.report_timeout_secs {
+                if (now - ended_at).num_seconds().max(0) as u64 > self.report_timeout_secs {
                     let reports = match_store.get_reports(&m.match_token).await?;
                     if reports.is_empty() {
                         match_store
                             .update_match_status(&m.match_token, MatchStatus::Disputed)
                             .await?;
                     } else if reports.len() == 1 {
+                        let report = &reports[0];
+                        let winner_ok = match report.winner {
+                            None => true,
+                            Some(w) => w == m.player_a || w == m.player_b,
+                        };
+                        if !winner_ok {
+                            // A lone report claiming a non-participant winner cannot be trusted.
+                            match_store
+                                .update_match_status(&m.match_token, MatchStatus::Disputed)
+                                .await?;
+                            continue;
+                        }
+                        let rating_a = rating_store.get_rating(m.player_a, &m.game_mode).await?;
+                        let rating_b = rating_store.get_rating(m.player_b, &m.game_mode).await?;
+                        let sk = if report.winner == Some(m.player_a) {
+                            Outcomes::WIN
+                        } else if report.winner == Some(m.player_b) {
+                            Outcomes::LOSS
+                        } else {
+                            Outcomes::DRAW
+                        };
+                        let (new_a, new_b) = mmr::update_ratings(&rating_a, &rating_b, sk);
+                        let outcome_str = if report.winner == Some(m.player_a) {
+                            "Win"
+                        } else if report.winner == Some(m.player_b) {
+                            "Loss"
+                        } else {
+                            "Draw"
+                        };
+                        let mu_change_a = new_a.mu - rating_a.mu;
+                        let mu_change_b = new_b.mu - rating_b.mu;
                         match_store
-                            .update_match_status(&m.match_token, MatchStatus::Resolved)
+                            .resolve_match(
+                                &m.match_token,
+                                &m.game_mode,
+                                m.player_a,
+                                m.player_b,
+                                outcome_str,
+                                Some(mu_change_a),
+                                Some(mu_change_b),
+                                &new_a,
+                                &new_b,
+                            )
                             .await?;
                     }
                 }

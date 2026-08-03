@@ -1,4 +1,7 @@
-{ pkgs ? import <nixpkgs> {} }:
+{ pkgs ? import (builtins.fetchGit {
+    url = "https://github.com/NixOS/nixpkgs";
+    rev = "643809054d65fdd466a63e3155b8c498cb483c04";
+  }) {} }:
 
 pkgs.mkShell {
   buildInputs = with pkgs; [

@@ -33,7 +33,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 // ── Wire types (mirror server's ClientMessage / ServerMessage) ──
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
     Auth { session_token: String },
@@ -43,6 +43,42 @@ enum ClientMsg {
     DeclineMatch { match_token: String },
     P2pConnected { match_token: String },
     MatchReport { match_token: String, winner: Option<u64>, demo_hash: Option<String> },
+}
+
+// Hand-written so session tokens never appear in logs: the JWT is a
+// credential; match_token/winner/demo_hash are not.
+impl std::fmt::Debug for ClientMsg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientMsg::Auth { .. } => {
+                f.debug_struct("Auth").field("session_token", &"<redacted>").finish()
+            }
+            ClientMsg::BeginMatchmaking { mode, difficulty } => f
+                .debug_struct("BeginMatchmaking")
+                .field("mode", mode)
+                .field("difficulty", difficulty)
+                .finish(),
+            ClientMsg::CancelMatchmaking => f.write_str("CancelMatchmaking"),
+            ClientMsg::AcceptMatch { match_token } => f
+                .debug_struct("AcceptMatch")
+                .field("match_token", match_token)
+                .finish(),
+            ClientMsg::DeclineMatch { match_token } => f
+                .debug_struct("DeclineMatch")
+                .field("match_token", match_token)
+                .finish(),
+            ClientMsg::P2pConnected { match_token } => f
+                .debug_struct("P2pConnected")
+                .field("match_token", match_token)
+                .finish(),
+            ClientMsg::MatchReport { match_token, winner, demo_hash } => f
+                .debug_struct("MatchReport")
+                .field("match_token", match_token)
+                .field("winner", winner)
+                .field("demo_hash", demo_hash)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,6 +136,28 @@ pub struct LobbyClient {
 impl LobbyClient {
     /// Connect to a Steam Lobby server. Returns immediately — I/O runs in a background task.
     pub async fn connect(url: &str) -> Result<Self, ClientError> {
+        // wss:// is required for non-loopback servers — the JWT is sent in the
+        // first WS frame and must not travel cleartext.
+        if let Ok(parsed) = url::Url::parse(url) {
+            match parsed.scheme() {
+                "wss" => {}
+                "ws" => {
+                    let loopback = parsed.host_str().is_some_and(|h| {
+                        h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "[::1]"
+                    });
+                    if !loopback {
+                        return Err(ClientError::Connection(
+                            "wss:// is required for non-loopback servers".into(),
+                        ));
+                    }
+                }
+                other => {
+                    return Err(ClientError::Connection(format!(
+                        "unsupported scheme: {other}"
+                    )));
+                }
+            }
+        }
         let (ws, _) = connect_async(url)
             .await
             .map_err(|e| ClientError::Connection(e.to_string()))?;
@@ -169,19 +227,25 @@ impl LobbyClient {
     }
 
     /// Dev-only: POST /auth/test-token to get a JWT, then authenticate over WebSocket.
-    /// Only works when the server runs with STEAM_API_KEY=test.
+    /// Only works when the server runs with `AUTH_DEV_MODE=true`.
     pub async fn authenticate_test_token(
         &mut self,
         steam_id: u64,
         base_url: &str,
     ) -> Result<AuthOk, ClientError> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| ClientError::Connection(e.to_string()))?;
         let resp = client
             .post(format!("{base_url}/auth/test-token"))
             .json(&serde_json::json!({"steam_id": steam_id}))
             .send()
             .await
             .map_err(|e| ClientError::Connection(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(ClientError::Server(format!("HTTP {}", resp.status())));
+        }
         let body: serde_json::Value = resp
             .json()
             .await

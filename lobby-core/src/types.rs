@@ -70,6 +70,10 @@ pub struct MatchInfo {
     pub accepted_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
+    pub accepted_a: bool,
+    pub accepted_b: bool,
+    pub connected_a: bool,
+    pub connected_b: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

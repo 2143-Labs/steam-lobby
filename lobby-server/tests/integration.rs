@@ -110,13 +110,31 @@ async fn full_match_lifecycle() {
     p1.submit_report(&token, Some(a1), Some("demo-a")).await.unwrap();
     p2.submit_report(&token, Some(a1), Some("demo-a")).await.unwrap();
 
-    // Verify the match resolved AND a match_results row was written (step 5's fix).
+    // Verify the match resolved AND a match_results row was written.
+    // The stored outcome is from player_a's perspective; the queue pairing
+    // order is racy, so learn which side p1 (100) landed on before asserting.
     let row = wait_for_row(&h.pool, &token,
         "SELECT outcome, mu_change_a FROM match_results WHERE match_token = $1")
         .await
         .expect("match_results row exists");
-    assert_eq!(row.0, "Win");
-    assert!(row.1 > 0.0, "winner's mu should increase");
+    let player_a: i64 = sqlx::query_scalar(
+        "SELECT player_a FROM matches WHERE match_token = $1",
+    )
+    .bind(&token)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let expected = if player_a as u64 == a1 { "Win" } else { "Loss" };
+    assert_eq!(row.0, expected, "outcome must match player_a's perspective");
+    // The winner's mu increases regardless of which side they landed on.
+    let winner_mu: f64 = sqlx::query_scalar(
+        "SELECT mu FROM ratings WHERE steam_id = $1 AND game_mode = 'ranked_1v1'",
+    )
+    .bind(a1 as i64)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert!(winner_mu > 25.0, "winner's mu should increase, got {winner_mu}");
 
     drop(p1);
     drop(p2);
@@ -197,4 +215,184 @@ async fn openid_return_to_validation() {
             .status();
         assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "return_to={evil}");
     }
+}
+
+#[tokio::test]
+async fn rate_limited_test_token() {
+    let h = setup().await;
+    let client = reqwest::Client::new();
+    let (mut ok, mut limited) = (0, 0);
+    for i in 0..25u64 {
+        let status = client
+            .post(format!("{}/auth/test-token", h.base_url))
+            .json(&serde_json::json!({"steam_id": i + 5000}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        match status.as_u16() {
+            200 => ok += 1,
+            429 => limited += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(ok, 20, "first 20 test-token calls per IP succeed");
+    assert_eq!(limited, 5, "the rest are rate-limited");
+}
+
+#[tokio::test]
+async fn logout_revokes_token() {
+    let h = setup().await;
+    let client = reqwest::Client::new();
+
+    // Mint a raw token so we can present it to both /auth/logout and the WS.
+    let resp = client
+        .post(format!("{}/auth/test-token", h.base_url))
+        .json(&serde_json::json!({"steam_id": 400}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let token = body["token"].as_str().unwrap().to_string();
+
+    // Token works over WS before logout.
+    let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    p1.authenticate(&token).await.unwrap();
+    drop(p1);
+
+    // Logout bumps token_version.
+    let resp = client
+        .post(format!("{}/auth/logout", h.base_url))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // The same token is now rejected on a fresh connection.
+    let mut p2 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    assert!(
+        p2.authenticate(&token).await.is_err(),
+        "a revoked token must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn ws_frame_size_limit() {
+    use futures_util::SinkExt;
+    use futures_util::StreamExt;
+
+    let h = setup().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(&h.ws_url).await.unwrap();
+
+    // First message: a ~2 MiB text frame — the 64 KiB cap must reject it.
+    let big = "x".repeat(2 * 1024 * 1024);
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(big.into()))
+        .await
+        .unwrap();
+
+    // The server may send an error frame (e.g. auth_required) before closing.
+    let outcome: Option<String>;
+    loop {
+        match timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(frame)))) => {
+                outcome = Some(format!("close:{}", frame.map(|f| u16::from(f.code)).unwrap_or(0)));
+                break;
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(e))) => {
+                outcome = Some(format!("err:{e}"));
+                break;
+            }
+            other => panic!("oversized frame must close the connection, got {other:?}"),
+        }
+    }
+    let outcome = outcome.expect("connection must close or error");
+    assert!(
+        outcome.starts_with("close:") || outcome.starts_with("err:"),
+        "unexpected outcome {outcome}"
+    );
+    // With the 64 KiB cap the oversized frame is rejected; without it the
+    // server would wait for a valid auth message instead.
+    assert!(
+        outcome != "close:0",
+        "server must close with an error code, got {outcome}"
+    );
+}
+
+#[tokio::test]
+async fn replaced_connection_keeps_new() {
+    let h = setup().await;
+
+    let mut first = LobbyClient::connect(&h.ws_url).await.unwrap();
+    first.authenticate_test_token(500, &h.base_url).await.unwrap();
+
+    // Second connection for the same steam_id replaces the first.
+    let mut second = LobbyClient::connect(&h.ws_url).await.unwrap();
+    second.authenticate_test_token(500, &h.base_url).await.unwrap();
+
+    // The first connection must be closed (possibly after a "replaced" notice).
+    let mut closed = false;
+    for _ in 0..5 {
+        match timeout(Duration::from_secs(5), first.next_event()).await {
+            Ok(None) => {
+                closed = true;
+                break;
+            }
+            Ok(Some(Ok(lobby_client::ServerEvent::Error { .. }))) => continue,
+            Ok(Some(Err(_))) => {
+                closed = true;
+                break;
+            }
+            other => panic!("unexpected event from replaced connection: {other:?}"),
+        }
+    }
+    assert!(closed, "first connection must be closed after replacement");
+
+    // The second connection stays functional.
+    second
+        .begin_matchmaking("ranked_1v1", "normal")
+        .await
+        .unwrap();
+    drop(first);
+    drop(second);
+}
+
+#[tokio::test]
+async fn ws_origin_restriction() {
+    let h = setup().await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let key = "dGhlIHNhbXBsZSBub25jZQ==";
+
+    // Non-allowlisted browser origin → 403 before the upgrade.
+    let status = client
+        .get(format!("{}/ws", h.base_url))
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Key", key)
+        .header("Sec-WebSocket-Version", "13")
+        .header("Origin", "https://evil.com")
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+
+    // Allowlisted origin → 101 Switching Protocols.
+    let status = client
+        .get(format!("{}/ws", h.base_url))
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Key", key)
+        .header("Sec-WebSocket-Version", "13")
+        .header("Origin", "https://lobby.example.com")
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, reqwest::StatusCode::SWITCHING_PROTOCOLS);
 }

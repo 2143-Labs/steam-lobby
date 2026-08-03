@@ -2,15 +2,14 @@ services:
   db:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: lobby
-      POSTGRES_PASSWORD: lobby
-      POSTGRES_DB: lobby
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: ${POSTGRES_USER:-lobby}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (openssl rand -base64 24)}
+      POSTGRES_DB: ${POSTGRES_DB:-lobby}
+    # No ports: the DB is only reachable inside the compose network.
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U lobby"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lobby}"]
       interval: 2s
       timeout: 3s
       retries: 10
@@ -20,11 +19,23 @@ services:
     ports:
       - "8080:8080"
     environment:
-      DATABASE_URL: postgres://lobby:lobby@db:5432/lobby
-      STEAM_API_KEY: "${STEAM_API_KEY:-test}"
-      STEAM_APP_ID: "480"
-      JWT_SECRET: "${JWT_SECRET:-dev-secret-change-me}"
-      RUST_LOG: info,lobby_server=debug
+      # NOTE: POSTGRES_PASSWORD is interpolated into DATABASE_URL, so it must be
+      # URL-safe (alphanumeric or base64). `openssl rand -base64 24` output works.
+      DATABASE_URL: postgres://${POSTGRES_USER:-lobby}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-lobby}
+      # STEAM_API_KEY intentionally NOT set — OpenID login needs no key; add it
+      # explicitly (real Steam Web API key) only when ticket auth is required.
+      STEAM_APP_ID: ${STEAM_APP_ID:-480}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set (openssl rand -base64 48)}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      AUTH_DEV_MODE: ${AUTH_DEV_MODE:-false}
+      JWT_TTL_S: ${JWT_TTL_S:-86400}
+      RUST_LOG: ${RUST_LOG:-info,lobby_server=debug}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy

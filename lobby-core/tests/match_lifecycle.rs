@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use lobby_core::error::Result;
+use lobby_core::error::{LobbyError, Result};
 use lobby_core::traits::{GameCallbacks, MatchStore, PlayerStore, QueueStore, RatingStore};
 use lobby_core::types::{
     MatchDifficulty, MatchInfo, MatchReport, MatchStatus, OpenSkillRating, PlayerInfo, PlayerState,
@@ -20,6 +20,7 @@ struct MockStore {
     reports: Mutex<HashMap<String, Vec<MatchReport>>>,
     queue: Mutex<HashMap<(SteamId, String), QueueEntry>>,
     results: Mutex<HashMap<String, StoredResult>>,
+    token_versions: Mutex<HashMap<SteamId, u32>>,
 }
 
 impl MockStore {
@@ -31,6 +32,7 @@ impl MockStore {
             reports: Mutex::new(HashMap::new()),
             queue: Mutex::new(HashMap::new()),
             results: Mutex::new(HashMap::new()),
+            token_versions: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -92,6 +94,16 @@ impl PlayerStore for MockStore {
         if let Some(info) = p.get_mut(&steam_id) {
             info.last_heartbeat = Utc::now();
         }
+        Ok(())
+    }
+
+    async fn get_token_version(&self, steam_id: SteamId) -> Result<u32> {
+        Ok(self.token_versions.lock().get(&steam_id).copied().unwrap_or(0))
+    }
+
+    async fn bump_token_version(&self, steam_id: SteamId) -> Result<()> {
+        let mut v = self.token_versions.lock();
+        *v.entry(steam_id).or_insert(0) += 1;
         Ok(())
     }
 }
@@ -160,10 +172,15 @@ impl MatchStore for MockStore {
         Ok(())
     }
 
-    async fn mark_accepted(&self, token: &str) -> Result<bool> {
+    async fn mark_accepted(&self, token: &str, steam_id: SteamId) -> Result<bool> {
         let mut m = self.matches.lock();
         if let Some(mi) = m.get_mut(token) {
-            if mi.accepted_at.is_none() {
+            if mi.player_a == steam_id {
+                mi.accepted_a = true;
+            } else if mi.player_b == steam_id {
+                mi.accepted_b = true;
+            }
+            if mi.accepted_a && mi.accepted_b {
                 mi.accepted_at = Some(Utc::now());
                 return Ok(true);
             }
@@ -171,10 +188,15 @@ impl MatchStore for MockStore {
         Ok(false)
     }
 
-    async fn mark_started(&self, token: &str) -> Result<bool> {
+    async fn mark_started(&self, token: &str, steam_id: SteamId) -> Result<bool> {
         let mut m = self.matches.lock();
         if let Some(mi) = m.get_mut(token) {
-            if mi.started_at.is_none() {
+            if mi.player_a == steam_id {
+                mi.connected_a = true;
+            } else if mi.player_b == steam_id {
+                mi.connected_b = true;
+            }
+            if mi.connected_a && mi.connected_b {
                 mi.started_at = Some(Utc::now());
                 return Ok(true);
             }
@@ -193,6 +215,53 @@ impl MatchStore for MockStore {
             token.to_string(),
             (outcome.to_string(), mu_change_a, mu_change_b),
         );
+        Ok(())
+    }
+
+    async fn recent_match_between(
+        &self,
+        a: SteamId,
+        b: SteamId,
+        since: DateTime<Utc>,
+    ) -> Result<bool> {
+        Ok(self
+            .matches
+            .lock()
+            .values()
+            .any(|m| {
+                m.status == MatchStatus::Resolved
+                    && ((m.player_a == a && m.player_b == b)
+                        || (m.player_a == b && m.player_b == a))
+                    && m.ended_at.is_some_and(|e| e >= since)
+            }))
+    }
+
+    async fn resolve_match(
+        &self,
+        token: &str,
+        game_mode: &str,
+        player_a: SteamId,
+        player_b: SteamId,
+        outcome: &str,
+        mu_change_a: Option<f64>,
+        mu_change_b: Option<f64>,
+        rating_a: &OpenSkillRating,
+        rating_b: &OpenSkillRating,
+    ) -> Result<()> {
+        {
+            let mut r = self.ratings.lock();
+            r.insert((player_a, game_mode.to_string()), rating_a.clone());
+            r.insert((player_b, game_mode.to_string()), rating_b.clone());
+        }
+        self.results.lock().insert(
+            token.to_string(),
+            (outcome.to_string(), mu_change_a, mu_change_b),
+        );
+        let mut m = self.matches.lock();
+        if let Some(mi) = m.get_mut(token) {
+            mi.status = MatchStatus::Resolved;
+            mi.ended_at = Some(Utc::now());
+        }
         Ok(())
     }
 }
@@ -372,6 +441,10 @@ async fn dispute_on_winner_mismatch() {
             accepted_at: Some(Utc::now()),
             started_at: Some(Utc::now()),
             ended_at: Some(Utc::now()),
+            accepted_a: true,
+            accepted_b: true,
+            connected_a: true,
+            connected_b: true,
         })
         .await
         .unwrap();
@@ -424,6 +497,10 @@ async fn auto_loss_on_timeout() {
             accepted_at: Some(Utc::now()),
             started_at: Some(Utc::now()),
             ended_at: Some(Utc::now() - Duration::seconds(400)),
+            accepted_a: true,
+            accepted_b: true,
+            connected_a: true,
+            connected_b: true,
         })
         .await
         .unwrap();
@@ -439,8 +516,98 @@ async fn auto_loss_on_timeout() {
         .unwrap();
 
     let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
-    mgr.expire_pending_reports(&store).await.unwrap();
+    mgr.expire_pending_reports(&store, &store).await.unwrap();
 
     let m = store.get_match(&token).await.unwrap().unwrap();
     assert_eq!(m.status, MatchStatus::Resolved);
+    // The lone report's winner (100) gets the win: their mu must have increased,
+    // and the match must be Resolved (the auto-loss the audit found missing).
+    let rating_100 = store.ratings.lock().get(&(100, "ranked_1v1".into())).cloned().unwrap();
+    let rating_200 = store.ratings.lock().get(&(200, "ranked_1v1".into())).cloned().unwrap();
+    assert!(rating_100.mu > 25.0, "winner's mu should increase, got {}", rating_100.mu);
+    assert!(rating_200.mu < 25.0, "loser's mu should decrease, got {}", rating_200.mu);
+}
+
+#[tokio::test]
+async fn winner_must_be_participant() {
+    let store = MockStore::new();
+    let token = "winner-gate".to_string();
+    store
+        .create_match(&MatchInfo {
+            match_token: token.clone(),
+            player_a: 100,
+            player_a_difficulty: MatchDifficulty::Normal,
+            player_b: 200,
+            player_b_difficulty: MatchDifficulty::Normal,
+            game_mode: "ranked_1v1".into(),
+            status: MatchStatus::Reporting,
+            created_at: Utc::now(),
+            accepted_at: Some(Utc::now()),
+            started_at: Some(Utc::now()),
+            ended_at: Some(Utc::now()),
+            accepted_a: true,
+            accepted_b: true,
+            connected_a: true,
+            connected_b: true,
+        })
+        .await
+        .unwrap();
+
+    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
+    let err = mgr
+        .submit_report(
+            MatchReport {
+                match_token: token.clone(),
+                reporting_player: 100,
+                winner: Some(999), // a third steam_id — not a participant
+                demo_hash: None,
+            },
+            &store,
+            &store,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, LobbyError::InvalidReport(_)));
+
+    // Match must be untouched.
+    let m = store.get_match(&token).await.unwrap().unwrap();
+    assert_eq!(m.status, MatchStatus::Reporting);
+}
+
+#[tokio::test]
+async fn double_accept_requires_both() {
+    let store = MockStore::new();
+    let token = "double-accept".to_string();
+    store
+        .create_match(&MatchInfo {
+            match_token: token.clone(),
+            player_a: 100,
+            player_a_difficulty: MatchDifficulty::Normal,
+            player_b: 200,
+            player_b_difficulty: MatchDifficulty::Normal,
+            game_mode: "ranked_1v1".into(),
+            status: MatchStatus::PendingAccept,
+            created_at: Utc::now(),
+            accepted_at: None,
+            started_at: None,
+            ended_at: None,
+            accepted_a: false,
+            accepted_b: false,
+            connected_a: false,
+            connected_b: false,
+        })
+        .await
+        .unwrap();
+
+    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
+    // Player A accepts — match must still be PendingAccept.
+    mgr.accept_match(&token, 100, &store).await.unwrap();
+    // Player A accepts again — a double-accept must NOT advance the match.
+    mgr.accept_match(&token, 100, &store).await.unwrap();
+    let m = store.get_match(&token).await.unwrap().unwrap();
+    assert_eq!(m.status, MatchStatus::PendingAccept);
+    // Only once B accepts does the match transition.
+    mgr.accept_match(&token, 200, &store).await.unwrap();
+    let m = store.get_match(&token).await.unwrap().unwrap();
+    assert_eq!(m.status, MatchStatus::InProgress);
 }

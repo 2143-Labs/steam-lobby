@@ -17,6 +17,8 @@ pub enum LobbyError {
     SteamAuthFailed(String),
     #[error("database error: {0}")]
     Database(String),
+    #[error("invalid report for match {0}")]
+    InvalidReport(String),
 }
 
 pub type Result<T> = std::result::Result<T, LobbyError>;

@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
-use lobby_core::traits::{QueueStore, RatingStore};
+use lobby_core::traits::{PlayerStore, QueueStore};
 use lobby_core::types::{MatchDifficulty, MatchReport, SteamId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
-use crate::state::AppState;
+use crate::state::{AppState, ConnectionEntry};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -86,26 +86,15 @@ pub struct OpponentInfo {
     pub display_name: String,
 }
 
-pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
+pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::SocketAddr) {
     let (mut sender, mut receiver) = ws.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
     // Auth phase
-    let steam_id = match authenticate(&mut receiver, &mut sender, &state).await {
+    let steam_id = match authenticate(&mut receiver, &mut sender, &state, peer_ip).await {
         Ok(id) => id,
         Err(_) => return,
     };
-
-    // Register connection
-    {
-        let mut connections = state.connections.lock().await;
-        if let Some(old_tx) = connections.insert(steam_id, tx.clone()) {
-            let _ = old_tx.send(ServerMessage::Error {
-                code: "replaced".into(),
-                message: "Newer connection established".into(),
-            });
-        }
-    }
 
     // Send auth ok
     let display_name = state
@@ -130,7 +119,8 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
         .enter_menus(steam_id, &state.store)
         .await;
 
-    // Spawn outbound message forwarder — takes ownership of sender
+    // Spawn the outbound message forwarder FIRST so the map entry can hold an
+    // abort handle and kill a ghosted connection.
     let mut outbound_task = tokio::spawn(async move {
         while let Some(server_msg) = rx.recv().await {
             let json = serde_json::to_string(&server_msg).unwrap();
@@ -139,6 +129,29 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
             }
         }
     });
+    let outbound_abort = outbound_task.abort_handle();
+
+    // Register connection — replace any ghost of this player.
+    let my_gen = state
+        .next_generation
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut connections = state.connections.lock().await;
+        if let Some(old) = connections.insert(
+            steam_id,
+            ConnectionEntry {
+                tx: tx.clone(),
+                generation: my_gen,
+                abort: outbound_abort,
+            },
+        ) {
+            let _ = old.tx.send(ServerMessage::Error {
+                code: "replaced".into(),
+                message: "Newer connection established".into(),
+            });
+            old.abort.abort(); // kills the old socket; its cleanup sees a stale generation
+        }
+    }
 
     // Message loop — select between client messages and outbound task
     loop {
@@ -180,13 +193,22 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    // Cleanup
-    let _ = state
-        .player_manager
-        .handle_disconnect(steam_id, &state.store)
-        .await;
-    let mut connections = state.connections.lock().await;
-    connections.remove(&steam_id);
+    // Cleanup — only the connection still registered for this player may
+    // reset player state and remove the map entry.
+    let is_current = {
+        let connections = state.connections.lock().await;
+        connections
+            .get(&steam_id)
+            .map(|e| e.generation == my_gen)
+            .unwrap_or(false)
+    };
+    if is_current {
+        let _ = state
+            .player_manager
+            .handle_disconnect(steam_id, &state.store)
+            .await;
+        state.connections.lock().await.remove(&steam_id);
+    }
     outbound_task.abort();
 }
 
@@ -194,6 +216,7 @@ async fn authenticate(
     receiver: &mut (impl StreamExt<Item = Result<Message, axum::Error>> + Unpin),
     sender: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
     state: &Arc<AppState>,
+    peer_ip: std::net::SocketAddr,
 ) -> Result<SteamId, ()> {
     let first_msg = timeout(Duration::from_secs(10), receiver.next()).await;
     let text = match first_msg {
@@ -231,15 +254,34 @@ async fn authenticate(
     };
 
     match cm {
-        ClientMessage::Auth { session_token } => state
-            .steam_auth
-            .validate_session_token(&session_token)
-            .map_err(|_| ()),
-        ClientMessage::AuthTicket { ticket } => state
-            .steam_auth
-            .verify_ticket(&ticket)
-            .await
-            .map_err(|_| ()),
+        ClientMessage::Auth { session_token } => {
+            let (id, ver) = state
+                .steam_auth
+                .validate_session_token(&session_token)
+                .map_err(|_| ())?;
+            // A token minted before a logout (or a DB error) is rejected.
+            let db_ver = state.store.get_token_version(id).await.map_err(|_| ())?;
+            if db_ver != ver {
+                return Err(());
+            }
+            Ok(id)
+        }
+        ClientMessage::AuthTicket { ticket } => {
+            if !state.ticket_limiter.check(peer_ip.ip()) {
+                let _ = sender
+                    .send(Message::Text(
+                        serde_json::to_string(&ServerMessage::Error {
+                            code: "rate_limited".into(),
+                            message: "Too many auth attempts".into(),
+                        })
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await;
+                return Err(());
+            }
+            state.steam_auth.verify_ticket(&ticket).await.map_err(|_| ())
+        }
         _ => {
             let _ = sender
                 .send(Message::Text(
@@ -255,6 +297,7 @@ async fn authenticate(
         }
     }
 }
+
 
 async fn handle_client_message(
     cm: ClientMessage,
@@ -275,13 +318,15 @@ async fn handle_client_message(
                 .await;
 
             // Create queue entry
-            let rating = state.store.get_rating(steam_id, &mode).await.unwrap_or(
-                lobby_core::types::OpenSkillRating {
-                    mu: 25.0,
-                    sigma: 25.0 / 3.0,
-                    last_updated: chrono::Utc::now(),
-                },
-            );
+            let rating = <dyn lobby_core::traits::RatingStore>::get_rating(&state.store, steam_id, &mode)
+                .await
+                .unwrap_or(
+                    lobby_core::types::OpenSkillRating {
+                        mu: 25.0,
+                        sigma: 25.0 / 3.0,
+                        last_updated: chrono::Utc::now(),
+                    },
+                );
 
             let entry = lobby_core::types::QueueEntry {
                 steam_id,

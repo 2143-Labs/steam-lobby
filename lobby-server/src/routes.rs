@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::state::AppState;
+use crate::state::{AppState, OpenIdState};
 use lobby_core::traits::PlayerStore;
 
 pub async fn health() -> &'static str {
@@ -18,19 +20,31 @@ pub struct LoginQuery {
     return_to: Option<String>,
 }
 
-/// True if `return_to` is safe to redirect to: a same-origin path, or an
-/// absolute URL whose origin matches `public_url` (when set).
+/// True if `return_to` is safe to redirect to: a same-origin path without
+/// query/fragment, or an absolute URL whose origin matches `public_url` and
+/// which has no fragment (the token fragment is appended by the server).
 fn validate_return_to(return_to: &str, public_url: Option<&str>) -> bool {
     // Relative same-origin path: "/dashboard" ok; "//evil.com" and "/\evil.com" are not.
     if return_to.starts_with('/') && !return_to.starts_with("//") && !return_to.starts_with("/\\") {
-        return true;
+        // A `?` would smuggle params into the callback/redirect; a `#` would
+        // swallow the fragment token.
+        return !return_to.contains('?') && !return_to.contains('#');
     }
     // Absolute: must match the configured public origin exactly.
     let Some(pub_url) = public_url else { return false };
+    if return_to.contains('#') {
+        return false;
+    }
     match (url::Url::parse(return_to), url::Url::parse(pub_url)) {
         (Ok(a), Ok(b)) => a.origin() == b.origin(),
         _ => false,
     }
+}
+
+/// Append the session token as a URL fragment — never a query param (not sent
+/// in Referer, not in access logs, not in history as a server-visible value).
+fn build_token_redirect(return_to: &str, token: &str) -> String {
+    format!("{return_to}#token={token}")
 }
 
 pub async fn steam_login(
@@ -40,13 +54,44 @@ pub async fn steam_login(
     let return_to = query.return_to.unwrap_or_else(|| "/".to_string());
     if !validate_return_to(&return_to, state.public_url.as_deref()) {
         return (
-            axum::http::StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "invalid_return_to"})),
         )
             .into_response();
     }
-    let realm = state.public_url.as_deref().unwrap_or(&return_to);
-    let redirect_url = state.steam_auth.openid_redirect_url(&return_to, realm);
+    // Steam requires an absolute callback URL, so OpenID login needs PUBLIC_URL.
+    let Some(public_url) = state.public_url.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "public_url_required"})),
+        )
+            .into_response();
+    };
+
+    // Issue a one-time login state bound to this return_to.
+    let login_state = uuid::Uuid::new_v4().to_string();
+    {
+        let mut states = state.openid_states.lock().unwrap();
+        states.retain(|_, s| s.created_at.elapsed() < Duration::from_secs(600));
+        if states.len() >= 4096 {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "state_limit"})),
+            )
+                .into_response();
+        }
+        states.insert(
+            login_state.clone(),
+            OpenIdState {
+                return_to: return_to.clone(),
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    let redirect_url = state
+        .steam_auth
+        .openid_redirect_url(public_url, &login_state, &return_to);
     Redirect::temporary(&redirect_url).into_response()
 }
 
@@ -58,20 +103,50 @@ pub async fn steam_callback(
         .get("return_to")
         .cloned()
         .unwrap_or_else(|| "/".to_string());
-    if !validate_return_to(&return_to, state.public_url.as_deref()) {
+    let state_param = query.get("state").cloned().unwrap_or_default();
+
+    // Consume the one-time login state (prevents replay of a callback).
+    let stored = {
+        let mut states = state.openid_states.lock().unwrap();
+        states.remove(&state_param)
+    };
+    let Some(stored) = stored else {
         return (
-            axum::http::StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid_state"})),
+        )
+            .into_response();
+    };
+    if stored.created_at.elapsed() >= Duration::from_secs(600) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "state_expired"})),
+        )
+            .into_response();
+    }
+    if stored.return_to != return_to {
+        return (
+            StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "invalid_return_to"})),
         )
             .into_response();
     }
+    // Defense in depth: re-validate the (now state-bound) return_to.
+    if !validate_return_to(&return_to, state.public_url.as_deref()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid_return_to"})),
+        )
+            .into_response();
+    }
+
     tracing::info!("OpenID callback: {:?}", query.keys());
 
     let steam_id = match state.steam_auth.verify_openid(&query).await {
         Ok(id) => id,
         Err(e) => {
             tracing::error!("OpenID verification failed: {e}");
-            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+            return StatusCode::UNAUTHORIZED.into_response();
         }
     };
 
@@ -84,16 +159,33 @@ pub async fn steam_callback(
 
     let _ = state.store.upsert_player(steam_id, &display_name).await;
 
-    // Generate JWT
-    let token = match state.steam_auth.generate_session_token(steam_id) {
+    // Generate JWT bound to the current token_version (DB error fails closed).
+    let version = match state.store.get_token_version(steam_id).await {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response();
+        }
+    };
+    let token = match state
+        .steam_auth
+        .generate_session_token(steam_id, version, state.jwt_ttl_secs)
+    {
         Ok(t) => t,
         Err(e) => {
             tracing::error!("JWT generation failed: {e}");
-            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response();
         }
     };
 
-    Redirect::temporary(&format!("{return_to}?token={token}")).into_response()
+    Redirect::temporary(&build_token_redirect(&return_to, &token)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -108,33 +200,57 @@ pub struct TokenResponse {
 
 pub async fn ticket_auth(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(ip): ConnectInfo<std::net::SocketAddr>,
     Json(body): Json<TicketAuthBody>,
 ) -> impl IntoResponse {
+    if !state.ticket_limiter.check(ip.ip()) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "rate_limited"})),
+        )
+            .into_response();
+    }
+
     let steam_id = match state.steam_auth.verify_ticket(&body.ticket).await {
         Ok(id) => id,
         Err(e) => {
             tracing::error!("Ticket verification failed: {e}");
             return (
-                axum::http::StatusCode::UNAUTHORIZED,
+                StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "auth_failed"})),
             )
                 .into_response();
         }
     };
 
-    let token = match state.steam_auth.generate_session_token(steam_id) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("JWT generation failed: {e}");
+    // DB error fails closed — never mint with version 0.
+    let version = match state.store.get_token_version(steam_id).await {
+        Ok(v) => v,
+        Err(_) => {
             return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal"})),
             )
                 .into_response();
         }
     };
 
-    (axum::http::StatusCode::OK, Json(TokenResponse { token })).into_response()
+    let token = match state
+        .steam_auth
+        .generate_session_token(steam_id, version, state.jwt_ttl_secs)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("JWT generation failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response();
+        }
+    };
+
+    (StatusCode::OK, Json(TokenResponse { token })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -144,18 +260,95 @@ pub struct TestTokenBody {
 
 pub async fn test_token(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(ip): ConnectInfo<std::net::SocketAddr>,
     Json(body): Json<TestTokenBody>,
 ) -> impl IntoResponse {
-    let token = state
+    if !state.test_token_limiter.check(ip.ip()) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "rate_limited"})),
+        )
+            .into_response();
+    }
+
+    let version = match state.store.get_token_version(body.steam_id).await {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response();
+        }
+    };
+
+    let token = match state
         .steam_auth
-        .generate_session_token(body.steam_id)
-        .unwrap();
-    (axum::http::StatusCode::OK, Json(TokenResponse { token })).into_response()
+        .generate_session_token(body.steam_id, version, state.jwt_ttl_secs)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("JWT generation failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response();
+        }
+    };
+
+    (StatusCode::OK, Json(TokenResponse { token })).into_response()
+}
+
+/// Revoke the session token presented in `Authorization: Bearer <token>` by
+/// bumping the player's token_version (all previously minted tokens die).
+pub async fn logout(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let Some(auth) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    };
+    let Some(token) = auth.strip_prefix("Bearer ") else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    };
+    let (steam_id, _) = match state.steam_auth.validate_session_token(token) {
+        Ok(pair) => pair,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "unauthorized"})),
+            )
+                .into_response();
+        }
+    };
+    match state.store.bump_token_version(steam_id).await {
+        Ok(()) => (),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response();
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::validate_return_to;
+    use super::{build_token_redirect, validate_return_to};
 
     #[test]
     fn validate_return_to_table() {
@@ -166,10 +359,14 @@ mod tests {
             ("/\\evil.com", None, false),
             ("", None, false),
             ("javascript:alert(1)", None, false),
+            ("/x?a=b", None, false),
+            ("/x#frag", None, false),
             ("https://evil.com/x", Some("https://lobby.example.com"), false),
             ("https://lobby.example.com/cb", Some("https://lobby.example.com"), true),
             ("https://lobby.example.com/cb", None, false),
             ("https://lobby.example.com/cb", Some("https://lobby.example.com/"), true),
+            ("https://lobby.example.com/cb?x=1", Some("https://lobby.example.com"), true),
+            ("https://lobby.example.com/cb#frag", Some("https://lobby.example.com"), false),
         ];
         for (return_to, public_url, expected) in cases {
             assert_eq!(
@@ -178,5 +375,17 @@ mod tests {
                 "return_to={return_to:?}, public_url={public_url:?}"
             );
         }
+    }
+
+    #[test]
+    fn token_redirect_uses_fragment() {
+        assert_eq!(
+            build_token_redirect("/dashboard", "abc"),
+            "/dashboard#token=abc"
+        );
+        assert_eq!(
+            build_token_redirect("https://lobby.example.com/cb", "xyz"),
+            "https://lobby.example.com/cb#token=xyz"
+        );
     }
 }

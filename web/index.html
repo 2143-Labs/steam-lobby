@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src http: https: ws: wss:; img-src data:">
 <title>Steam Lobby — Protocol Demo</title>
 <style>
   :root { color-scheme: dark; }
@@ -35,7 +37,7 @@ connect both, then start matchmaking in each.</p>
 <section id="connect-panel">
   <label>Server URL</label>
   <input id="server-url" value="http://localhost:8080" size="30">
-  <label>Steam ID (dev test-token; server must run with STEAM_API_KEY=test)</label>
+  <label>Steam ID (dev test-token; server must run with AUTH_DEV_MODE=true)</label>
   <input id="steam-id" value="76561198000000001" size="20">
   <button id="btn-connect" class="primary">Connect</button>
 </section>
@@ -76,6 +78,13 @@ connect both, then start matchmaking in each.</p>
 "use strict";
 const $ = (id) => document.getElementById(id);
 const state = { ws: null, steamId: null, matchToken: null, opponentId: null };
+// Consume an OpenID-issued fragment token (#token=…) if present, then strip it
+// from the URL so it isn't re-sent or stored in history.
+let fragmentToken = null;
+if (location.hash.startsWith("#token=")) {
+  fragmentToken = location.hash.slice(7);
+  history.replaceState(null, "", location.pathname + location.search);
+}
 
 function setStatus(text, cls) {
   const el = $("status");
@@ -98,33 +107,36 @@ function showControls(name) {
 }
 function send(obj) {
   const text = JSON.stringify(obj);
-  log("out", "→ " + text);
+  // Log a sanitized copy — never credentials.
+  const shown = { ...obj };
+  if ("session_token" in shown) shown.session_token = "***";
+  if ("ticket" in shown) shown.ticket = "***";
+  log("out", "→ " + JSON.stringify(shown));
   state.ws.send(text);
 }
 
-// ── Connect: fetch a dev JWT, then open the WebSocket ──
-$("btn-connect").addEventListener("click", async () => {
-  const base = $("server-url").value.replace(/\/$/, "");
-  const steamId = $("steam-id").value.trim();
-  if (!/^\d+$/.test(steamId)) { setStatus("Error: steam ID must be numeric", "err"); return; }
-
-  setStatus("Fetching test token…");
-  log("sys", "POST " + base + "/auth/test-token");
-  let token;
-  try {
-    const resp = await fetch(base + "/auth/test-token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ steam_id: Number(steamId) }),
-    });
-    if (!resp.ok) throw new Error("HTTP " + resp.status);
-    const body = await resp.json();
-    token = body.token;
-    log("sys", "got token (first 12 chars): " + token.slice(0, 12) + "…");
-  } catch (e) {
-    setStatus("Error: test-token request failed — " + e.message, "err");
-    log("sys", "test-token failed: " + e.message);
-    return;
+  let token = fragmentToken;
+  if (token) {
+    setStatus("Using Steam login token");
+    log("sys", "using session token from Steam OpenID login (fragment)");
+  } else {
+    setStatus("Fetching test token…");
+    log("sys", "POST " + base + "/auth/test-token");
+    try {
+      const resp = await fetch(base + "/auth/test-token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ steam_id: Number(steamId) }),
+      });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const body = await resp.json();
+      token = body.token;
+      log("sys", "got token (first 12 chars): " + token.slice(0, 12) + "…");
+    } catch (e) {
+      setStatus("Error: test-token request failed — " + e.message, "err");
+      log("sys", "test-token failed: " + e.message);
+      return;
+    }
   }
 
   const wsUrl = base.replace(/^http/, "ws") + "/ws";
