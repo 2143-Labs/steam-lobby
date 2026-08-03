@@ -166,3 +166,35 @@ async fn queue_cancel() {
 
     drop(p1);
 }
+
+#[tokio::test]
+async fn openid_return_to_validation() {
+    let h = setup().await;
+
+    // No-redirect client so the redirect (307) isn't followed away by reqwest.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let base = &h.base_url;
+
+    // Same-origin relative return_to: accepted, redirect to Steam.
+    let status = client
+        .get(format!("{base}/auth/steam/login?return_to=/dashboard"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, reqwest::StatusCode::TEMPORARY_REDIRECT);
+
+    // Absolute foreign origin and protocol-relative URL: rejected with 400.
+    for evil in ["https://evil.com", "//evil.com"] {
+        let status = client
+            .get(format!("{base}/auth/steam/login?return_to={evil}"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "return_to={evil}");
+    }
+}

@@ -14,6 +14,7 @@ pub struct AppState {
     pub steam_auth: SteamAuthService,
     pub store: PostgresStore,
     pub connections: Mutex<HashMap<u64, mpsc::UnboundedSender<ServerMessage>>>,
+    pub public_url: Option<String>,
 }
 
 #[derive(Clone, Default)]

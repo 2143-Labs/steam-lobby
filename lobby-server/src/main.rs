@@ -29,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "300".into())
             .parse()
             .unwrap_or(300),
+        public_url: std::env::var("PUBLIC_URL").ok().filter(|s| !s.is_empty()),
     };
 
     let (app, _state) = build_app(config).await;

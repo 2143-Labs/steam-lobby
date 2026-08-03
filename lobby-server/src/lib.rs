@@ -27,6 +27,7 @@ pub struct AppConfig {
     pub port: u16,
     pub match_accept_timeout_secs: u64,
     pub report_timeout_secs: u64,
+    pub public_url: Option<String>, // PUBLIC_URL; None = relative return_to only
 }
 
 /// Build the full axum Router + shared state.
@@ -63,6 +64,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         steam_auth,
         store,
         connections: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        public_url: config.public_url.clone(),
     });
 
     tokio::spawn(ticker::tick_loop(state.clone()));

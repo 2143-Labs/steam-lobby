@@ -61,6 +61,7 @@ pub async fn setup() -> TestHarness {
         port: 0,
         match_accept_timeout_secs: 30,
         report_timeout_secs: 300,
+        public_url: None,
     };
 
     let (app, state) = build_app(config).await; // runs migrations + spawns ticker

@@ -60,6 +60,7 @@ just run
 | `RUST_LOG` | `info,lobby_server=debug` | Tracing log level |
 | `LOBBY_HOST` | `0.0.0.0` | Bind address |
 | `LOBBY_PORT` | `8080` | Bind port |
+| `PUBLIC_URL` | — | Public origin for OpenID `return_to` validation; unset = relative paths only |
 
 > **Production:** Set `STEAM_API_KEY` to a real [Steam Web API key](https://steamcommunity.com/dev/apikey). The `/auth/test-token` endpoint is disabled automatically when the key is not `"test"`. Change `JWT_SECRET` to a strong random value.
 
@@ -93,6 +94,33 @@ The Rust reference client (`lobby-client`) has a helper for this flow:
 integration tests in `lobby-server/tests/` use it to emulate players.
 
 Then send: `{"type":"begin_matchmaking","mode":"ranked_1v1","difficulty":"normal"}`
+
+## Steam Ticket Auth (production)
+
+In production (`STEAM_API_KEY` = a real key) clients authenticate with a Steam
+ticket instead of the dev test-token. The flow follows the Steamworks Web API
+docs, `GetAuthTicketForWebApi` → `AuthenticateUserTicket`:
+
+1. The client (game) mints a ticket with the Steamworks SDK:
+   `ISteamUser::GetAuthTicketForWebApi("matchmaking")` — **not**
+   `GetAuthSessionTicket`, which Steam's docs explicitly disallow for this Web
+   API. The identity string must be exactly `matchmaking`; Steam only
+   authenticates tickets created with that parameter, and the server verifies
+   with `identity=matchmaking` (`lobby-server/src/steam_auth.rs`).
+2. Wait for `GetTicketForWebApiResponse_t`, hex-encode the binary ticket, and
+   send `{"type":"auth_ticket","ticket":"<hex>"}` over the WebSocket (or
+   `POST /auth/ticket` with the same JSON body).
+3. `STEAM_APP_ID` must be the app that minted the ticket — the game's real
+   appid. The default `480` (Spacewar) only works for testing.
+
+OpenID browser login requires `PUBLIC_URL` set to the public origin (e.g.
+`https://lobby.example.com`). The `return_to` parameter is validated: it must
+be a relative path or match `PUBLIC_URL`'s origin, otherwise the server answers
+`400`. With `PUBLIC_URL` unset, absolute `return_to` values are rejected.
+
+Transport note: the server is plain HTTP by design — terminate TLS at a reverse
+proxy (nginx/Caddy) in front of it. Without TLS the JWT and tickets travel in
+cleartext.
 
 ## How It Works
 
