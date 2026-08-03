@@ -32,8 +32,15 @@ pub struct AppConfig {
 /// Build the full axum Router + shared state.
 /// Caller binds a TcpListener and calls `axum::serve`.
 pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
-    if config.steam_api_key.is_empty() {
-        tracing::warn!("STEAM_API_KEY not set — OpenID auth will work, ticket auth will not");
+    match config.steam_api_key.as_str() {
+        "" => tracing::warn!("STEAM_API_KEY not set — OpenID auth will work, ticket auth will not"),
+        "test" => tracing::info!(
+            "auth mode: TEST — /auth/test-token enabled, no Steam verification"
+        ),
+        _ => tracing::info!(
+            "auth mode: STEAM — ticket + OpenID verification against Steam (appid {})",
+            config.app_id
+        ),
     }
     let pool = PgPool::connect(&config.db_url).await.expect("DB connection");
     sqlx::migrate!().run(&pool).await.expect("Migrations");

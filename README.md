@@ -63,6 +63,19 @@ just run
 
 > **Production:** Set `STEAM_API_KEY` to a real [Steam Web API key](https://steamcommunity.com/dev/apikey). The `/auth/test-token` endpoint is disabled automatically when the key is not `"test"`. Change `JWT_SECRET` to a strong random value.
 
+### How to tell which auth mode the server is in
+
+The server logs the active mode at startup:
+
+```
+INFO lobby_server: auth mode: TEST  — /auth/test-token enabled, no Steam verification
+INFO lobby_server: auth mode: STEAM — ticket + OpenID verification against Steam (appid 480)
+```
+
+Or probe it: `POST /auth/test-token` returns a JWT in TEST mode and `404` in STEAM
+mode. Note the web demo (`web/index.html`) only works in TEST mode — its Connect
+button uses the test-token endpoint.
+
 ## WebSocket Quick Test
 
 When `STEAM_API_KEY=test`, the dev-only token endpoint is enabled. Get a JWT and connect:
