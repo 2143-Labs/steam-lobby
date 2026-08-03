@@ -86,9 +86,19 @@ pub trait MatchStore: Send + Sync {
         ended_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()>;
     /// Record the first player's acceptance timestamp.
-    async fn mark_accepted(&self, token: &str) -> Result<()>;
+    /// Returns true if this call claimed the slot (first accept); false if it was already set.
+    async fn mark_accepted(&self, token: &str) -> Result<bool>;
     /// Record the first player's P2P connection timestamp.
-    async fn mark_started(&self, token: &str) -> Result<()>;
+    /// Returns true if this call claimed the slot (first connection); false if it was already set.
+    async fn mark_started(&self, token: &str) -> Result<bool>;
+    /// Persist a resolved match outcome record.
+    async fn write_match_result(
+        &self,
+        token: &str,
+        outcome: &str,
+        mu_change_a: Option<f64>,
+        mu_change_b: Option<f64>,
+    ) -> Result<()>;
 }
 
 #[async_trait]

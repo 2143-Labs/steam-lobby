@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Steam Lobby — Protocol Demo</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+         max-width: 720px; margin: 2rem auto; padding: 0 1rem;
+         background: #111; color: #ddd; }
+  h1 { font-size: 1.2rem; }
+  section { border: 1px solid #333; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+  label { display: block; margin: 0.5rem 0 0.25rem; font-size: 0.8rem; color: #aaa; }
+  input, select, button { font: inherit; padding: 0.4rem 0.6rem; border-radius: 6px;
+         border: 1px solid #555; background: #1c1c1c; color: #eee; }
+  button { cursor: pointer; margin-right: 0.4rem; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { background: #2d6a4f; border-color: #2d6a4f; }
+  #status { font-weight: bold; }
+  #status.ok { color: #74c69d; }
+  #status.err { color: #e76f51; }
+  #opponent { color: #74c69d; }
+  #log { height: 240px; overflow-y: auto; background: #0a0a0a; border: 1px solid #333;
+         border-radius: 6px; padding: 0.5rem; font-size: 0.75rem; white-space: pre-wrap;
+         word-break: break-all; }
+  .in { color: #7fb3ff; } .out { color: #ffd28f; } .sys { color: #888; }
+</style>
+</head>
+<body>
+<h1>Steam Lobby — zero-dependency protocol demo</h1>
+<p class="sys">Uses native <code>fetch</code> + <code>WebSocket</code>. Open two tabs with distinct steam IDs,
+connect both, then start matchmaking in each.</p>
+
+<section id="connect-panel">
+  <label>Server URL</label>
+  <input id="server-url" value="http://localhost:8080" size="30">
+  <label>Steam ID (dev test-token; server must run with STEAM_API_KEY=test)</label>
+  <input id="steam-id" value="76561198000000001" size="20">
+  <button id="btn-connect" class="primary">Connect</button>
+</section>
+
+<section>
+  <label>Status: <span id="status">Disconnected</span></label>
+</section>
+
+<section id="controls" style="display:none">
+  <div id="ctrl-connected">
+    <label>Difficulty</label>
+    <select id="difficulty"><option>easy</option><option selected>normal</option><option>hard</option></select>
+    <button id="btn-queue" class="primary">Start Matchmaking</button>
+  </div>
+  <div id="ctrl-queueing" style="display:none">
+    <button id="btn-cancel">Cancel Matchmaking</button>
+  </div>
+  <div id="ctrl-match" style="display:none">
+    <p>Opponent: <span id="opponent">—</span><br>
+       Match token: <span id="match-token">—</span></p>
+    <button id="btn-accept" class="primary">Accept Match</button>
+    <button id="btn-decline">Decline Match</button>
+  </div>
+  <div id="ctrl-inmatch" style="display:none">
+    <button id="btn-p2p" class="primary">P2P Connected</button>
+    <button id="btn-report-win" style="display:none">Report Win</button>
+    <button id="btn-report-loss" style="display:none">Report Loss</button>
+    <button id="btn-report-draw" style="display:none">Report Draw</button>
+  </div>
+</section>
+
+<section>
+  <label>Event log</label>
+  <div id="log"></div>
+</section>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const state = { ws: null, steamId: null, matchToken: null, opponentId: null };
+
+function setStatus(text, cls) {
+  const el = $("status");
+  el.textContent = text;
+  el.className = cls || "";
+}
+function log(kind, text) {
+  const el = $("log");
+  const line = document.createElement("div");
+  line.className = kind;
+  line.textContent = new Date().toISOString().slice(11, 23) + "  " + text;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+function showControls(name) {
+  $("ctrl-connected").style.display = name === "connected" ? "" : "none";
+  $("ctrl-queueing").style.display = name === "queueing" ? "" : "none";
+  $("ctrl-match").style.display = name === "match" ? "" : "none";
+  $("ctrl-inmatch").style.display = name === "inmatch" ? "" : "none";
+}
+function send(obj) {
+  const text = JSON.stringify(obj);
+  log("out", "→ " + text);
+  state.ws.send(text);
+}
+
+// ── Connect: fetch a dev JWT, then open the WebSocket ──
+$("btn-connect").addEventListener("click", async () => {
+  const base = $("server-url").value.replace(/\/$/, "");
+  const steamId = $("steam-id").value.trim();
+  if (!/^\d+$/.test(steamId)) { setStatus("Error: steam ID must be numeric", "err"); return; }
+
+  setStatus("Fetching test token…");
+  log("sys", "POST " + base + "/auth/test-token");
+  let token;
+  try {
+    const resp = await fetch(base + "/auth/test-token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ steam_id: Number(steamId) }),
+    });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const body = await resp.json();
+    token = body.token;
+    log("sys", "got token (first 12 chars): " + token.slice(0, 12) + "…");
+  } catch (e) {
+    setStatus("Error: test-token request failed — " + e.message, "err");
+    log("sys", "test-token failed: " + e.message);
+    return;
+  }
+
+  const wsUrl = base.replace(/^http/, "ws") + "/ws";
+  try {
+    state.ws = new WebSocket(wsUrl);
+  } catch (e) {
+    setStatus("Error: " + e.message, "err");
+    return;
+  }
+
+  state.ws.onopen = () => {
+    log("sys", "WS open: " + wsUrl);
+    state.steamId = Number(steamId);
+    send({ type: "auth", session_token: token });
+  };
+  state.ws.onmessage = (ev) => handleServer(ev.data);
+  state.ws.onclose = () => {
+    log("sys", "WS closed");
+    if (state.ws) { state.ws = null; }
+    setStatus("Disconnected", "");
+    $("controls").style.display = "none";
+  };
+  state.ws.onerror = () => log("sys", "WS error");
+});
+
+function handleServer(raw) {
+  log("in", "← " + raw);
+  let msg;
+  try { msg = JSON.parse(raw); } catch { return; }
+  switch (msg.type) {
+    case "auth_ok":
+      setStatus("Connected", "ok");
+      $("controls").style.display = "";
+      showControls("connected");
+      break;
+    case "match_found":
+      setStatus("MatchFound", "ok");
+      state.matchToken = msg.match_token;
+      state.opponentId = msg.opponent.steam_id;
+      $("opponent").textContent = msg.opponent.steam_id + " (" + msg.opponent.display_name + ")";
+      $("match-token").textContent = msg.match_token;
+      showControls("match");
+      break;
+    case "match_result":
+      setStatus("Match resolved (" + JSON.stringify(msg.outcome) + ")", "ok");
+      log("sys", "back to Connected — start a new match or disconnect");
+      showControls("connected");
+      state.matchToken = null;
+      break;
+    case "match_declined":
+      setStatus("Match declined", "");
+      showControls("connected");
+      state.matchToken = null;
+      break;
+    case "error":
+      setStatus("Error: " + msg.message, "err");
+      showControls("connected");
+      break;
+    default:
+      log("sys", "unhandled event type: " + msg.type);
+  }
+}
+
+$("btn-queue").addEventListener("click", () => {
+  send({ type: "begin_matchmaking", mode: "ranked_1v1", difficulty: $("difficulty").value });
+  setStatus("Queueing…", "");
+  showControls("queueing");
+});
+$("btn-cancel").addEventListener("click", () => {
+  send({ type: "cancel_matchmaking" });
+  setStatus("Connected", "ok");
+  showControls("connected");
+});
+$("btn-accept").addEventListener("click", () => {
+  send({ type: "accept_match", match_token: state.matchToken });
+  log("sys", "match accepted — send P2P Connected when your transport is up");
+  showControls("inmatch");
+  $("btn-p2p").style.display = "";
+});
+$("btn-decline").addEventListener("click", () => {
+  send({ type: "decline_match", match_token: state.matchToken });
+});
+$("btn-p2p").addEventListener("click", () => {
+  send({ type: "p2p_connected", match_token: state.matchToken });
+  $("btn-p2p").style.display = "none";
+  $("btn-report-win").style.display = "";
+  $("btn-report-loss").style.display = "";
+  $("btn-report-draw").style.display = "";
+});
+$("btn-report-win").addEventListener("click", () => {
+  send({ type: "match_report", match_token: state.matchToken, winner: state.steamId, demo_hash: "web-demo" });
+});
+$("btn-report-loss").addEventListener("click", () => {
+  // Winner is the opponent.
+  send({ type: "match_report", match_token: state.matchToken, winner: state.opponentId, demo_hash: "web-demo" });
+});
+$("btn-report-draw").addEventListener("click", () => {
+  send({ type: "match_report", match_token: state.matchToken, winner: null, demo_hash: "web-demo" });
+});
+
+</script>
+</body>
+</html>

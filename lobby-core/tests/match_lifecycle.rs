@@ -11,12 +11,15 @@ use std::collections::HashMap;
 
 // ── Mock Stores ──────────────────────────────────────────
 
+type StoredResult = (String, Option<f64>, Option<f64>);
+
 struct MockStore {
     players: Mutex<HashMap<SteamId, PlayerInfo>>,
     ratings: Mutex<HashMap<(SteamId, String), OpenSkillRating>>,
     matches: Mutex<HashMap<String, MatchInfo>>,
     reports: Mutex<HashMap<String, Vec<MatchReport>>>,
     queue: Mutex<HashMap<(SteamId, String), QueueEntry>>,
+    results: Mutex<HashMap<String, StoredResult>>,
 }
 
 impl MockStore {
@@ -27,6 +30,7 @@ impl MockStore {
             matches: Mutex::new(HashMap::new()),
             reports: Mutex::new(HashMap::new()),
             queue: Mutex::new(HashMap::new()),
+            results: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -156,19 +160,39 @@ impl MatchStore for MockStore {
         Ok(())
     }
 
-    async fn mark_accepted(&self, token: &str) -> Result<()> {
+    async fn mark_accepted(&self, token: &str) -> Result<bool> {
         let mut m = self.matches.lock();
         if let Some(mi) = m.get_mut(token) {
-            mi.accepted_at = Some(Utc::now());
+            if mi.accepted_at.is_none() {
+                mi.accepted_at = Some(Utc::now());
+                return Ok(true);
+            }
         }
-        Ok(())
+        Ok(false)
     }
 
-    async fn mark_started(&self, token: &str) -> Result<()> {
+    async fn mark_started(&self, token: &str) -> Result<bool> {
         let mut m = self.matches.lock();
         if let Some(mi) = m.get_mut(token) {
-            mi.started_at = Some(Utc::now());
+            if mi.started_at.is_none() {
+                mi.started_at = Some(Utc::now());
+                return Ok(true);
+            }
         }
+        Ok(false)
+    }
+
+    async fn write_match_result(
+        &self,
+        token: &str,
+        outcome: &str,
+        mu_change_a: Option<f64>,
+        mu_change_b: Option<f64>,
+    ) -> Result<()> {
+        self.results.lock().insert(
+            token.to_string(),
+            (outcome.to_string(), mu_change_a, mu_change_b),
+        );
         Ok(())
     }
 }

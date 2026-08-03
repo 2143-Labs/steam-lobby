@@ -327,25 +327,52 @@ impl MatchStore for PostgresStore {
         Ok(())
     }
 
-    async fn mark_accepted(&self, token: &str) -> Result<()> {
-        sqlx::query("UPDATE matches SET accepted_at = NOW() WHERE match_token = $1")
-            .bind(token)
-            .execute(&self.pool)
-            .await
-            .map_err(map_db_error)?;
-        Ok(())
+    async fn mark_accepted(&self, token: &str) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE matches SET accepted_at = NOW() \
+             WHERE match_token = $1 AND accepted_at IS NULL",
+        )
+        .bind(token)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_error)?;
+        Ok(res.rows_affected() == 1)
     }
 
-    async fn mark_started(&self, token: &str) -> Result<()> {
-        sqlx::query("UPDATE matches SET started_at = NOW() WHERE match_token = $1")
-            .bind(token)
-            .execute(&self.pool)
-            .await
-            .map_err(map_db_error)?;
+    async fn mark_started(&self, token: &str) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE matches SET started_at = NOW() \
+             WHERE match_token = $1 AND started_at IS NULL",
+        )
+        .bind(token)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_error)?;
+        Ok(res.rows_affected() == 1)
+    }
+
+
+    async fn write_match_result(
+        &self,
+        token: &str,
+        outcome: &str,
+        mu_change_a: Option<f64>,
+        mu_change_b: Option<f64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO match_results (match_token, outcome, mu_change_a, mu_change_b) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(token)
+        .bind(outcome)
+        .bind(mu_change_a)
+        .bind(mu_change_b)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_error)?;
         Ok(())
     }
 }
-
 #[async_trait]
 impl QueueStore for PostgresStore {
     async fn enqueue(&self, entry: &QueueEntry) -> Result<()> {

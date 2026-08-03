@@ -37,13 +37,14 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         if steam_id != m.player_a && steam_id != m.player_b {
             return Err(LobbyError::NotParticipant(token.to_string()));
         }
-        if m.accepted_at.is_some() {
+        if match_store.mark_accepted(token).await? {
+            // First player to accept — keep status PendingAccept until the second accepts.
+        } else {
+            // Second player — both accepted, transition to InProgress.
             match_store
                 .update_match_status(token, MatchStatus::InProgress)
                 .await?;
             self.callbacks.on_match_accepted(&m).await?;
-        } else {
-            match_store.mark_accepted(token).await?;
         }
         Ok(())
     }
@@ -64,15 +65,14 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         if steam_id != m.player_a && steam_id != m.player_b {
             return Err(LobbyError::NotParticipant(token.to_string()));
         }
-        if m.started_at.is_some() {
-            // Second player — both connected, transition to Reporting
+        if match_store.mark_started(token).await? {
+            // First player to connect — keep status InProgress until the second connects.
+        } else {
+            // Second player — both connected, transition to Reporting.
             match_store
                 .update_match_status(token, MatchStatus::Reporting)
                 .await?;
             self.callbacks.on_players_connected(&m).await?;
-        } else {
-            // First player — mark timestamp
-            match_store.mark_started(token).await?;
         }
         Ok(())
     }
@@ -124,8 +124,12 @@ impl<CB: GameCallbacks> MatchManager<CB> {
             rating_store
                 .update_rating(m.player_b, &m.game_mode, &new_b)
                 .await?;
-            // TODO: persist match result to match_results table after rating updates
+            let outcome_str = if winner_a == Some(m.player_a) { "Win" } else if winner_a == Some(m.player_b) { "Loss" } else { "Draw" };
+            let mu_change_b = new_b.mu - rating_b.mu;
             let mu_change_a = new_a.mu - rating_a.mu;
+            match_store
+                .write_match_result(token, outcome_str, Some(mu_change_a), Some(mu_change_b))
+                .await?;
             match_store
                 .update_match(token, MatchStatus::Resolved, Utc::now())
                 .await?;
@@ -176,7 +180,12 @@ impl<CB: GameCallbacks> MatchManager<CB> {
             rating_store
                 .update_rating(m.player_b, &m.game_mode, &new_b)
                 .await?;
+            let outcome_str = if winner_a == Some(m.player_a) { "Win" } else if winner_a == Some(m.player_b) { "Loss" } else { "Draw" };
+            let mu_change_b = new_b.mu - rating_b.mu;
             let mu_change_a = new_a.mu - rating_a.mu;
+            match_store
+                .write_match_result(token, outcome_str, Some(mu_change_a), Some(mu_change_b))
+                .await?;
             match_store
                 .update_match(token, MatchStatus::Resolved, Utc::now())
                 .await?;
