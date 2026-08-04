@@ -565,9 +565,15 @@ impl QueueStore for PostgresStore {
     }
 
     async fn remove_stale_queue_entries(&self, timeout: Duration) -> Result<Vec<SteamId>> {
+        // Liveness is the player's heartbeat, not the moment they queued:
+        // a client that keeps heartbeating may stay queued indefinitely.
         let cutoff = Utc::now() - timeout;
         let rows = sqlx::query_scalar::<_, i64>(
-            "DELETE FROM matchmaking_queue WHERE queued_at < $1 RETURNING steam_id",
+            "DELETE FROM matchmaking_queue q \
+             USING player_state ps \
+             WHERE q.steam_id = ps.steam_id \
+               AND ps.last_heartbeat < $1 \
+             RETURNING q.steam_id",
         )
         .bind(cutoff)
         .fetch_all(&self.pool)

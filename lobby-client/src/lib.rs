@@ -43,6 +43,7 @@ enum ClientMsg {
     DeclineMatch { match_token: String },
     P2pConnected { match_token: String },
     MatchReport { match_token: String, winner: Option<u64>, demo_hash: Option<String> },
+    Heartbeat,
 }
 
 // Hand-written so session tokens never appear in logs: the JWT is a
@@ -77,6 +78,7 @@ impl std::fmt::Debug for ClientMsg {
                 .field("winner", winner)
                 .field("demo_hash", demo_hash)
                 .finish(),
+            ClientMsg::Heartbeat => f.write_str("Heartbeat"),
         }
     }
 }
@@ -307,6 +309,12 @@ impl LobbyClient {
     /// Leave the queue (no server response expected).
     pub async fn cancel_matchmaking(&mut self) -> Result<(), ClientError> {
         self.send(ClientMsg::CancelMatchmaking)
+    }
+
+    /// Tell the server the client is still alive. While queueing, refresh
+    /// regularly (e.g. every 5s) to keep the queue entry from going stale.
+    pub async fn heartbeat(&mut self) -> Result<(), ClientError> {
+        self.send(ClientMsg::Heartbeat)
     }
 
     /// Accept a found match.

@@ -118,6 +118,17 @@ function showControls(name) {
   $("ctrl-queueing").style.display = name === "queueing" ? "" : "none";
   $("ctrl-match").style.display = name === "match" ? "" : "none";
   $("ctrl-inmatch").style.display = name === "inmatch" ? "" : "none";
+  // The queue entry only survives while the client heartbeats. Heartbeat
+  // while the queueing panel is up; stop as soon as we leave it.
+  if (name === "queueing") startHeartbeat(); else stopHeartbeat();
+}
+let hbTimer = null;
+function startHeartbeat() {
+  stopHeartbeat();
+  hbTimer = setInterval(() => send({ type: "heartbeat" }), 5000);
+}
+function stopHeartbeat() {
+  if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
 }
 function send(obj) {
   const text = JSON.stringify(obj);
@@ -176,6 +187,7 @@ $("btn-connect").addEventListener("click", async () => {
   };
   state.ws.onmessage = (ev) => handleServer(ev.data);
   state.ws.onclose = () => {
+    stopHeartbeat();
     log("sys", "WS closed");
     if (state.ws) { state.ws = null; }
     setStatus("Disconnected", "");

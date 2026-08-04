@@ -190,6 +190,7 @@ All communication happens over a single WebSocket connection at `/ws`. Messages 
 | `decline_match` | `match_token: String` | Decline a found match (rare — acceptance is the default) |
 | `p2p_connected` | `match_token: String` | Notify server that P2P connection to opponent is established |
 | `match_report` | `match_token: String`, `winner: u64?`, `demo_hash: String?` | Submit match result (winner is the victor's steam_id; `null` for draw) |
+| `heartbeat` | — | Client liveness signal. While queueing, send every ~5s to keep your queue entry alive indefinitely; without heartbeats the entry is dropped 30s after the last one |
 
 ### Server → Client
 
@@ -203,8 +204,7 @@ All communication happens over a single WebSocket connection at `/ws`. Messages 
 | `error` | `message: String` | An error occurred processing a message |
 | `match_result` | `match_token: String`, `outcome: Value` | The reports agreed and the match resolved (`Win`/`Loss`/`Draw`/`Disputed` with mu change) — sent to **both** players |
 | `match_declined` | `match_token: String` | A player declined the found match — sent to **both** players (the decliner's ack + the opponent's notification) |
-| `match_expired` | `match_token: String` | Nobody accepted within the accept window — sent to **both** players |
-| `queue_expired` | — | The player's queue entry was dropped (30s without a match or heartbeat) |
+| `queue_expired` | — | The player's queue entry was dropped (30s without a heartbeat) — sent to the player so the UI never freezes on a dead queue |
 
 ### Typical flow
 

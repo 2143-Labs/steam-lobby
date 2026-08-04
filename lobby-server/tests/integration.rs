@@ -501,7 +501,7 @@ async fn queue_expired_notifies_player() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    sqlx::query("UPDATE matchmaking_queue SET queued_at = NOW() - INTERVAL '40 seconds'")
+    sqlx::query("UPDATE player_state SET last_heartbeat = NOW() - INTERVAL '40 seconds' WHERE steam_id = 701")
         .execute(&h.pool)
         .await
         .unwrap();
@@ -520,6 +520,76 @@ async fn queue_expired_notifies_player() {
         }
     }
     assert!(told, "queued player must be told when its entry expires");
+
+    drop(p1);
+}
+
+#[tokio::test]
+async fn heartbeat_keeps_queued_alive() {
+    let h = setup().await;
+
+    let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    p1.authenticate_test_token(702, &h.base_url).await.unwrap();
+    p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+
+    // Wait for the server to enqueue the player (fire-and-forget message).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let queued: Option<i64> = sqlx::query_scalar(
+            "SELECT steam_id FROM matchmaking_queue WHERE steam_id = 702",
+        )
+        .fetch_optional(&h.pool)
+        .await
+        .unwrap();
+        if queued.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queue row never appeared for the queued player"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The player's heartbeat is 40s old: without heartbeats the next tick
+    // would drop the entry (see queue_expired_notifies_player). Keep the
+    // client heartbeating across several 2s ticker cycles instead.
+    sqlx::query("UPDATE player_state SET last_heartbeat = NOW() - INTERVAL '40 seconds' WHERE steam_id = 702")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        p1.heartbeat().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+    }
+
+    // One more full tick without a heartbeat (it ages to ~4s) — still well
+    // inside the 30s window, so the entry must have survived cleanup.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let still: Option<i64> = sqlx::query_scalar(
+        "SELECT steam_id FROM matchmaking_queue WHERE steam_id = 702",
+    )
+    .fetch_optional(&h.pool)
+    .await
+    .unwrap();
+    assert!(still.is_some(), "heartbeating player must stay queued");
+
+    // And the client must never have been told its entry expired.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut expired = false;
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(2), p1.next_event()).await {
+            Ok(Some(Ok(lobby_client::ServerEvent::QueueExpired))) => {
+                expired = true;
+                break;
+            }
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(e))) => panic!("client error: {e}"),
+            Ok(None) => break,
+        }
+    }
+    assert!(!expired, "heartbeating player must not be told queue_expired");
 
     drop(p1);
 }
