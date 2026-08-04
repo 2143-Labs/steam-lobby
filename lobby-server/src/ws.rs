@@ -51,6 +51,7 @@ pub enum ServerMessage {
         #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
         steam_id: u64,
         display_name: String,
+        state: lobby_core::types::PlayerState,
     },
     QueueStatus {
         elapsed_ms: u64,
@@ -93,6 +94,10 @@ pub enum ServerMessage {
     MatchDeclined {
         match_token: String,
     },
+    MatchExpired {
+        match_token: String,
+    },
+    QueueExpired,
     Error {
         code: String,
         message: String,
@@ -116,17 +121,27 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
         Err(_) => return,
     };
 
-    // Send auth ok
+    // Send auth ok — include the player's persisted state so a reconnecting
+    // client knows it was in the queue, mid-match, etc.
     let display_name = state
         .steam_auth
         .get_player_summary(steam_id)
         .await
         .unwrap_or_else(|_| "Unknown".into());
+    let player_state = state
+        .store
+        .get_player_state(steam_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.state)
+        .unwrap_or(lobby_core::types::PlayerState::InMenus);
     let _ = sender
         .send(Message::Text(
             serde_json::to_string(&ServerMessage::AuthOk {
                 steam_id,
                 display_name: display_name.clone(),
+                state: player_state,
             })
             .unwrap()
             .into(),

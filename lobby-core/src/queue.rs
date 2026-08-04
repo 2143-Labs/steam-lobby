@@ -5,10 +5,7 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::traits::{GameCallbacks, MatchStore, PlayerStore, QueueStore, RatingStore};
-use crate::types::{MatchInfo, MatchStatus};
-
-/// Do not re-pair the same two accounts within this window after a resolved match.
-const SAME_PAIR_COOLDOWN_SECS: i64 = 300;
+use crate::types::{MatchInfo, MatchStatus, SteamId};
 
 /// Expanding search band: 50 at t=0, +25 every 10s of wait, capped at 400.
 /// Returns `(lo, hi)` in MMR terms, both shifted by the difficulty offset.
@@ -17,13 +14,23 @@ pub fn search_band(wait_secs: f64, mu: f64, offset: f64) -> (f64, f64) {
     (mu - band + offset, mu + band + offset)
 }
 
+/// Do not re-pair the same two accounts within this window after a resolved
+/// match (anti rating-farm). Configurable so a demo can rematch instantly.
 pub struct MatchmakingQueue<CB: GameCallbacks> {
     callbacks: CB,
+    pair_cooldown_secs: i64,
 }
 
 impl<CB: GameCallbacks> MatchmakingQueue<CB> {
     pub fn new(callbacks: CB) -> Self {
-        Self { callbacks }
+        Self::with_pair_cooldown(callbacks, 300)
+    }
+
+    pub fn with_pair_cooldown(callbacks: CB, pair_cooldown_secs: i64) -> Self {
+        Self {
+            callbacks,
+            pair_cooldown_secs,
+        }
     }
 
     /// tick scans the queue for a mode, pairs compatible players using expanding MMR bands.
@@ -87,7 +94,7 @@ impl<CB: GameCallbacks> MatchmakingQueue<CB> {
                     .recent_match_between(
                         player_a.steam_id,
                         player_b.steam_id,
-                        now - chrono::Duration::seconds(SAME_PAIR_COOLDOWN_SECS),
+                        now - chrono::Duration::seconds(self.pair_cooldown_secs),
                     )
                     .await?
                 {
@@ -142,7 +149,8 @@ impl<CB: GameCallbacks> MatchmakingQueue<CB> {
     }
 
     /// Remove queue entries for players with no heartbeat in the last 30 seconds.
-    pub async fn cleanup_stale(&self, queue_store: &dyn QueueStore) -> Result<()> {
+    /// Returns the steam_ids that were removed.
+    pub async fn cleanup_stale(&self, queue_store: &dyn QueueStore) -> Result<Vec<SteamId>> {
         queue_store
             .remove_stale_queue_entries(chrono::Duration::seconds(30))
             .await

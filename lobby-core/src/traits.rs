@@ -129,7 +129,8 @@ pub trait QueueStore: Send + Sync {
     async fn enqueue(&self, entry: &QueueEntry) -> Result<()>;
     async fn dequeue(&self, steam_id: SteamId, mode: &str) -> Result<()>;
     async fn get_queue(&self, mode: &str) -> Result<Vec<QueueEntry>>;
-    async fn remove_stale_queue_entries(&self, timeout: chrono::Duration) -> Result<()>;
+    /// Remove stale entries; returns the steam_ids that were removed.
+    async fn remove_stale_queue_entries(&self, timeout: chrono::Duration) -> Result<Vec<SteamId>>;
 }
 
 #[async_trait]

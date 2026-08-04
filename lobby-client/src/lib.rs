@@ -90,6 +90,7 @@ pub enum ServerEvent {
         #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
         steam_id: u64,
         display_name: String,
+        state: lobby_core::types::PlayerState,
     },
     #[serde(rename = "match_found")]
     MatchFound { match_token: String, opponent: OpponentInfo, timeout_ms: u64 },
@@ -106,7 +107,6 @@ pub enum ServerEvent {
     },
     #[serde(rename = "opponent_connected")]
     OpponentConnected { match_token: String },
-    #[serde(rename = "report_received")]
     ReportReceived {
         match_token: String,
         #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
@@ -117,8 +117,12 @@ pub enum ServerEvent {
     },
     #[serde(rename = "match_declined")]
     MatchDeclined { match_token: String },
+    #[serde(rename = "match_expired")]
+    MatchExpired { match_token: String },
     #[serde(rename = "match_result")]
     MatchResult { match_token: String, outcome: serde_json::Value },
+    #[serde(rename = "queue_expired")]
+    QueueExpired,
     Error { message: String },
 }
 
@@ -133,6 +137,7 @@ pub struct OpponentInfo {
 pub struct AuthOk {
     pub steam_id: u64,
     pub display_name: String,
+    pub state: lobby_core::types::PlayerState,
 }
 
 #[derive(Debug, Clone)]
@@ -249,9 +254,15 @@ impl LobbyClient {
     pub async fn authenticate(&mut self, token: &str) -> Result<AuthOk, ClientError> {
         self.send(ClientMsg::Auth { session_token: token.to_string() })?;
         match self.rx.recv().await.ok_or(ClientError::NoResponse)? {
-            Ok(ServerEvent::AuthOk { steam_id, display_name }) => {
-                Ok(AuthOk { steam_id, display_name })
-            }
+            Ok(ServerEvent::AuthOk {
+                steam_id,
+                display_name,
+                state,
+            }) => Ok(AuthOk {
+                steam_id,
+                display_name,
+                state,
+            }),
             Ok(ServerEvent::Error { message }) => Err(ClientError::Server(message)),
             Ok(other) => Err(ClientError::UnexpectedResponse(other)),
             Err(e) => Err(e),
@@ -265,10 +276,7 @@ impl LobbyClient {
         steam_id: u64,
         base_url: &str,
     ) -> Result<AuthOk, ClientError> {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| ClientError::Connection(e.to_string()))?;
+        let client = reqwest::Client::new();
         let resp = client
             .post(format!("{base_url}/auth/test-token"))
             .json(&serde_json::json!({"steam_id": steam_id}))

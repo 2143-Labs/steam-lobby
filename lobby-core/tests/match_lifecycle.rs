@@ -290,8 +290,18 @@ impl QueueStore for MockStore {
             .collect())
     }
 
-    async fn remove_stale_queue_entries(&self, _timeout: Duration) -> Result<()> {
-        Ok(())
+    async fn remove_stale_queue_entries(&self, timeout: Duration) -> Result<Vec<SteamId>> {
+        let cutoff = Utc::now() - timeout;
+        let mut queue = self.queue.lock();
+        let stale: Vec<SteamId> = queue
+            .values()
+            .filter(|e| e.queued_at < cutoff)
+            .map(|e| e.steam_id)
+            .collect();
+        for id in &stale {
+            queue.retain(|(sid, _mode), _e| sid != id);
+        }
+        Ok(stale)
     }
 }
 

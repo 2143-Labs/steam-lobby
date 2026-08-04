@@ -29,6 +29,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "300".into())
             .parse()
             .unwrap_or(300),
+        pair_cooldown_secs: std::env::var("LOBBY_PAIR_COOLDOWN_S")
+            .unwrap_or_else(|_| "300".into())
+            .parse()
+            .unwrap_or(300),
         public_url: std::env::var("PUBLIC_URL").ok().filter(|s| !s.is_empty()),
         auth_dev_mode: std::env::var("AUTH_DEV_MODE")
             .map(|v| v == "true" || v == "1")

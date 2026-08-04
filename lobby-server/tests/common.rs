@@ -62,6 +62,7 @@ pub async fn setup() -> TestHarness {
         port: 0,
         match_accept_timeout_secs: 30,
         report_timeout_secs: 300,
+        pair_cooldown_secs: 300,
         public_url: Some("https://lobby.example.com".into()),
         auth_dev_mode: true,
         jwt_ttl_secs: 86400,

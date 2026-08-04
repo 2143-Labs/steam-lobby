@@ -185,12 +185,12 @@ impl<CB: GameCallbacks> MatchManager<CB> {
             }
         }
     }
-
-    pub async fn expire_pending_accepts(&self, match_store: &dyn MatchStore) -> Result<()> {
+    pub async fn expire_pending_accepts(&self, match_store: &dyn MatchStore) -> Result<Vec<String>> {
         let matches = match_store
             .get_matches_by_status(MatchStatus::PendingAccept)
             .await?;
         let now = Utc::now();
+        let mut expired = Vec::new();
         for m in &matches {
             if (now - m.created_at).num_seconds().max(0) as u64 > self.match_accept_timeout_secs {
                 tracing::info!(
@@ -203,20 +203,22 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                 match_store
                     .update_match_status(&m.match_token, MatchStatus::Disputed)
                     .await?;
+                expired.push(m.match_token.clone());
             }
         }
-        Ok(())
+        Ok(expired)
     }
 
     pub async fn expire_pending_reports(
         &self,
         match_store: &dyn MatchStore,
         rating_store: &dyn RatingStore,
-    ) -> Result<()> {
+    ) -> Result<Vec<(String, MatchOutcome)>> {
         let matches = match_store
             .get_matches_by_status(MatchStatus::Reporting)
             .await?;
         let now = Utc::now();
+        let mut resolved = Vec::new();
         for m in &matches {
             if let Some(ended_at) = m.ended_at {
                 if (now - ended_at).num_seconds().max(0) as u64 > self.report_timeout_secs {
@@ -229,6 +231,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                         match_store
                             .update_match_status(&m.match_token, MatchStatus::Disputed)
                             .await?;
+                        resolved.push((m.match_token.clone(), MatchOutcome::Disputed));
                     } else if reports.len() == 1 {
                         let report = &reports[0];
                         let winner_ok = match report.winner {
@@ -244,6 +247,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                             match_store
                                 .update_match_status(&m.match_token, MatchStatus::Disputed)
                                 .await?;
+                            resolved.push((m.match_token.clone(), MatchOutcome::Disputed));
                             continue;
                         }
                         let rating_a = rating_store.get_rating(m.player_a, &m.game_mode).await?;
@@ -284,10 +288,24 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                                 &new_b,
                             )
                             .await?;
+                        let outcome = if report.winner == Some(m.player_a) {
+                            MatchOutcome::Win {
+                                mu_change: mu_change_a,
+                            }
+                        } else if report.winner == Some(m.player_b) {
+                            MatchOutcome::Loss {
+                                mu_change: mu_change_a,
+                            }
+                        } else {
+                            MatchOutcome::Draw {
+                                mu_change: mu_change_a,
+                            }
+                        };
+                        resolved.push((m.match_token.clone(), outcome));
                     }
                 }
             }
         }
-        Ok(())
+        Ok(resolved)
     }
 }

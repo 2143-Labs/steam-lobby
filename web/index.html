@@ -190,9 +190,10 @@ function handleServer(raw) {
   try { msg = JSON.parse(raw); } catch { return; }
   switch (msg.type) {
     case "auth_ok":
-      setStatus("Connected", "ok");
+      setStatus(msg.state === "queueing" ? "Connected — still in queue" : "Connected", "ok");
       $("controls").style.display = "";
-      showControls("connected");
+      showControls(msg.state === "queueing" ? "queueing" : "connected");
+      log("sys", "server state on connect: " + msg.state);
       break;
     case "match_found":
       setStatus("MatchFound", "ok");
@@ -239,11 +240,20 @@ function handleServer(raw) {
       $("report-status").textContent = who + " reported: " + w;
       log("sys", who + " reported: " + w);
       break;
-    case "match_result":
-      setStatus("Match resolved (" + JSON.stringify(msg.outcome) + ")", "ok");
-      log("sys", "back to Connected — start a new match or disconnect");
+    case "match_expired":
+      setStatus("Match expired — no one accepted in time", "");
+      log("sys", "match expired — no one accepted in time");
       showControls("connected");
       state.matchToken = null;
+      break;
+    case "queue_expired":
+      setStatus("Removed from queue — no opponent found in time", "");
+      log("sys", "removed from queue (no heartbeat / no match found)");
+      showControls("connected");
+      $("q-wait").textContent = "—";
+      $("q-band").textContent = "—";
+      $("q-cands").textContent = "—";
+      $("q-size").textContent = "—";
       break;
     case "match_declined":
       setStatus("Match declined", "");
@@ -280,10 +290,13 @@ $("btn-accept").addEventListener("click", () => {
   send({ type: "accept_match", match_token: state.matchToken });
   log("sys", "match accepted — send P2P Connected when your transport is up");
   showControls("inmatch");
+  // Reset the in-match panel so a previous game's state never leaks in.
   $("btn-p2p").style.display = "";
-});
-$("btn-decline").addEventListener("click", () => {
-  send({ type: "decline_match", match_token: state.matchToken });
+  $("btn-report-win").style.display = "none";
+  $("btn-report-loss").style.display = "none";
+  $("btn-report-draw").style.display = "none";
+  $("opp-p2p").textContent = "Waiting for opponent P2P…";
+  $("report-status").textContent = "—";
 });
 $("btn-p2p").addEventListener("click", () => {
   send({ type: "p2p_connected", match_token: state.matchToken });

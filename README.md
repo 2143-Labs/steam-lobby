@@ -80,6 +80,7 @@ need a POSIX shell. Use WSL2 or Git Bash, or run the server directly:
 | `CORS_ORIGINS` | — | Comma-separated browser origins allowed to call the API (the web demo origin) |
 | `MATCH_ACCEPT_TIMEOUT_S` | `30` | Seconds players have to accept a match |
 | `REPORT_TIMEOUT_S` | `300` | Seconds after match ends to report outcome |
+| `LOBBY_PAIR_COOLDOWN_S` | `300` | Seconds before the same two accounts can re-pair after a match; set `0` for the demo to rematch instantly |
 | `RUST_LOG` | `info,lobby_server=debug` | Tracing log level |
 | `LOBBY_HOST` | `0.0.0.0` | Bind address |
 | `LOBBY_PORT` | `8080` | Bind port |
@@ -194,7 +195,7 @@ All communication happens over a single WebSocket connection at `/ws`. Messages 
 
 | Type | Fields | Description |
 |------|--------|-------------|
-| `auth_ok` | `steam_id: u64`, `display_name: String` | Authentication succeeded |
+| `auth_ok` | `steam_id: u64`, `display_name: String`, `state: string` | Authentication succeeded; `state` is the player's persisted status (`in_menus`/`queueing`/`match_accepted`/`in_match`/`reporting`) so a reconnect knows where it left off |
 | `match_found` | `match_token: String`, `opponent: { steam_id, display_name }`, `timeout_ms: u64` | A match is ready — accept or it expires |
 | `queue_status` | `elapsed_ms`, `band_lo/hi`, `candidates`, `queue_size`, `my_mu/sigma/rating`, `leaderboard: [{steam_id, mu, sigma, rating}]` | Live queue stats pushed every ~2s while queueing (wait time, expanding MMR band, opponents available, your rating, full MMR leaderboard) |
 | `opponent_connected` | `match_token` | The opponent's `p2p_connected` signal was accepted |
@@ -202,6 +203,8 @@ All communication happens over a single WebSocket connection at `/ws`. Messages 
 | `error` | `message: String` | An error occurred processing a message |
 | `match_result` | `match_token: String`, `outcome: Value` | The reports agreed and the match resolved (`Win`/`Loss`/`Draw`/`Disputed` with mu change) — sent to **both** players |
 | `match_declined` | `match_token: String` | A player declined the found match — sent to **both** players (the decliner's ack + the opponent's notification) |
+| `match_expired` | `match_token: String` | Nobody accepted within the accept window — sent to **both** players |
+| `queue_expired` | — | The player's queue entry was dropped (30s without a match or heartbeat) |
 
 ### Typical flow
 

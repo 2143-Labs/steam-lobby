@@ -564,18 +564,19 @@ impl QueueStore for PostgresStore {
             .collect())
     }
 
-    async fn remove_stale_queue_entries(&self, timeout: Duration) -> Result<()> {
+    async fn remove_stale_queue_entries(&self, timeout: Duration) -> Result<Vec<SteamId>> {
         let cutoff = Utc::now() - timeout;
-        let result = sqlx::query("DELETE FROM matchmaking_queue WHERE queued_at < $1")
-            .bind(cutoff)
-            .execute(&self.pool)
-            .await
-            .map_err(map_db_error)?;
-        let removed = result.rows_affected();
-        if removed > 0 {
-            tracing::info!("removed {removed} stale queue entries (no heartbeat)");
+        let rows = sqlx::query_scalar::<_, i64>(
+            "DELETE FROM matchmaking_queue WHERE queued_at < $1 RETURNING steam_id",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_db_error)?;
+        if !rows.is_empty() {
+            tracing::info!("removed {} stale queue entries (no heartbeat)", rows.len());
         }
-        Ok(())
+        Ok(rows.into_iter().map(|id| id as SteamId).collect())
     }
 }
 

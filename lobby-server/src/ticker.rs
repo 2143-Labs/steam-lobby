@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use lobby_core::traits::{QueueStore, RatingStore};
+use lobby_core::traits::{MatchStore, QueueStore, RatingStore};
 use lobby_core::types::LeaderboardEntry;
 
 use crate::state::AppState;
@@ -132,14 +132,63 @@ pub async fn tick_loop(state: Arc<AppState>) {
                 }
             }
         }
-        let _ = state.matchmaking_queue.cleanup_stale(&state.store).await;
-        let _ = state
+        if let Ok(removed) = state.matchmaking_queue.cleanup_stale(&state.store).await {
+            if !removed.is_empty() {
+                let connections = state.connections.lock().await;
+                for sid in removed {
+                    if let Some(e) = connections.get(&sid) {
+                        let _ = e.tx.send(ServerMessage::QueueExpired);
+                    }
+                }
+            }
+        }
+
+        // Tell both players when their match dies so no client is left
+        // waiting on a panel that can never resolve.
+        if let Ok(expired) = state
             .match_manager
             .expire_pending_accepts(&state.store)
-            .await;
-        let _ = state
+            .await
+        {
+            for token in expired {
+                notify_match_players(
+                    &state,
+                    &token,
+                    ServerMessage::MatchExpired {
+                        match_token: token.clone(),
+                    },
+                )
+                .await;
+            }
+        }
+        if let Ok(resolved) = state
             .match_manager
             .expire_pending_reports(&state.store, &state.store)
-            .await;
+            .await
+        {
+            for (token, outcome) in resolved {
+                notify_match_players(
+                    &state,
+                    &token,
+                    ServerMessage::MatchResult {
+                        match_token: token.clone(),
+                        outcome: serde_json::to_value(&outcome).unwrap(),
+                    },
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// Send `msg` to both participants of `token` that are currently connected.
+async fn notify_match_players(state: &Arc<AppState>, token: &str, msg: ServerMessage) {
+    if let Ok(Some(m)) = state.store.get_match(token).await {
+        let connections = state.connections.lock().await;
+        for pid in [m.player_a, m.player_b] {
+            if let Some(e) = connections.get(&pid) {
+                let _ = e.tx.send(msg.clone());
+            }
+        }
     }
 }

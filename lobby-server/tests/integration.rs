@@ -364,6 +364,167 @@ async fn decline_notifies_opponent() {
 }
 
 #[tokio::test]
+async fn auth_ok_reports_state() {
+    use lobby_core::types::PlayerState;
+
+    let h = setup().await;
+
+    let mut c1 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    let auth = c1.authenticate_test_token(601, &h.base_url).await.unwrap();
+    assert_eq!(auth.state, PlayerState::InMenus, "fresh player starts in menus");
+
+    c1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+
+    // A second connection for the same player reports the persisted state.
+    let mut c2 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    let auth2 = c2.authenticate_test_token(601, &h.base_url).await.unwrap();
+    assert_eq!(
+        auth2.state,
+        PlayerState::Queueing,
+        "reconnecting while queueing must report queueing"
+    );
+
+    drop(c1);
+    drop(c2);
+}
+
+#[tokio::test]
+async fn match_expired_notifies_players() {
+    let h = setup().await;
+
+    let (mut p1, mut p2, token) = pair_up(&h, 100, 200).await;
+
+    // Pretend the accept window already lapsed (30s); the next tick expires it.
+    sqlx::query("UPDATE matches SET created_at = NOW() - INTERVAL '40 seconds' WHERE match_token = $1")
+        .bind(&token)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    for (name, client) in [("p1", &mut p1), ("p2", &mut p2)] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        let mut told = false;
+        while std::time::Instant::now() < deadline {
+            match timeout(Duration::from_secs(2), client.next_event()).await {
+                Ok(Some(Ok(lobby_client::ServerEvent::MatchExpired {
+                    match_token,
+                }))) => {
+                    assert_eq!(match_token, token);
+                    told = true;
+                    break;
+                }
+                Ok(Some(Ok(_))) | Err(_) => continue,
+                Ok(Some(Err(e))) => panic!("{name} client error: {e}"),
+                Ok(None) => break,
+            }
+        }
+        assert!(told, "{name} must be told the match expired");
+    }
+
+    drop(p1);
+    drop(p2);
+}
+
+#[tokio::test]
+async fn report_timeout_resolves_and_notifies() {
+    let h = setup().await;
+
+    let (mut p1, mut p2, token) = pair_up(&h, 100, 200).await;
+    accept_and_connect(&h, &mut p1, &mut p2, &token).await;
+
+    // One report in, then the report window (300s) lapses -> auto-resolution.
+    p1.submit_report(&token, Some(100), Some("demo-a")).await.unwrap();
+    sqlx::query("UPDATE matches SET ended_at = NOW() - INTERVAL '310 seconds' WHERE match_token = $1")
+        .bind(&token)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    for (name, client) in [("p1", &mut p1), ("p2", &mut p2)] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        let mut told = false;
+        while std::time::Instant::now() < deadline {
+            match timeout(Duration::from_secs(2), client.next_event()).await {
+                Ok(Some(Ok(lobby_client::ServerEvent::MatchResult { .. }))) => {
+                    told = true;
+                    break;
+                }
+                Ok(Some(Ok(_))) | Err(_) => continue,
+                Ok(Some(Err(e))) => panic!("{name} client error: {e}"),
+                Ok(None) => break,
+            }
+        }
+        assert!(told, "{name} must receive the auto-resolution result");
+    }
+
+    // The resolution is recorded in the DB (outcome from player_a's side).
+    let row = wait_for_row(&h.pool, &token, "SELECT outcome, mu_change_a FROM match_results WHERE match_token = $1")
+        .await
+        .expect("auto-resolution writes a match_results row");
+    assert!(
+        row.0 == "Win" || row.0 == "Loss",
+        "a single report must resolve as win/loss, got {}",
+        row.0
+    );
+
+    drop(p1);
+    drop(p2);
+}
+
+#[tokio::test]
+async fn queue_expired_notifies_player() {
+    let h = setup().await;
+
+    let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    p1.authenticate_test_token(701, &h.base_url).await.unwrap();
+    p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+
+    // Pretend the player idled past the 30s stale window; the next tick
+    // removes the entry and must tell the still-connected client.
+
+    // begin_matchmaking is fire-and-forget: wait for the server to actually
+    // enqueue the player before backdating, or the UPDATE races the INSERT.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let queued: Option<i64> = sqlx::query_scalar(
+            "SELECT steam_id FROM matchmaking_queue WHERE steam_id = 701",
+        )
+        .fetch_optional(&h.pool)
+        .await
+        .unwrap();
+        if queued.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queue row never appeared for the queued player"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    sqlx::query("UPDATE matchmaking_queue SET queued_at = NOW() - INTERVAL '40 seconds'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    let mut told = false;
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(2), p1.next_event()).await {
+            Ok(Some(Ok(lobby_client::ServerEvent::QueueExpired))) => {
+                told = true;
+                break;
+            }
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(e))) => panic!("client error: {e}"),
+            Ok(None) => break,
+        }
+    }
+    assert!(told, "queued player must be told when its entry expires");
+
+    drop(p1);
+}
+
+#[tokio::test]
 async fn openid_return_to_validation() {
     let h = setup().await;
 

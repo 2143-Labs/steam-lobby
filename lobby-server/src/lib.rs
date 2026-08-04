@@ -32,6 +32,7 @@ pub struct AppConfig {
     pub port: u16,
     pub match_accept_timeout_secs: u64,
     pub report_timeout_secs: u64,
+    pub pair_cooldown_secs: u64, // LOBBY_PAIR_COOLDOWN_S; anti re-pair window after a match
     pub public_url: Option<String>, // PUBLIC_URL; None = relative return_to only
     pub auth_dev_mode: bool,        // AUTH_DEV_MODE; true = /auth/test-token enabled
     pub jwt_ttl_secs: u64,
@@ -83,7 +84,10 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
     let steam_auth = SteamAuthService::new(config.steam_api_key.clone(), config.app_id, config.jwt_secret);
     let callbacks = DefaultCallbacks;
     let player_manager = lobby_core::player::PlayerManager::new(callbacks.clone());
-    let matchmaking_queue = lobby_core::queue::MatchmakingQueue::new(callbacks.clone());
+    let matchmaking_queue = lobby_core::queue::MatchmakingQueue::with_pair_cooldown(
+        callbacks.clone(),
+        config.pair_cooldown_secs as i64,
+    );
     let match_manager = lobby_core::match_lifecycle::MatchManager::new(
         callbacks,
         config.match_accept_timeout_secs,
