@@ -1,42 +1,39 @@
 # list all recipes
 default:
   @just --list --unsorted
+# Use the pinned nix-shell toolchain when Nix is installed, plain cargo otherwise.
+has_nix := `if command -v nix-shell >/dev/null 2>&1; then echo 1; fi`
+nix := if has_nix == "1" { "nix-shell shell.nix --run " } else { "" }
+
 
 # build all crates
 build:
-  nix-shell shell.nix --run "cargo build --workspace"
+  {{nix}}"cargo build --workspace"
 
-# run all tests
 test:
-  nix-shell shell.nix --run "cargo test --workspace"
+  {{nix}}"cargo test --workspace"
 
-# run tests with output
 test-verbose:
-  nix-shell shell.nix --run "cargo test --workspace -- --nocapture"
+  {{nix}}"cargo test --workspace -- --nocapture"
 
-# run DB-backed integration tests (needs `just db-up` first)
 itest:
-  nix-shell shell.nix --run "cargo test -p lobby-server --test integration -- --nocapture"
+  {{nix}}"cargo test -p lobby-server --test integration -- --nocapture"
 
-# lint with clippy
 lint:
-  nix-shell shell.nix --run "cargo clippy --all-targets -- -D warnings"
+  {{nix}}"cargo clippy --all-targets -- -D warnings"
 
-# lint + auto-fix
 lint-fix:
-  nix-shell shell.nix --run "cargo clippy --fix --allow-dirty --allow-staged"
+  {{nix}}"cargo clippy --fix --allow-dirty --allow-staged"
 
-# format with rustfmt
 fmt:
-  nix-shell shell.nix --run "cargo fmt --all"
+  {{nix}}"cargo fmt --all"
 
-# check formatting
 fmt-check:
-  nix-shell shell.nix --run "cargo fmt --all -- --check"
+  {{nix}}"cargo fmt --all -- --check"
 
-# run server (needs PostgreSQL + .env file)
 run:
-  nix-shell shell.nix --run "cargo run -p lobby-server"
+  {{nix}}"cargo run -p lobby-server"
+
 
 # start database container (uses `docker compose` when available,
 # otherwise falls back to a plain `docker run` — both produce the same
@@ -55,11 +52,19 @@ db-up:
       -v lobby-pgdata:/var/lib/postgresql/data \
       postgres:16-alpine
   fi
-  # Wait until Postgres accepts connections on :5432.
-  for _ in $(seq 1 30); do
-    (echo > /dev/tcp/localhost/5432) 2>/dev/null && break
-    sleep 1
-  done
+  # Wait until Postgres accepts connections on :5432 (check inside the
+  # container, so this works on any host where `docker` does).
+  if docker compose version &>/dev/null; then
+    for _ in $(seq 1 30); do
+      docker compose exec -T db pg_isready -U lobby &>/dev/null && break
+      sleep 1
+    done
+  else
+    for _ in $(seq 1 30); do
+      docker exec lobby-db pg_isready -U lobby &>/dev/null && break
+      sleep 1
+    done
+  fi
   echo "DB ready at localhost:5432"
 
 # stop the database container(s)

@@ -4,12 +4,20 @@ A matchmaking and MMR service for Steam games, built with Axum + PostgreSQL.
 
 ## Prerequisites
 
-- **Docker** — for PostgreSQL
-- **Nix** — provides Rust + just + OpenSSL via `nix-shell shell.nix`
+- **Docker** — for PostgreSQL (`docker compose` or just Docker Engine; `just
+  db-up` falls back to a plain `docker run` when the compose plugin is missing)
+- **Rust toolchain + just** — via `nix-shell shell.nix` if you have Nix,
+  otherwise install `rustup` and `cargo install just` yourself
 
-### Non-NixOS
+No system OpenSSL is required anywhere — all TLS is pure-Rust (rustls).
+`just` uses the pinned `shell.nix` toolchain when Nix is installed and plain
+`cargo` otherwise, so the same commands work on any platform.
 
-Install Rust (`rustup`), OpenSSL (system package manager), and `just` (`cargo install just`). Then use the same `just` commands below.
+### Non-NixOS / non-Nix
+
+Install Rust (`rustup`) and `just` (`cargo install just`). That's it — no
+OpenSSL, no Nix needed.
+
 
 ## Quickstart (NixOS)
 
@@ -28,8 +36,11 @@ To emulate multiple users without Steam, set `AUTH_DEV_MODE=true` in `.env`
 tabs (distinct steam IDs), connect both, and start matchmaking in each — the
 demo talks to the dev-only `/auth/test-token` endpoint, no real Steam API
 calls involved.
-
 ## Quickstart (non-NixOS)
+
+Works on any Linux, macOS, or WSL2 — and on Windows via WSL2 or Git Bash.
+Install [rustup](https://rustup.rs) and Docker (Docker Desktop on
+macOS/Windows). The `just` commands are the same as the NixOS quickstart:
 
 ```bash
 cp .env.example .env
@@ -39,6 +50,10 @@ just db-up
 just test
 just run
 ```
+
+Native Windows (PowerShell/cmd) is not covered by the `just` recipes — they
+need a POSIX shell. Use WSL2 or Git Bash, or run the server directly:
+`cargo run -p lobby-server` after exporting the variables from `.env`.
 
 ## API Endpoints
 
