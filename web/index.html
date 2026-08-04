@@ -54,6 +54,14 @@ connect both, then start matchmaking in each.</p>
   </div>
   <div id="ctrl-queueing" style="display:none">
     <button id="btn-cancel">Cancel Matchmaking</button>
+    <div id="queue-stats">
+      <p>Waiting: <span id="q-wait">—</span> — MMR band <span id="q-band">—</span>
+         — opponents in band: <span id="q-cands">—</span> (queue size <span id="q-size">—</span>)</p>
+      <p>My MMR: μ <span id="q-mu">—</span> σ <span id="q-sigma">—</span>
+         rating <span id="q-rating">—</span></p>
+    </div>
+    <table id="leaderboard"><thead><tr><th>Steam ID</th><th>μ</th><th>σ</th><th>Rating</th></tr></thead>
+      <tbody></tbody></table>
   </div>
   <div id="ctrl-match" style="display:none">
     <p>Opponent: <span id="opponent">—</span><br>
@@ -62,13 +70,13 @@ connect both, then start matchmaking in each.</p>
     <button id="btn-decline">Decline Match</button>
   </div>
   <div id="ctrl-inmatch" style="display:none">
-    <button id="btn-p2p" class="primary">P2P Connected</button>
+    <p>P2P: <span id="opp-p2p">Waiting for opponent P2P…</span></p>
+    <p>Result: <span id="report-status">—</span></p>
+    <button id="btn-p2p" class="primary">P2P Connected (simulated)</button>
     <button id="btn-report-win" style="display:none">Report Win</button>
     <button id="btn-report-loss" style="display:none">Report Loss</button>
     <button id="btn-report-draw" style="display:none">Report Draw</button>
   </div>
-</section>
-
 <section>
   <label>Event log</label>
   <div id="log"></div>
@@ -192,7 +200,44 @@ function handleServer(raw) {
       state.opponentId = msg.opponent.steam_id;
       $("opponent").textContent = msg.opponent.steam_id + " (" + msg.opponent.display_name + ")";
       $("match-token").textContent = msg.match_token;
+      $("opp-p2p").textContent = "Waiting for opponent P2P…";
+      $("report-status").textContent = "—";
       showControls("match");
+      break;
+    case "queue_status":
+      $("q-wait").textContent = Math.floor(msg.elapsed_ms / 1000) + "s";
+      $("q-band").textContent = msg.band_lo.toFixed(1) + " – " + msg.band_hi.toFixed(1);
+      $("q-cands").textContent = msg.candidates;
+      $("q-size").textContent = msg.queue_size;
+      $("q-mu").textContent = msg.my_mu.toFixed(1);
+      $("q-sigma").textContent = msg.my_sigma.toFixed(1);
+      $("q-rating").textContent = msg.my_rating.toFixed(1);
+      const tbody = document.querySelector("#leaderboard tbody");
+      tbody.innerHTML = "";
+      for (const e of msg.leaderboard) {
+        const tr = document.createElement("tr");
+        const td = (txt) => {
+          const cell = document.createElement("td");
+          cell.textContent = txt;
+          return cell;
+        };
+        tr.appendChild(td(e.steam_id));
+        tr.appendChild(td(e.mu.toFixed(1)));
+        tr.appendChild(td(e.sigma.toFixed(1)));
+        tr.appendChild(td(e.rating.toFixed(1)));
+        tbody.appendChild(tr);
+      }
+      break;
+    case "opponent_connected":
+      $("opp-p2p").textContent = "Opponent P2P connected ✓";
+      log("sys", "opponent P2P connected");
+      break;
+    case "report_received":
+      const who = msg.reporting_player === state.steamId ? "You" : "Opponent";
+      const w = msg.winner === null ? "Draw"
+        : (msg.winner === state.steamId ? "Win (you)" : "Win (opponent)");
+      $("report-status").textContent = who + " reported: " + w;
+      log("sys", who + " reported: " + w);
       break;
     case "match_result":
       setStatus("Match resolved (" + JSON.stringify(msg.outcome) + ")", "ok");
@@ -213,11 +258,18 @@ function handleServer(raw) {
       log("sys", "unhandled event type: " + msg.type);
   }
 }
-
 $("btn-queue").addEventListener("click", () => {
   send({ type: "begin_matchmaking", mode: "ranked_1v1", difficulty: $("difficulty").value });
   setStatus("Queueing…", "");
   showControls("queueing");
+  $("q-wait").textContent = "waiting…";
+  $("q-band").textContent = "—";
+  $("q-cands").textContent = "—";
+  $("q-size").textContent = "—";
+  $("q-mu").textContent = "—";
+  $("q-sigma").textContent = "—";
+  $("q-rating").textContent = "—";
+  document.querySelector("#leaderboard tbody").innerHTML = "";
 });
 $("btn-cancel").addEventListener("click", () => {
   send({ type: "cancel_matchmaking" });

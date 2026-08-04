@@ -581,6 +581,22 @@ impl RatingStore for PostgresStore {
         <Self as PlayerStore>::get_rating(self, steam_id, mode).await
     }
 
+    async fn list_ratings(&self) -> Result<Vec<(SteamId, OpenSkillRating)>> {
+        let rows = sqlx::query_as::<_, (i64, f64, f64, DateTime<Utc>)>(
+            "SELECT steam_id, mu, sigma, last_updated FROM ratings \
+             ORDER BY (mu - 3 * sigma) DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_db_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, mu, sigma, last_updated)| {
+                (id as u64, OpenSkillRating { mu, sigma, last_updated })
+            })
+            .collect())
+    }
+
     async fn update_rating(
         &self,
         steam_id: SteamId,

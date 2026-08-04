@@ -50,6 +50,26 @@ where
 {
     serializer.serialize_str(&id.to_string())
 }
+/// Serialize an optional Steam ID as a JSON string (or `null`).
+pub fn serialize_optional_steam_id<S>(id: &Option<SteamId>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match id {
+        Some(n) => serializer.serialize_str(&n.to_string()),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// One row of the MMR leaderboard pushed to queueing players.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaderboardEntry {
+    #[serde(serialize_with = "serialize_steam_id", deserialize_with = "deserialize_steam_id")]
+    pub steam_id: SteamId,
+    pub mu: f64,
+    pub sigma: f64,
+    pub rating: f64, // mu - 3*sigma, the display/matchmaking value
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PlayerState {

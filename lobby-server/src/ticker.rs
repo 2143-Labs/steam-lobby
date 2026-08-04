@@ -1,6 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use lobby_core::traits::{QueueStore, RatingStore};
+use lobby_core::types::LeaderboardEntry;
+
 use crate::state::AppState;
 use crate::ws::{OpponentInfo, ServerMessage};
 
@@ -63,6 +66,63 @@ pub async fn tick_loop(state: Arc<AppState>) {
                 }
                 Ok(None) => {}
                 Err(e) => tracing::error!("queue tick failed: {e}"),
+            }
+        }
+
+        // Live queue stats for the demo: best-effort, never blocks the tick on errors.
+        if let Ok(queue) = state.store.get_queue("ranked_1v1").await {
+            let leaderboard: Vec<LeaderboardEntry> = state
+                .store
+                .list_ratings()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, r)| LeaderboardEntry {
+                    steam_id: id,
+                    mu: r.mu,
+                    sigma: r.sigma,
+                    rating: r.mu - 3.0 * r.sigma,
+                })
+                .collect();
+            let now = chrono::Utc::now();
+            let mut sends: Vec<(u64, ServerMessage)> = Vec::new();
+            for entry in &queue {
+                let wait_s = (now - entry.queued_at).num_seconds().max(0) as f64;
+                let (lo, hi) =
+                    lobby_core::queue::search_band(wait_s, entry.mu, entry.difficulty.mmr_offset());
+                let candidates = queue
+                    .iter()
+                    .filter(|o| o.steam_id != entry.steam_id && o.mu >= lo && o.mu <= hi)
+                    .count() as u32;
+                let rating = state
+                    .store
+                    .get_rating(entry.steam_id, "ranked_1v1")
+                    .await
+                    .unwrap_or(lobby_core::types::OpenSkillRating {
+                        mu: entry.mu,
+                        sigma: 25.0 / 3.0,
+                        last_updated: now,
+                    });
+                sends.push((
+                    entry.steam_id,
+                    ServerMessage::QueueStatus {
+                        elapsed_ms: (wait_s * 1000.0) as u64,
+                        band_lo: lo,
+                        band_hi: hi,
+                        candidates,
+                        queue_size: queue.len() as u32,
+                        my_mu: rating.mu,
+                        my_sigma: rating.sigma,
+                        my_rating: rating.mu - 3.0 * rating.sigma,
+                        leaderboard: leaderboard.clone(),
+                    },
+                ));
+            }
+            let connections = state.connections.lock().await; // lock ONLY after all awaits
+            for (sid, msg) in sends {
+                if let Some(entry) = connections.get(&sid) {
+                    let _ = entry.tx.send(msg);
+                }
             }
         }
         let _ = state.matchmaking_queue.cleanup_stale(&state.store).await;

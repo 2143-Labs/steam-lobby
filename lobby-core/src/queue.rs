@@ -10,6 +10,13 @@ use crate::types::{MatchInfo, MatchStatus};
 /// Do not re-pair the same two accounts within this window after a resolved match.
 const SAME_PAIR_COOLDOWN_SECS: i64 = 300;
 
+/// Expanding search band: 50 at t=0, +25 every 10s of wait, capped at 400.
+/// Returns `(lo, hi)` in MMR terms, both shifted by the difficulty offset.
+pub fn search_band(wait_secs: f64, mu: f64, offset: f64) -> (f64, f64) {
+    let band = (50.0 + (wait_secs / 10.0).floor() * 25.0).min(400.0);
+    (mu - band + offset, mu + band + offset)
+}
+
 pub struct MatchmakingQueue<CB: GameCallbacks> {
     callbacks: CB,
 }
@@ -58,12 +65,7 @@ impl<CB: GameCallbacks> MatchmakingQueue<CB> {
             }
 
             let wait_s = (now - player_a.queued_at).num_seconds().max(0) as f64;
-            let band = (50.0 + (wait_s / 10.0).floor() * 25.0).min(400.0);
-            let offset = player_a.difficulty.mmr_offset();
-            // Effective search range: [mu - band + offset, mu + band + offset]
-            let lo = player_a.mu - band + offset;
-            let hi = player_a.mu + band + offset;
-
+            let (lo, hi) = search_band(wait_s, player_a.mu, player_a.difficulty.mmr_offset());
             // Find first compatible opponent
             let mut opponent_idx = None;
             for (j, player_b) in queue.iter().enumerate() {

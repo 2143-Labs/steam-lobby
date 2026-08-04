@@ -178,11 +178,142 @@ async fn queue_cancel() {
     p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
     p1.cancel_matchmaking().await.unwrap();
 
-    // No partner queued, so no MatchFound should ever arrive; expect a timeout.
-    let res = timeout(Duration::from_secs(5), p1.next_event()).await;
-    assert!(res.is_err(), "cancelled player must not receive a MatchFound");
+    // No partner queued, so no MatchFound should ever arrive. A stale
+    // queue_status pushed by the ticker can land just after the cancel, so
+    // drain non-match events instead of expecting an empty channel.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_match = false;
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(2), p1.next_event()).await {
+            Ok(Some(Ok(lobby_client::ServerEvent::MatchFound { .. }))) => {
+                saw_match = true;
+                break;
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    assert!(!saw_match, "cancelled player must not receive a MatchFound");
 
     drop(p1);
+}
+
+#[tokio::test]
+async fn queue_stats_received() {
+    let h = setup().await;
+
+    let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    p1.authenticate_test_token(901, &h.base_url).await.unwrap();
+    p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+
+    // The ticker pushes queue_status every ~2s while the player is queued.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    let mut got = false;
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(2), p1.next_event()).await {
+            Ok(Some(Ok(lobby_client::ServerEvent::QueueStatus {
+                my_mu,
+                queue_size,
+                leaderboard,
+                ..
+            }))) => {
+                assert!(
+                    my_mu > 24.0 && my_mu < 26.0,
+                    "fresh player should sit at the default mu 25.0, got {my_mu}"
+                );
+                assert!(queue_size >= 1, "queue must contain the queued player");
+                assert!(
+                    leaderboard.iter().any(|e| e.steam_id == 901),
+                    "leaderboard must include the queued player"
+                );
+                got = true;
+                break;
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(e))) => panic!("client error while queueing: {e}"),
+            Ok(None) => panic!("connection closed while queueing"),
+            Err(_) => continue,
+        }
+    }
+    assert!(got, "queue_status must arrive within 6s");
+
+    p1.cancel_matchmaking().await.unwrap();
+    drop(p1);
+}
+
+#[tokio::test]
+async fn p2p_and_report_visibility() {
+    let h = setup().await;
+
+    let (mut p1, mut p2, token) = pair_up(&h, 100, 200).await;
+    accept_and_connect(&h, &mut p1, &mut p2, &token).await;
+
+    // accept_and_connect sends both p2p_connected signals; p1 must learn that
+    // the opponent connected once p2's signal is processed.
+    let mut saw_opponent = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(2), p1.next_event()).await {
+            Ok(Some(Ok(lobby_client::ServerEvent::OpponentConnected { .. }))) => {
+                saw_opponent = true;
+                break;
+            }
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(e))) => panic!("client error: {e}"),
+            Ok(None) => break,
+        }
+    }
+    assert!(saw_opponent, "p1 must learn that the opponent P2P-connected");
+
+    // p1 reports first; both sides must see report_received before resolution.
+    p1.submit_report(&token, Some(100), Some("demo-a")).await.unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut p2_saw_report = false;
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(2), p2.next_event()).await {
+            Ok(Some(Ok(lobby_client::ServerEvent::ReportReceived {
+                reporting_player,
+                winner,
+                demo_hash,
+                ..
+            }))) => {
+                assert_eq!(reporting_player, 100, "p1 reported");
+                assert_eq!(winner, Some(100), "p1 claimed a win for themselves");
+                assert_eq!(demo_hash.as_deref(), Some("demo-a"));
+                p2_saw_report = true;
+                break;
+            }
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(e))) => panic!("client error: {e}"),
+            Ok(None) => break,
+        }
+    }
+    assert!(p2_saw_report, "p2 must see p1's report before resolution");
+
+    // p2 agrees; the match resolves and BOTH players receive match_result.
+    p2.submit_report(&token, Some(100), Some("demo-a")).await.unwrap();
+
+    for (name, client) in [("p1", &mut p1), ("p2", &mut p2)] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_result = false;
+        while std::time::Instant::now() < deadline {
+            match timeout(Duration::from_secs(2), client.next_event()).await {
+                Ok(Some(Ok(lobby_client::ServerEvent::MatchResult { .. }))) => {
+                    saw_result = true;
+                    break;
+                }
+                Ok(Some(Ok(_))) | Err(_) => continue,
+                Ok(Some(Err(e))) => panic!("{name} client error: {e}"),
+                Ok(None) => break,
+            }
+        }
+        assert!(saw_result, "{name} must receive match_result after resolution");
+    }
+
+    drop(p1);
+    drop(p2);
 }
 
 #[tokio::test]

@@ -301,6 +301,20 @@ impl RatingStore for MockStore {
         <Self as PlayerStore>::get_rating(self, steam_id, mode).await
     }
 
+    async fn list_ratings(&self) -> Result<Vec<(SteamId, OpenSkillRating)>> {
+        let r = self.ratings.lock();
+        let mut all: Vec<(SteamId, OpenSkillRating)> = r
+            .iter()
+            .map(|((id, _mode), rating)| (*id, rating.clone()))
+            .collect();
+        all.sort_by(|a, b| {
+            (b.1.mu - 3.0 * b.1.sigma)
+                .partial_cmp(&(a.1.mu - 3.0 * a.1.sigma))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(all)
+    }
+
     async fn update_rating(
         &self,
         steam_id: SteamId,

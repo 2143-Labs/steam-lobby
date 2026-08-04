@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
-use lobby_core::traits::{PlayerStore, QueueStore};
+use lobby_core::traits::{MatchStore, PlayerStore, QueueStore};
 use lobby_core::types::{MatchDifficulty, MatchReport, SteamId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -53,9 +53,26 @@ pub enum ServerMessage {
         display_name: String,
     },
     QueueStatus {
-        state: String,
         elapsed_ms: u64,
-        mmr_band: f64,
+        band_lo: f64,
+        band_hi: f64,
+        candidates: u32, // other queued players whose mu falls in [band_lo, band_hi]
+        queue_size: u32, // total queued in the mode
+        my_mu: f64,
+        my_sigma: f64,
+        my_rating: f64, // mu - 3*sigma
+        leaderboard: Vec<lobby_core::types::LeaderboardEntry>,
+    },
+    OpponentConnected {
+        match_token: String,
+    },
+    ReportReceived {
+        match_token: String,
+        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
+        reporting_player: u64,
+        #[serde(serialize_with = "lobby_core::types::serialize_optional_steam_id")]
+        winner: Option<u64>,
+        demo_hash: Option<String>,
     },
     MatchFound {
         match_token: String,
@@ -357,10 +374,20 @@ async fn handle_client_message(
             let _ = tx.send(ServerMessage::MatchDeclined { match_token });
         }
         ClientMessage::P2pConnected { match_token } => {
-            let _ = state
+            if state
                 .match_manager
                 .mark_connected(&match_token, steam_id, &state.store)
-                .await;
+                .await
+                .is_ok()
+            {
+                if let Ok(Some(m)) = state.store.get_match(&match_token).await {
+                    let other = if steam_id == m.player_a { m.player_b } else { m.player_a };
+                    let connections = state.connections.lock().await;
+                    if let Some(e) = connections.get(&other) {
+                        let _ = e.tx.send(ServerMessage::OpponentConnected { match_token });
+                    }
+                }
+            }
         }
         ClientMessage::MatchReport {
             match_token,
@@ -375,13 +402,51 @@ async fn handle_client_message(
             };
             let outcome = state
                 .match_manager
-                .submit_report(report, &state.store, &state.store)
+                .submit_report(report.clone(), &state.store, &state.store)
                 .await;
-            if let Ok(outcome) = outcome {
-                let _ = tx.send(ServerMessage::MatchResult {
-                    match_token,
-                    outcome: serde_json::to_value(&outcome).unwrap(),
-                });
+
+            // Broadcast the received report to BOTH players so each sees what the
+            // other selected before resolution. Gated on the report actually being
+            // stored (Ok) — a rejected report (wrong state/participant) is not
+            // presented as a fact.
+            if outcome.is_ok() {
+                if let Ok(Some(m)) = state.store.get_match(&match_token).await {
+                    let connections = state.connections.lock().await;
+                    for pid in [m.player_a, m.player_b] {
+                        if let Some(e) = connections.get(&pid) {
+                            let _ = e.tx.send(ServerMessage::ReportReceived {
+                                match_token: match_token.clone(),
+                                reporting_player: steam_id,
+                                winner: report.winner,
+                                demo_hash: report.demo_hash.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            // On a REAL resolution (both reports processed — match terminal),
+            // tell BOTH players. The first report alone returns Ok(Disputed)
+            // while awaiting the opponent's, so gate on match status, not on Ok.
+            let terminal = match state.store.get_match(&match_token).await {
+                Ok(Some(m)) => {
+                    matches!(m.status, lobby_core::types::MatchStatus::Resolved | lobby_core::types::MatchStatus::Disputed)
+                }
+                _ => false,
+            };
+            if terminal {
+                if let Ok(outcome) = outcome {
+                    if let Ok(Some(m)) = state.store.get_match(&match_token).await {
+                        let connections = state.connections.lock().await;
+                        for pid in [m.player_a, m.player_b] {
+                            if let Some(e) = connections.get(&pid) {
+                                let _ = e.tx.send(ServerMessage::MatchResult {
+                                    match_token: match_token.clone(),
+                                    outcome: serde_json::to_value(&outcome).unwrap(),
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
         ClientMessage::Heartbeat => {

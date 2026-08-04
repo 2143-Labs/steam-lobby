@@ -135,6 +135,8 @@ pub trait QueueStore: Send + Sync {
 #[async_trait]
 pub trait RatingStore: Send + Sync {
     async fn get_rating(&self, steam_id: SteamId, mode: &str) -> Result<OpenSkillRating>;
+    /// All ratings, ordered by display rating (`mu - 3*sigma`) descending.
+    async fn list_ratings(&self) -> Result<Vec<(SteamId, OpenSkillRating)>>;
     async fn update_rating(
         &self,
         steam_id: SteamId,

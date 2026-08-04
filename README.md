@@ -196,8 +196,11 @@ All communication happens over a single WebSocket connection at `/ws`. Messages 
 |------|--------|-------------|
 | `auth_ok` | `steam_id: u64`, `display_name: String` | Authentication succeeded |
 | `match_found` | `match_token: String`, `opponent: { steam_id, display_name }`, `timeout_ms: u64` | A match is ready — accept or it expires |
+| `queue_status` | `elapsed_ms`, `band_lo/hi`, `candidates`, `queue_size`, `my_mu/sigma/rating`, `leaderboard: [{steam_id, mu, sigma, rating}]` | Live queue stats pushed every ~2s while queueing (wait time, expanding MMR band, opponents available, your rating, full MMR leaderboard) |
+| `opponent_connected` | `match_token` | The opponent's `p2p_connected` signal was accepted |
+| `report_received` | `match_token`, `reporting_player`, `winner: Option<steam_id>`, `demo_hash` | A player submitted a match report — sent to both players before resolution |
 | `error` | `message: String` | An error occurred processing a message |
-| `match_result` | `match_token: String`, `outcome: Value` | A report resolved the match (`Win`/`Loss`/`Draw`/`Disputed` with mu change) |
+| `match_result` | `match_token: String`, `outcome: Value` | The reports agreed and the match resolved (`Win`/`Loss`/`Draw`/`Disputed` with mu change) — sent to **both** players |
 | `match_declined` | `match_token: String` | Your opponent declined the found match |
 
 ### Typical flow
@@ -273,12 +276,15 @@ connection error.
 serves it at `/` — with the server running, just open `http://localhost:8080/`
 in two browser tabs. To test multiple users locally:
 
-1. `just db-up` + `just run` (with `AUTH_DEV_MODE=true` in `.env`).
-2. Open `http://localhost:8080/` in two browser tabs.
-3. Give each tab a distinct steam ID, click **Connect** on both.
-4. Click **Start Matchmaking** in both — each tab shows the other as its
-   opponent.
-5. **Accept** on both, then **P2P Connected**, then report a result.
+4. Click **Start Matchmaking** in both — the queueing panel shows live wait
+   time, the expanding MMR band and opponents in it, your own μ/σ/rating, and
+   a leaderboard of every player's rating.
+5. **Accept** on both, then **P2P Connected (simulated)** — this demo has no
+   real P2P transport; the button only sends the game's `p2p_connected`
+   signal, and each tab shows the other's signal (`Opponent P2P connected ✓`).
+6. Report a result — each tab immediately shows what the other player selected
+   (`You reported: Win (you)` / `Opponent reported: …`) before the match
+   resolves.
 
 The event log shows every JSON message sent and received — a live protocol
 reference. No Steam account or API key is involved.

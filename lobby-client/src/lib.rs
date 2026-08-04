@@ -93,6 +93,30 @@ pub enum ServerEvent {
     },
     #[serde(rename = "match_found")]
     MatchFound { match_token: String, opponent: OpponentInfo, timeout_ms: u64 },
+    QueueStatus {
+        elapsed_ms: u64,
+        band_lo: f64,
+        band_hi: f64,
+        candidates: u32,
+        queue_size: u32,
+        my_mu: f64,
+        my_sigma: f64,
+        my_rating: f64,
+        leaderboard: Vec<lobby_core::types::LeaderboardEntry>,
+    },
+    #[serde(rename = "opponent_connected")]
+    OpponentConnected { match_token: String },
+    #[serde(rename = "report_received")]
+    ReportReceived {
+        match_token: String,
+        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
+        reporting_player: u64,
+        #[serde(default, deserialize_with = "lobby_core::types::deserialize_optional_steam_id")]
+        winner: Option<u64>,
+        demo_hash: Option<String>,
+    },
+    #[serde(rename = "match_result")]
+    MatchResult { match_token: String, outcome: serde_json::Value },
     Error { message: String },
 }
 
