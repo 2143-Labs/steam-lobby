@@ -35,6 +35,7 @@ pub enum ClientMessage {
     },
     MatchReport {
         match_token: String,
+        #[serde(default, deserialize_with = "lobby_core::types::deserialize_optional_steam_id")]
         winner: Option<u64>,
         demo_hash: Option<String>,
     },
@@ -47,6 +48,7 @@ pub enum ClientMessage {
 #[allow(dead_code)] // QueueStatus, MatchAccepted, MatchStarted reserved for future use
 pub enum ServerMessage {
     AuthOk {
+        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
         steam_id: u64,
         display_name: String,
     },
@@ -82,6 +84,7 @@ pub enum ServerMessage {
 
 #[derive(Debug, Serialize, Clone)]
 pub struct OpponentInfo {
+    #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
     pub steam_id: u64,
     pub display_name: String,
 }

@@ -395,4 +395,18 @@ async fn ws_origin_restriction() {
         .unwrap()
         .status();
     assert_eq!(status, reqwest::StatusCode::SWITCHING_PROTOCOLS);
+
+    // Same origin (the host that served the page) → 101.
+    let status = client
+        .get(format!("{}/ws", h.base_url))
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Key", key)
+        .header("Sec-WebSocket-Version", "13")
+        .header("Origin", h.base_url.clone())
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, reqwest::StatusCode::SWITCHING_PROTOCOLS);
 }

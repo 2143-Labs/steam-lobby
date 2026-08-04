@@ -261,6 +261,8 @@ pub async fn ticket_auth(
 
 #[derive(Deserialize)]
 pub struct TestTokenBody {
+    // Browser clients send 17-digit IDs as strings; Rust clients as numbers.
+    #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
     steam_id: u64,
 }
 

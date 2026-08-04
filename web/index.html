@@ -85,6 +85,12 @@ if (location.hash.startsWith("#token=")) {
   fragmentToken = location.hash.slice(7);
   history.replaceState(null, "", location.pathname + location.search);
 }
+// When served by the server itself (http://host:port/), default the API base
+// to this same origin so the hostname and port are always right.
+if (location.protocol.startsWith("http")) {
+  $("server-url").value = location.origin;
+}
+
 
 function setStatus(text, cls) {
   const el = $("status");
@@ -115,6 +121,14 @@ function send(obj) {
   state.ws.send(text);
 }
 
+$("btn-connect").addEventListener("click", async () => {
+  const base = $("server-url").value.trim().replace(/\/+$/, "");
+  const steamId = $("steam-id").value.trim();
+  if (!base || !steamId) {
+    setStatus("Error: server URL and steam ID are required", "err");
+    return;
+  }
+
   let token = fragmentToken;
   if (token) {
     setStatus("Using Steam login token");
@@ -126,7 +140,7 @@ function send(obj) {
       const resp = await fetch(base + "/auth/test-token", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ steam_id: Number(steamId) }),
+        body: JSON.stringify({ steam_id: steamId }), // string: 17-digit IDs lose precision as JS numbers
       });
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       const body = await resp.json();
@@ -149,7 +163,7 @@ function send(obj) {
 
   state.ws.onopen = () => {
     log("sys", "WS open: " + wsUrl);
-    state.steamId = Number(steamId);
+    state.steamId = steamId;
     send({ type: "auth", session_token: token });
   };
   state.ws.onmessage = (ev) => handleServer(ev.data);

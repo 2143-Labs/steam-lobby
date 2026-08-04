@@ -85,7 +85,12 @@ impl std::fmt::Debug for ClientMsg {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
     #[serde(rename = "auth_ok")]
-    AuthOk { steam_id: u64, display_name: String },
+    AuthOk {
+        // The server serializes 17-digit Steam IDs as strings (JS-safe).
+        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
+        steam_id: u64,
+        display_name: String,
+    },
     #[serde(rename = "match_found")]
     MatchFound { match_token: String, opponent: OpponentInfo, timeout_ms: u64 },
     Error { message: String },
@@ -93,6 +98,7 @@ pub enum ServerEvent {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OpponentInfo {
+    #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
     pub steam_id: u64,
     pub display_name: String,
 }

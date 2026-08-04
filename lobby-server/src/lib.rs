@@ -113,8 +113,18 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
                  headers: axum::http::HeaderMap| async move {
                 if let Some(origin) = headers.get(axum::http::header::ORIGIN) {
                     let s = origin.to_str().unwrap_or_default();
+                    // Allowed if the origin is in the CORS allowlist, is the
+                    // file:// null origin in dev mode, or is the same origin
+                    // that served the page (the demo is embedded at /).
+                    let same_origin = headers
+                        .get(axum::http::header::HOST)
+                        .and_then(|h| h.to_str().ok())
+                        .is_some_and(|host| {
+                            s == format!("http://{host}") || s == format!("https://{host}")
+                        });
                     let allowed = app_state.allowed_origins.iter().any(|a| a == s)
-                        || (app_state.auth_dev_mode && origin.as_bytes() == b"null");
+                        || (app_state.auth_dev_mode && origin.as_bytes() == b"null")
+                        || same_origin;
                     if !allowed {
                         return axum::http::StatusCode::FORBIDDEN.into_response();
                     }
