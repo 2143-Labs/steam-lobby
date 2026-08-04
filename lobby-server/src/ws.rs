@@ -133,6 +133,8 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
         ))
         .await;
 
+    tracing::info!("player {steam_id} connected from {peer_ip} ({display_name})");
+
     // Enter menus
     let _ = state
         .player_manager
@@ -174,6 +176,8 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
     }
 
     // Message loop — select between client messages and outbound task
+    // Set on every break path below; overridden to "replaced…" for ghosts.
+    let mut disconnect_reason;
     loop {
         tokio::select! {
             msg = timeout(Duration::from_secs(60), receiver.next()) => {
@@ -197,8 +201,18 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
                         )
                         .await;
                     }
-                    Ok(Some(Ok(Message::Close(_)))) | Err(_) => {
-                        // Disconnect or timeout
+                    Ok(Some(Ok(Message::Close(_)))) => {
+                        disconnect_reason = "close frame";
+                        break;
+                    }
+                    Ok(Some(Err(e))) => {
+                        tracing::debug!("ws read error from {steam_id}: {e}");
+                        disconnect_reason = "socket error";
+                        break;
+                    }
+                    Err(_) => {
+                        // No frames at all for 60s (an idle client) — drop it.
+                        disconnect_reason = "idle timeout (60s)";
                         break;
                     }
                     _ => {
@@ -208,13 +222,11 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
             }
             _ = &mut outbound_task => {
                 // Outbound task died (socket closed, send-side error)
+                disconnect_reason = "peer disconnected (send side)";
                 break;
             }
         }
     }
-
-    // Cleanup — only the connection still registered for this player may
-    // reset player state and remove the map entry.
     let is_current = {
         let connections = state.connections.lock().await;
         connections
@@ -228,7 +240,10 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
             .handle_disconnect(steam_id, &state.store)
             .await;
         state.connections.lock().await.remove(&steam_id);
+    } else {
+        disconnect_reason = "replaced by newer connection";
     }
+    tracing::info!("player {steam_id} disconnected ({disconnect_reason})");
     outbound_task.abort();
 }
 
@@ -242,6 +257,7 @@ async fn authenticate(
     let text = match first_msg {
         Ok(Some(Ok(Message::Text(t)))) => t.to_string(),
         _ => {
+            tracing::warn!("auth failed (no auth message within 10s) from {peer_ip}");
             let _ = sender
                 .send(Message::Text(
                     serde_json::to_string(&ServerMessage::Error {
@@ -259,6 +275,7 @@ async fn authenticate(
     let cm: ClientMessage = match serde_json::from_str(&text) {
         Ok(m) => m,
         Err(_) => {
+            tracing::warn!("auth failed (unparseable first message) from {peer_ip}");
             let _ = sender
                 .send(Message::Text(
                     serde_json::to_string(&ServerMessage::Error {
@@ -275,19 +292,30 @@ async fn authenticate(
 
     match cm {
         ClientMessage::Auth { session_token } => {
-            let (id, ver) = state
-                .steam_auth
-                .validate_session_token(&session_token)
-                .map_err(|_| ())?;
+            let (id, ver) = match state.steam_auth.validate_session_token(&session_token) {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!("auth failed (invalid session token) from {peer_ip}");
+                    return Err(());
+                }
+            };
             // A token minted before a logout (or a DB error) is rejected.
-            let db_ver = state.store.get_token_version(id).await.map_err(|_| ())?;
+            let db_ver = match state.store.get_token_version(id).await {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!("auth failed (token version lookup error) from {peer_ip}");
+                    return Err(());
+                }
+            };
             if db_ver != ver {
+                tracing::warn!("auth failed (revoked or outdated token) from {peer_ip}");
                 return Err(());
             }
             Ok(id)
         }
         ClientMessage::AuthTicket { ticket } => {
             if !state.ticket_limiter.check(peer_ip.ip()) {
+                tracing::warn!("auth failed (ticket rate-limited) from {peer_ip}");
                 let _ = sender
                     .send(Message::Text(
                         serde_json::to_string(&ServerMessage::Error {
@@ -300,9 +328,16 @@ async fn authenticate(
                     .await;
                 return Err(());
             }
-            state.steam_auth.verify_ticket(&ticket).await.map_err(|_| ())
+            match state.steam_auth.verify_ticket(&ticket).await {
+                Ok(id) => Ok(id),
+                Err(_) => {
+                    tracing::warn!("auth failed (invalid ticket) from {peer_ip}");
+                    Err(())
+                }
+            }
         }
         _ => {
+            tracing::warn!("auth failed (first message was not auth) from {peer_ip}");
             let _ = sender
                 .send(Message::Text(
                     serde_json::to_string(&ServerMessage::Error {
@@ -348,6 +383,7 @@ async fn handle_client_message(
                     },
                 );
 
+            tracing::info!("player {steam_id} entered queue ({mode}, {difficulty})");
             let entry = lobby_core::types::QueueEntry {
                 steam_id,
                 game_mode: mode,
@@ -363,29 +399,50 @@ async fn handle_client_message(
                 .cancel_matchmaking(steam_id, &state.store)
                 .await;
             let _ = state.store.dequeue(steam_id, "ranked_1v1").await;
+            tracing::info!("player {steam_id} left queue (cancelled)");
         }
         ClientMessage::AcceptMatch { match_token } => {
-            let _ = state
+            match state
                 .match_manager
                 .accept_match(&match_token, steam_id, &state.store)
-                .await;
+                .await
+            {
+                Ok(()) => tracing::info!("player {steam_id} accepted match {match_token}"),
+                Err(e) => {
+                    tracing::warn!("player {steam_id} accept rejected for match {match_token}: {e}")
+                }
+            }
         }
         ClientMessage::DeclineMatch { match_token } => {
-            let _ = tx.send(ServerMessage::MatchDeclined { match_token });
+            tracing::info!("player {steam_id} declined match {match_token}");
+            let _ = tx.send(ServerMessage::MatchDeclined {
+                match_token: match_token.clone(),
+            });
+            if let Ok(Some(m)) = state.store.get_match(&match_token).await {
+                let other = if steam_id == m.player_a { m.player_b } else { m.player_a };
+                let connections = state.connections.lock().await;
+                if let Some(e) = connections.get(&other) {
+                    let _ = e.tx.send(ServerMessage::MatchDeclined { match_token });
+                }
+            }
         }
         ClientMessage::P2pConnected { match_token } => {
-            if state
+            match state
                 .match_manager
                 .mark_connected(&match_token, steam_id, &state.store)
                 .await
-                .is_ok()
             {
-                if let Ok(Some(m)) = state.store.get_match(&match_token).await {
-                    let other = if steam_id == m.player_a { m.player_b } else { m.player_a };
-                    let connections = state.connections.lock().await;
-                    if let Some(e) = connections.get(&other) {
-                        let _ = e.tx.send(ServerMessage::OpponentConnected { match_token });
+                Ok(()) => {
+                    if let Ok(Some(m)) = state.store.get_match(&match_token).await {
+                        let other = if steam_id == m.player_a { m.player_b } else { m.player_a };
+                        let connections = state.connections.lock().await;
+                        if let Some(e) = connections.get(&other) {
+                            let _ = e.tx.send(ServerMessage::OpponentConnected { match_token });
+                        }
                     }
+                }
+                Err(e) => {
+                    tracing::warn!("player {steam_id} p2p signal rejected for match {match_token}: {e}")
                 }
             }
         }
@@ -405,6 +462,13 @@ async fn handle_client_message(
                 .submit_report(report.clone(), &state.store, &state.store)
                 .await;
 
+            match &outcome {
+                Ok(_) => tracing::info!(
+                    "report from {steam_id} for match {match_token}: winner {:?}",
+                    report.winner
+                ),
+                Err(e) => tracing::warn!("report from {steam_id} for match {match_token} rejected: {e}"),
+            }
             // Broadcast the received report to BOTH players so each sees what the
             // other selected before resolution. Gated on the report actually being
             // stored (Ok) — a rejected report (wrong state/participant) is not
@@ -435,6 +499,7 @@ async fn handle_client_message(
             };
             if terminal {
                 if let Ok(outcome) = outcome {
+                    tracing::info!("match {match_token} resolved: {outcome:?}");
                     if let Ok(Some(m)) = state.store.get_match(&match_token).await {
                         let connections = state.connections.lock().await;
                         for pid in [m.player_a, m.player_b] {

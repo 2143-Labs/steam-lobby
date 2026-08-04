@@ -115,6 +115,8 @@ pub enum ServerEvent {
         winner: Option<u64>,
         demo_hash: Option<String>,
     },
+    #[serde(rename = "match_declined")]
+    MatchDeclined { match_token: String },
     #[serde(rename = "match_result")]
     MatchResult { match_token: String, outcome: serde_json::Value },
     Error { message: String },

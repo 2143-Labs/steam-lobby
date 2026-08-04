@@ -20,6 +20,7 @@ use rate_limit::RateLimiter;
 use state::DefaultCallbacks;
 use steam_auth::SteamAuthService;
 
+use lobby_core::traits::QueueStore;
 pub use state::AppState; // re-exported so integration tests can name the type
 
 pub struct AppConfig {
@@ -70,6 +71,15 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
     sqlx::migrate!().run(&pool).await.expect("database migrations failed");
 
     let store = PostgresStore::new(pool);
+
+    // The queue lives in Postgres and survives restarts; entries from a dead
+    // session (no heartbeats) must not phantom-match on boot.
+    if let Err(e) = store
+        .remove_stale_queue_entries(chrono::Duration::zero())
+        .await
+    {
+        tracing::warn!("failed to clear stale queue entries at startup: {e}");
+    }
     let steam_auth = SteamAuthService::new(config.steam_api_key.clone(), config.app_id, config.jwt_secret);
     let callbacks = DefaultCallbacks;
     let player_manager = lobby_core::player::PlayerManager::new(callbacks.clone());

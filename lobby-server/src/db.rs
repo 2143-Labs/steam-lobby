@@ -566,11 +566,15 @@ impl QueueStore for PostgresStore {
 
     async fn remove_stale_queue_entries(&self, timeout: Duration) -> Result<()> {
         let cutoff = Utc::now() - timeout;
-        sqlx::query("DELETE FROM matchmaking_queue WHERE queued_at < $1")
+        let result = sqlx::query("DELETE FROM matchmaking_queue WHERE queued_at < $1")
             .bind(cutoff)
             .execute(&self.pool)
             .await
             .map_err(map_db_error)?;
+        let removed = result.rows_affected();
+        if removed > 0 {
+            tracing::info!("removed {removed} stale queue entries (no heartbeat)");
+        }
         Ok(())
     }
 }

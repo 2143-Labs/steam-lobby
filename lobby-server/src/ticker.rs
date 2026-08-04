@@ -18,6 +18,13 @@ pub async fn tick_loop(state: Arc<AppState>) {
                 .await
             {
                 Ok(Some(match_info)) => {
+                    tracing::info!(
+                        "match {} formed: {} vs {} ({})",
+                        match_info.match_token,
+                        match_info.player_a,
+                        match_info.player_b,
+                        match_info.game_mode
+                    );
                     // Notify both players — spawn each notification to avoid
                     // blocking the 2s tick cycle on Steam API HTTP calls.
                     let state_a = state.clone();

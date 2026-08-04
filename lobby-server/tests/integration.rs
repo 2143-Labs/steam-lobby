@@ -317,6 +317,53 @@ async fn p2p_and_report_visibility() {
 }
 
 #[tokio::test]
+async fn decline_notifies_opponent() {
+    let h = setup().await;
+
+    let (mut p1, mut p2, token) = pair_up(&h, 100, 200).await;
+
+    p1.decline_match(&token).await.unwrap();
+
+    // The opponent must learn the match was declined…
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut p2_told = false;
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(2), p2.next_event()).await {
+            Ok(Some(Ok(lobby_client::ServerEvent::MatchDeclined {
+                match_token,
+            }))) => {
+                assert_eq!(match_token, token);
+                p2_told = true;
+                break;
+            }
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(e))) => panic!("client error: {e}"),
+            Ok(None) => break,
+        }
+    }
+    assert!(p2_told, "opponent must receive match_declined");
+
+    // …and the decliner's own UI resets on the same ack.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut p1_acked = false;
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(2), p1.next_event()).await {
+            Ok(Some(Ok(lobby_client::ServerEvent::MatchDeclined { .. }))) => {
+                p1_acked = true;
+                break;
+            }
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(e))) => panic!("client error: {e}"),
+            Ok(None) => break,
+        }
+    }
+    assert!(p1_acked, "decliner must receive its own match_declined ack");
+
+    drop(p1);
+    drop(p2);
+}
+
+#[tokio::test]
 async fn openid_return_to_validation() {
     let h = setup().await;
 

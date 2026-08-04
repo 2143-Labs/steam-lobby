@@ -39,6 +39,12 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         }
         if match_store.mark_accepted(token, steam_id).await? {
             // Both players have now accepted — transition to InProgress.
+            tracing::info!(
+                "match {} both players accepted -> InProgress ({}, {})",
+                m.match_token,
+                m.player_a,
+                m.player_b
+            );
             match_store
                 .update_match_status(token, MatchStatus::InProgress)
                 .await?;
@@ -66,6 +72,12 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         if match_store.mark_started(token, steam_id).await? {
             // Both players have now connected — transition to Reporting.
             // Use update_match (sets ended_at) so the report-timeout expiry path is reachable.
+            tracing::info!(
+                "match {} both players P2P-connected -> Reporting ({}, {})",
+                m.match_token,
+                m.player_a,
+                m.player_b
+            );
             match_store
                 .update_match(&m.match_token, MatchStatus::Reporting, Utc::now())
                 .await?;
@@ -181,6 +193,13 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         let now = Utc::now();
         for m in &matches {
             if (now - m.created_at).num_seconds().max(0) as u64 > self.match_accept_timeout_secs {
+                tracing::info!(
+                    "match {} expired: no accept within {}s ({}, {})",
+                    m.match_token,
+                    self.match_accept_timeout_secs,
+                    m.player_a,
+                    m.player_b
+                );
                 match_store
                     .update_match_status(&m.match_token, MatchStatus::Disputed)
                     .await?;
@@ -203,6 +222,10 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                 if (now - ended_at).num_seconds().max(0) as u64 > self.report_timeout_secs {
                     let reports = match_store.get_reports(&m.match_token).await?;
                     if reports.is_empty() {
+                        tracing::info!(
+                            "match {} report window expired with no reports -> Disputed",
+                            m.match_token
+                        );
                         match_store
                             .update_match_status(&m.match_token, MatchStatus::Disputed)
                             .await?;
@@ -214,6 +237,10 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                         };
                         if !winner_ok {
                             // A lone report claiming a non-participant winner cannot be trusted.
+                            tracing::info!(
+                                "match {} lone report claims non-participant winner -> Disputed",
+                                m.match_token
+                            );
                             match_store
                                 .update_match_status(&m.match_token, MatchStatus::Disputed)
                                 .await?;
@@ -238,6 +265,12 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                         };
                         let mu_change_a = new_a.mu - rating_a.mu;
                         let mu_change_b = new_b.mu - rating_b.mu;
+                        tracing::info!(
+                            "match {} report window expired, single report -> {} for {}",
+                            m.match_token,
+                            outcome_str,
+                            m.player_a
+                        );
                         match_store
                             .resolve_match(
                                 &m.match_token,

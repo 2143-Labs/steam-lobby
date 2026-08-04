@@ -201,7 +201,7 @@ All communication happens over a single WebSocket connection at `/ws`. Messages 
 | `report_received` | `match_token`, `reporting_player`, `winner: Option<steam_id>`, `demo_hash` | A player submitted a match report — sent to both players before resolution |
 | `error` | `message: String` | An error occurred processing a message |
 | `match_result` | `match_token: String`, `outcome: Value` | The reports agreed and the match resolved (`Win`/`Loss`/`Draw`/`Disputed` with mu change) — sent to **both** players |
-| `match_declined` | `match_token: String` | Your opponent declined the found match |
+| `match_declined` | `match_token: String` | A player declined the found match — sent to **both** players (the decliner's ack + the opponent's notification) |
 
 ### Typical flow
 
