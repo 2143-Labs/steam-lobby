@@ -32,10 +32,12 @@ just run                  # start server on :8080
 ```
 
 To emulate multiple users without Steam, set `AUTH_DEV_MODE=true` in `.env`
-(it must be `false` in production), then open `web/index.html` in two browser
-tabs (distinct steam IDs), connect both, and start matchmaking in each — the
-demo talks to the dev-only `/auth/test-token` endpoint, no real Steam API
-calls involved.
+(it must be `false` in production), then open `http://localhost:8080/` in two
+browser tabs (the server serves the demo page itself; `web/index.html` in the
+repo is the same file). Give each tab a distinct steam ID, connect both, and
+start matchmaking in each — the demo talks to the dev-only `/auth/test-token`
+endpoint, no real Steam API calls involved.
+
 ## Quickstart (non-NixOS)
 
 Works on any Linux, macOS, or WSL2 — and on Windows via WSL2 or Git Bash.
@@ -58,7 +60,7 @@ need a POSIX shell. Use WSL2 or Git Bash, or run the server directly:
 ## API Endpoints
 
 | Method | Path | Description |
-|--------|------|-------------|
+| GET | `/` | The browser demo page (same as `web/index.html`) |
 | GET | `/health` | Health check, returns `"ok"` |
 | GET | `/auth/steam/login` | Steam OpenID login redirect |
 | GET | `/auth/steam/callback` | Steam OpenID callback |
@@ -251,10 +253,6 @@ tests that start the real server in-process (`lobby-server/src/lib.rs`'s
 
 - `full_match_lifecycle` — two players queue, match, accept, connect, report;
   asserts the match resolves, ratings update, and a `match_results` row is written.
-- `dispute_on_winner_mismatch` — players report different winners; asserts the
-  match is marked `Disputed` and no outcome is persisted.
-- `queue_cancel` — a player cancels matchmaking; asserts no match ever arrives.
-- `rate_limited_test_token` — the dev token endpoint rate-limits per IP.
 - `logout_revokes_token` — a logged-out token no longer authenticates a WebSocket.
 - `ws_frame_size_limit` — oversized WS frames are rejected.
 - `replaced_connection_keeps_new` — a second connection replaces the first.
@@ -271,11 +269,12 @@ connection error.
 ## Web Demo
 
 `web/index.html` is a zero-dependency browser client (native `fetch` +
-`WebSocket`, no build step) that emulates a player. To test multiple users
-locally:
+`WebSocket`, no build step) that emulates a player. The server embeds and
+serves it at `/` — with the server running, just open `http://localhost:8080/`
+in two browser tabs. To test multiple users locally:
 
 1. `just db-up` + `just run` (with `AUTH_DEV_MODE=true` in `.env`).
-2. Open `web/index.html` in two browser tabs.
+2. Open `http://localhost:8080/` in two browser tabs.
 3. Give each tab a distinct steam ID, click **Connect** on both.
 4. Click **Start Matchmaking** in both — each tab shows the other as its
    opponent.

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Redirect};
+use axum::response::{Html, IntoResponse, Redirect};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +13,12 @@ use lobby_core::traits::PlayerStore;
 
 pub async fn health() -> &'static str {
     "ok"
+}
+
+/// The zero-dependency browser demo (`web/index.html`), embedded at build time
+/// so it works from any CWD and inside the Docker image.
+pub async fn index() -> Html<&'static str> {
+    Html(include_str!("../../web/index.html"))
 }
 
 #[derive(Deserialize)]

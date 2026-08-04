@@ -99,6 +99,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
     tokio::spawn(ticker::tick_loop(state.clone()));
 
     let mut router = Router::new()
+        .route("/", get(routes::index))
         .route("/health", get(routes::health))
         .route("/auth/steam/login", get(routes::steam_login))
         .route("/auth/steam/callback", get(routes::steam_callback))
