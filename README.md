@@ -23,9 +23,11 @@ just itest                # run integration tests against Postgres (9 pass)
 just run                  # start server on :8080
 ```
 
-To emulate multiple users without Steam, open `web/index.html` in two browser
-tabs (distinct steam IDs), connect both, then start matchmaking in each — no
-real Steam API calls involved.
+To emulate multiple users without Steam, set `AUTH_DEV_MODE=true` in `.env`
+(it must be `false` in production), then open `web/index.html` in two browser
+tabs (distinct steam IDs), connect both, and start matchmaking in each — the
+demo talks to the dev-only `/auth/test-token` endpoint, no real Steam API
+calls involved.
 
 ## Quickstart (non-NixOS)
 
