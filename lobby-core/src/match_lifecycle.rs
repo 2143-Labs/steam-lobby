@@ -1,3 +1,8 @@
+//! `MatchManager`'s player-facing actions: accept a found match, mark both
+//! players connected, submit reports, and resolve server-authoritative
+//! results from the gameserver webhook. Timeout-driven expiry lives in
+//! `match_expiry`; `resolve_agreed` is shared by every resolution path so
+//! rating math can never drift.
 use chrono::Utc;
 use skillratings::Outcomes;
 

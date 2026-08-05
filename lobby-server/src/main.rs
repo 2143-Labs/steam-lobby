@@ -1,3 +1,5 @@
+//! Binary entrypoint: loads env-var config, builds the app, and serves it
+//! with a graceful shutdown. Helpers: `parse_game_modes` and `shutdown_signal`.
 use lobby_server::{build_app, AppConfig};
 
 #[tokio::main]

@@ -1,3 +1,6 @@
+//! 2-second maintenance loop driving the server's background work: queue
+//! pairing, queue-stats broadcast, stale-queue cleanup, accept/playing/report
+//! expiry, and gameserver allocation for accepted matches.
 use std::sync::Arc;
 use std::time::Duration;
 

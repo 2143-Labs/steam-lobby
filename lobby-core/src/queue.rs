@@ -1,3 +1,6 @@
+//! Matchmaking with an expanding MMR `search_band` (50 at t=0, +25 every 10s,
+//! capped at 400): `MatchmakingQueue::tick` pairs compatible players per mode
+//! under a re-pair cooldown, and `cleanup_stale` drops heartbeat-dead entries.
 use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;

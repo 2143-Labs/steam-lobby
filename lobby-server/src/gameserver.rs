@@ -14,6 +14,8 @@ pub struct GameserverClient {
     /// Base URL of the coordinator as the gameserver can reach it — used to
     /// build the result callback URL.
     pub callback_base: String,
+    /// Shared HTTP client used for creator requests.
+    pub client: reqwest::Client,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -49,7 +51,7 @@ impl GameserverClient {
         });
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            reqwest::Client::new().post(creator_url).json(&body).send(),
+            self.client.post(creator_url).json(&body).send(),
         )
         .await
         .map_err(|_| format!("gameserver creator request timed out for match {}", m.match_token))?

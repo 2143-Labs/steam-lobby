@@ -1,3 +1,5 @@
+//! Steam ticket + OpenID verification and session JWT issue/validate, with
+//! token-version revocation (logout bumps the version, killing old tokens).
 use std::collections::HashMap;
 use std::time::Duration;
 

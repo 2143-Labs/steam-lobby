@@ -1,6 +1,11 @@
+//! WebSocket protocol: the `ClientMessage`/`ServerMessage` enums (tag=type,
+//! snake_case) and the auth-then-command flow from upgrade to disconnect.
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
+use axum::extract::{ConnectInfo, State};
+use axum::http::HeaderMap;
+use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use lobby_core::traits::{MatchStore, PlayerStore, QueueStore};
 use lobby_core::types::{MatchDifficulty, MatchEvent, MatchReport, MatchStatus, SteamId};
@@ -12,33 +17,44 @@ use crate::state::{AppState, ConnectionEntry};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// Inbound commands from the client, tag=type, snake_case. The first message
+/// must be `Auth` or `AuthTicket`; anything else ends the session.
 pub enum ClientMessage {
+    /// Authenticate with a JWT session token (from OpenID login).
     Auth {
         session_token: String,
     },
+    /// Authenticate with a raw Steam ticket.
     AuthTicket {
         ticket: String,
     },
+    /// Enter the matchmaking queue for a mode.
     BeginMatchmaking {
         mode: String,
         difficulty: String,
     },
+    /// Leave the queue.
     CancelMatchmaking,
+    /// Accept a found match.
     AcceptMatch {
         match_token: String,
     },
+    /// Decline a found match; the match becomes `Disputed` if still pending.
     DeclineMatch {
         match_token: String,
     },
+    /// Signal that both peers connected (P2P game start).
     P2pConnected {
         match_token: String,
     },
+    /// Submit a match report (`winner` None = draw).
     MatchReport {
         match_token: String,
         #[serde(default, deserialize_with = "lobby_core::types::deserialize_optional_steam_id")]
         winner: Option<u64>,
         demo_hash: Option<String>,
     },
+    /// Keepalive; refreshes queue liveness.
     Heartbeat,
 }
 
@@ -47,12 +63,14 @@ pub enum ClientMessage {
 /// Outbound messages sent over WebSocket connections.
 #[allow(dead_code)] // QueueStatus, MatchAccepted, MatchStarted reserved for future use
 pub enum ServerMessage {
+    /// Authentication succeeded; carries the player's Steam ID and state.
     AuthOk {
         #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
         steam_id: u64,
         display_name: String,
         state: lobby_core::types::PlayerState,
     },
+    /// Live queue stats + leaderboard for a queued player's mode.
     QueueStatus {
         elapsed_ms: u64,
         band_lo: f64,
@@ -64,9 +82,11 @@ pub enum ServerMessage {
         my_rating: f64, // mu - 3*sigma
         leaderboard: Vec<lobby_core::types::LeaderboardEntry>,
     },
+    /// The opponent reported their peer-to-peer connection.
     OpponentConnected {
         match_token: String,
     },
+    /// A match report was stored (broadcast to both players).
     ReportReceived {
         match_token: String,
         #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
@@ -75,39 +95,49 @@ pub enum ServerMessage {
         winner: Option<u64>,
         demo_hash: Option<String>,
     },
+    /// A match was found; the player must accept within `timeout_ms`.
     MatchFound {
         match_token: String,
         opponent: OpponentInfo,
         timeout_ms: u64,
         game_type: lobby_core::types::GameType,
     },
+    /// Reserved: match accepted by the opponent.
     MatchAccepted {
         match_token: String,
         opponent_steam_id: u64,
     },
+    /// Reserved: match started.
     MatchStarted {
         match_token: String,
     },
+    /// A gameserver was provisioned for a server-authoritative match.
     GameServerReady {
         match_token: String,
         address: String,
         join_token: Option<String>,
     },
+    /// Gameserver provisioning failed or timed out.
     GameServerError {
         match_token: String,
         message: String,
     },
+    /// Final outcome of a match.
     MatchResult {
         match_token: String,
         outcome: serde_json::Value, // MatchOutcome serialized
     },
+    /// The opponent declined the match.
     MatchDeclined {
         match_token: String,
     },
+    /// The match expired (accept timeout).
     MatchExpired {
         match_token: String,
     },
+    /// The player's queue entry was dropped (stale heartbeat).
     QueueExpired,
+    /// Protocol-level error.
     Error {
         code: String,
         message: String,
@@ -121,6 +151,39 @@ pub struct OpponentInfo {
     pub display_name: String,
 }
 
+/// WebSocket upgrade handler: origin-checked (CORS allowlist, dev file://
+/// null origin, or same-origin as the page that served /), 64 KiB frame cap,
+/// then on_upgrade into `handle_ws`.
+pub async fn ws_route(
+    ws: axum::extract::WebSocketUpgrade,
+    State(app_state): axum::extract::State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(origin) = headers.get(axum::http::header::ORIGIN) {
+        let s = origin.to_str().unwrap_or_default();
+        // Allowed if the origin is in the CORS allowlist, is the
+        // file:// null origin in dev mode, or is the same origin
+        // that served the page (the demo is embedded at /).
+        let same_origin = headers
+            .get(axum::http::header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|host| {
+                s == format!("http://{host}") || s == format!("https://{host}")
+            });
+        let allowed = app_state.config.cors_origins.iter().any(|a| a == s)
+            || (app_state.config.auth_dev_mode && origin.as_bytes() == b"null")
+            || same_origin;
+        if !allowed {
+            return axum::http::StatusCode::FORBIDDEN.into_response();
+        }
+    }
+    ws.max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024)
+        .on_upgrade(move |socket| handle_ws(socket, app_state, peer))
+}
+/// Run a WebSocket session: authenticate, then pump client commands and
+/// server broadcasts until either side closes.
 pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::SocketAddr) {
     let (mut sender, mut receiver) = ws.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
@@ -318,6 +381,7 @@ async fn authenticate(
         }
     };
 
+    // ── Auth ──
     match cm {
         ClientMessage::Auth { session_token } => {
             let (id, ver) = match state.steam_auth.validate_session_token(&session_token) {
@@ -389,6 +453,7 @@ async fn handle_client_message(
     tx: &mpsc::UnboundedSender<ServerMessage>,
 ) {
     match cm {
+        // ── Matchmaking ──
         ClientMessage::BeginMatchmaking { mode, difficulty } => {
             let diff = match difficulty.as_str() {
                 "easy" => MatchDifficulty::Easy,
@@ -429,6 +494,7 @@ async fn handle_client_message(
             let _ = state.store.dequeue(steam_id, "ranked_1v1").await;
             tracing::info!("player {steam_id} left queue (cancelled)");
         }
+        // ── Match lifecycle ──
         ClientMessage::AcceptMatch { match_token } => {
             match state
                 .match_manager
@@ -491,6 +557,7 @@ async fn handle_client_message(
                 }
             }
         }
+        // ── Reporting ──
         ClientMessage::MatchReport {
             match_token,
             winner,
@@ -559,6 +626,7 @@ async fn handle_client_message(
                 }
             }
         }
+        // ── Liveness ──
         ClientMessage::Heartbeat => {
             tracing::trace!("heartbeat from {steam_id}");
             let _ = state.player_manager.heartbeat(steam_id, &state.store).await;
@@ -567,6 +635,7 @@ async fn handle_client_message(
     }
 }
 
+/// Send `msg` to both players of a match (best-effort; skips disconnected).
 pub async fn notify_match_players(state: &Arc<AppState>, token: &str, msg: ServerMessage) {
     if let Ok(Some(m)) = state.store.get_match(token).await {
         let connections = state.connections.lock().await;

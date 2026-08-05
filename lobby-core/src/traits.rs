@@ -1,3 +1,7 @@
+//! The storage/callback traits the core depends on: `GameCallbacks` plus the
+//! five storage abstractions (`PlayerStore`, `MatchStore`, `QueueStore`,
+//! `RatingStore`, `SteamAuth`). Production impls are `PostgresStore` in
+//! lobby-server `db/`; tests use `MockStore` (lobby-core `tests/common`).
 use async_trait::async_trait;
 use std::collections::HashMap;
 

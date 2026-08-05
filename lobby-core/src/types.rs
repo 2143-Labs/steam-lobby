@@ -1,3 +1,7 @@
+//! Wire types shared by all crates, plus Steam-ID serde helpers that keep
+//! 17-digit IDs exact for JS clients (serialized as decimal strings). Most
+//! enums are `snake_case`; `MatchStatus` is deliberately PascalCase because
+//! it is the DB column contract.
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 

@@ -1,3 +1,6 @@
+//! HTTP surface: health + embedded demo index, Steam OpenID login/callback,
+//! ticket auth, logout, the internal gameserver result webhook, and the
+//! dev-only test-token + mock creator endpoints.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,7 +61,7 @@ pub async fn steam_login(
     Query(query): Query<LoginQuery>,
 ) -> impl IntoResponse {
     let return_to = query.return_to.unwrap_or_else(|| "/".to_string());
-    if !validate_return_to(&return_to, state.public_url.as_deref()) {
+    if !validate_return_to(&return_to, state.config.public_url.as_deref()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "invalid_return_to"})),
@@ -66,7 +69,7 @@ pub async fn steam_login(
             .into_response();
     }
     // Steam requires an absolute callback URL, so OpenID login needs PUBLIC_URL.
-    let Some(public_url) = state.public_url.as_deref() else {
+    let Some(public_url) = state.config.public_url.as_deref() else {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "public_url_required"})),
@@ -138,7 +141,7 @@ pub async fn steam_callback(
             .into_response();
     }
     // Defense in depth: re-validate the (now state-bound) return_to.
-    if !validate_return_to(&return_to, state.public_url.as_deref()) {
+    if !validate_return_to(&return_to, state.config.public_url.as_deref()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "invalid_return_to"})),
@@ -178,7 +181,7 @@ pub async fn steam_callback(
     };
     let token = match state
         .steam_auth
-        .generate_session_token(steam_id, version, state.jwt_ttl_secs)
+        .generate_session_token(steam_id, version, state.config.jwt_ttl_secs)
     {
         Ok(t) => t,
         Err(e) => {
@@ -243,7 +246,7 @@ pub async fn ticket_auth(
 
     let token = match state
         .steam_auth
-        .generate_session_token(steam_id, version, state.jwt_ttl_secs)
+        .generate_session_token(steam_id, version, state.config.jwt_ttl_secs)
     {
         Ok(t) => t,
         Err(e) => {
@@ -292,7 +295,7 @@ pub async fn test_token(
 
     let token = match state
         .steam_auth
-        .generate_session_token(body.steam_id, version, state.jwt_ttl_secs)
+        .generate_session_token(body.steam_id, version, state.config.jwt_ttl_secs)
     {
         Ok(t) => t,
         Err(e) => {
@@ -461,7 +464,10 @@ pub async fn modes(State(state): State<Arc<AppState>>) -> Json<serde_json::Value
 
 /// Dev-only fake creator: returns a (simulated) server address and auto-reports
 /// player_a's win 3s after allocation, exercising the full webhook path.
-pub async fn mock_allocate(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
+pub async fn mock_allocate(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
     let callback = body["result_callback_url"]
         .as_str()
         .unwrap_or_default()
@@ -472,8 +478,8 @@ pub async fn mock_allocate(Json(body): Json<serde_json::Value>) -> impl IntoResp
         .unwrap_or_default();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let client = reqwest::Client::new();
-        let _ = client
+        let _ = state
+            .http
             .post(&callback)
             .json(&serde_json::json!({ "winner": winner }))
             .send()

@@ -1,3 +1,6 @@
+//! Thin wrapper over `skillratings`' Weng-Lin implementation: converts the
+//! core's `OpenSkillRating` to/from the library types, applies an `Outcomes`
+//! result, and stamps both new ratings with the current time.
 use chrono::Utc;
 use skillratings::weng_lin::{weng_lin, WengLinConfig, WengLinRating};
 use skillratings::Outcomes;

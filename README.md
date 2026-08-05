@@ -182,6 +182,30 @@ When a match is found, both players receive a `MatchFound` message. Both must ac
 
 Every pairing, accept, and decline is appended to the `match_events` audit table (`event_type` `paired`/`accepted`/`declined`, actor `steam_id`, timestamp), and a declined match is immediately marked `Disputed`.
 
+## Codebase Map
+
+| Crate | File | Responsibility |
+|-------|------|----------------|
+| lobby-core | `types.rs` | Wire types + Steam-ID serde helpers |
+| lobby-core | `traits.rs` | Storage/callback traits |
+| lobby-core | `player.rs` | `PlayerManager` state machine |
+| lobby-core | `queue.rs` | Matchmaking + expanding search band |
+| lobby-core | `match_lifecycle.rs` / `match_expiry.rs` | MatchManager player actions / expiry |
+| lobby-core | `mmr.rs` | Weng-Lin rating math |
+| lobby-core | `error.rs` | `LobbyError` + `Result` |
+| lobby-server | `lib.rs` | App assembly (`build_app`) |
+| lobby-server | `state.rs` | `AppState` composition root |
+| lobby-server | `ws.rs` | WebSocket protocol |
+| lobby-server | `ticker.rs` | 2s maintenance loop (7 phases) |
+| lobby-server | `routes.rs` | HTTP endpoints |
+| lobby-server | `steam_auth.rs` | Steam ticket/OpenID auth + JWT |
+| lobby-server | `db/` | `PostgresStore` impls (one file per store trait) |
+| lobby-server | `gameserver.rs` | Gameserver creator client |
+| lobby-server | `rate_limit.rs` | Rate limiter |
+| lobby-client | `lib.rs` | WS client + `ServerEvent` types (demo + integration tests) |
+| tests | `lobby-core/tests/` | Common mocks + lifecycle/player/rating suites |
+| tests | `lobby-server/tests/` | Integration suite + common harness |
+
 ## Client Protocol
 
 All communication happens over a single WebSocket connection at `/ws`. Messages are JSON with a `"type"` field (`snake_case`).

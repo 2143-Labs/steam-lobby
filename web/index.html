@@ -40,6 +40,7 @@ connect both, then start matchmaking in each.</p>
   <label>Steam ID (dev test-token; server must run with AUTH_DEV_MODE=true)</label>
   <input id="steam-id" value="76561198000000001" size="20">
   <button id="btn-connect" class="primary">Connect</button>
+  <button id="btn-disconnect" disabled>Disconnect</button>
 </section>
 
 <section>
@@ -207,6 +208,8 @@ $("btn-connect").addEventListener("click", async () => {
   state.ws.onopen = () => {
     log("sys", "WS open: " + wsUrl);
     state.steamId = steamId;
+    $("btn-connect").disabled = true;
+    $("btn-disconnect").disabled = false;
     send({ type: "auth", session_token: token });
   };
   state.ws.onmessage = (ev) => handleServer(ev.data);
@@ -214,10 +217,24 @@ $("btn-connect").addEventListener("click", async () => {
     stopHeartbeat();
     log("sys", "WS closed");
     if (state.ws) { state.ws = null; }
+    $("btn-connect").disabled = false;
+    $("btn-disconnect").disabled = true;
     setStatus("Disconnected", "");
     $("controls").style.display = "none";
   };
   state.ws.onerror = () => log("sys", "WS error");
+});
+
+$("btn-disconnect").addEventListener("click", () => {
+  log("sys", "disconnecting");
+  // ws.close() runs the normal close handshake; onclose resets the UI and
+  // the server cleans up (handle_disconnect, queue sweep) on the close frame.
+  if (state.ws) { state.ws.close(); }
+  // Clear session state so a reconnect can't inherit a stale match.
+  state.steamId = null;
+  state.matchToken = null;
+  state.opponentId = null;
+  state.gameType = null;
 });
 
 function handleServer(raw) {

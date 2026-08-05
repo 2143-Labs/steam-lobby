@@ -1,3 +1,6 @@
+//! In-memory sliding-window rate limiter keyed by client IP. Per-process
+//! state only — behind a reverse proxy all clients share one budget
+//! (acceptable fail-closed behavior for a single-instance service).
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::Mutex;

@@ -1,3 +1,4 @@
+//! `RatingStore` impl for `PostgresStore`: ratings rows and leaderboard reads.
 use super::*;
 
 #[async_trait]

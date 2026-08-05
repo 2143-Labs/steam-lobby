@@ -1,3 +1,4 @@
+//! `QueueStore` impl for `PostgresStore`: the `matchmaking_queue` table.
 use super::*;
 
 #[async_trait]

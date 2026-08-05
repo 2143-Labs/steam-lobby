@@ -1,3 +1,5 @@
+//! `MatchStore` impl for `PostgresStore`: matches, reports, results, and
+//! match_events rows.
 use super::*;
 
 #[async_trait]

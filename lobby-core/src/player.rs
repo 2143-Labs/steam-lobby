@@ -1,16 +1,27 @@
+//! `PlayerManager` drives the per-player `PlayerState` state machine: every
+//! transition validates the prior state and rejects illegal ones with
+//! `LobbyError::InvalidStateTransition`.
 use crate::error::{LobbyError, Result};
 use crate::traits::{GameCallbacks, PlayerStore};
 use crate::types::{MatchDifficulty, PlayerState, SteamId};
 
+/// Drives a single player's `PlayerState` machine against a `PlayerStore`.
+/// Every transition validates the current state first and rejects illegal
+/// ones with `LobbyError::InvalidStateTransition`. The happy path is
+/// `InMenus → Queueing → MatchAccepted → InMatch → Reporting → InMenus`;
+/// `handle_disconnect` returns to `InMenus` from anywhere.
 pub struct PlayerManager<CB: GameCallbacks> {
     callbacks: CB,
 }
 
 impl<CB: GameCallbacks> PlayerManager<CB> {
+    /// Create a manager wired to the given game callbacks.
     pub fn new(callbacks: CB) -> Self {
         Self { callbacks }
     }
 
+    /// Move a player into the menus (first login only): creates the player
+    /// row at `InMenus` when none exists, otherwise a no-op. Idempotent.
     pub async fn enter_menus(
         &self,
         steam_id: SteamId,
@@ -28,6 +39,9 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         Ok(())
     }
 
+    /// `InMenus → Queueing`. A missing player row defaults to `InMenus`, so a
+    /// player who skipped `enter_menus` can still queue; fires the
+    /// `on_player_queueing` callback, then sets the state.
     pub async fn begin_matchmaking(
         &self,
         steam_id: SteamId,
@@ -54,6 +68,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         Ok(())
     }
 
+    /// `Queueing → InMenus`. Errors `PlayerNotFound` when no row exists.
     pub async fn cancel_matchmaking(
         &self,
         steam_id: SteamId,
@@ -77,6 +92,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         Ok(())
     }
 
+    /// `Queueing → MatchAccepted` once the player accepts a found match.
     pub async fn match_accepted(
         &self,
         steam_id: SteamId,
@@ -99,6 +115,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         Ok(())
     }
 
+    /// `MatchAccepted → InMatch` once both peers have connected.
     pub async fn p2p_connected(
         &self,
         steam_id: SteamId,
@@ -121,6 +138,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         Ok(())
     }
 
+    /// `InMatch → Reporting` when the player submits their match report.
     pub async fn begin_reporting(
         &self,
         steam_id: SteamId,
@@ -143,6 +161,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         Ok(())
     }
 
+    /// `Reporting → InMenus`; the player is free to queue again.
     pub async fn reporting_complete(
         &self,
         steam_id: SteamId,
@@ -165,12 +184,14 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         Ok(())
     }
 
+    /// No state transition — refreshes `last_heartbeat` (queue liveness).
     pub async fn heartbeat(&self, steam_id: SteamId, player_store: &dyn PlayerStore) -> Result<()> {
         self.callbacks.on_heartbeat(steam_id).await?;
         player_store.update_heartbeat(steam_id).await?;
         Ok(())
     }
 
+    /// Any state → `InMenus`; called when the client disconnects.
     pub async fn handle_disconnect(
         &self,
         steam_id: SteamId,

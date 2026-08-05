@@ -1,3 +1,5 @@
+//! `PlayerStore` impl for `PostgresStore`: users, player_state, ratings, and
+//! token-version rows.
 use super::*;
 
 #[async_trait]

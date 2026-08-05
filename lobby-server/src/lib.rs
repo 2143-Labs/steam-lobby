@@ -1,8 +1,10 @@
+//! Lobby server: `build_app` wires config + shared state into an axum Router.
+//! Module map: `db/` PostgresStore impls, `gameserver` creator client,
+//! `rate_limit` limiter, `routes` HTTP surface, `state` AppState, `steam_auth`
+//! Steam ticket + JWT auth, `ticker` maintenance loop, `ws` WebSocket protocol.
 use std::sync::Arc;
 
-use axum::extract::ConnectInfo;
-use axum::response::IntoResponse;
-use axum::{extract::State, routing::get, Router};
+use axum::{routing::get, Router};
 use tower_http::cors::CorsLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
@@ -24,6 +26,7 @@ use steam_auth::SteamAuthService;
 use lobby_core::traits::QueueStore;
 use lobby_core::types::GameType;
 pub use state::AppState; // re-exported so integration tests can name the type
+use state::RuntimeConfig;
 
 pub struct AppConfig {
     pub db_url: String,
@@ -112,6 +115,9 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
     {
         tracing::warn!("failed to clear stale queue entries at startup: {e}");
     }
+    // Built here: `config.jwt_secret` is moved into SteamAuthService below,
+    // after which the whole `config` can no longer be borrowed.
+    let cors = cors_layer(&config);
     let steam_auth = SteamAuthService::new(config.steam_api_key.clone(), config.app_id, config.jwt_secret);
     let callbacks = DefaultCallbacks;
     let player_manager = lobby_core::player::PlayerManager::new(callbacks.clone());
@@ -124,6 +130,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         config.match_accept_timeout_secs,
         config.report_timeout_secs,
     );
+    let http = reqwest::Client::new();
     let state = Arc::new(AppState {
         player_manager,
         matchmaking_queue,
@@ -131,17 +138,21 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         steam_auth,
         store,
         game_modes: config.game_modes.clone(),
+        http: http.clone(),
         gameserver: crate::gameserver::GameserverClient {
             creator_url,
             callback_base,
+            client: http,
         },
         gameserver_alloc_timeout_secs: config.gameserver_alloc_timeout_secs,
         gameserver_result_timeout_secs: config.gameserver_result_timeout_secs,
         connections: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        public_url: config.public_url.clone(),
-        auth_dev_mode: config.auth_dev_mode,
-        jwt_ttl_secs: config.jwt_ttl_secs,
-        allowed_origins: config.cors_origins.clone(),
+        config: RuntimeConfig {
+            public_url: config.public_url.clone(),
+            auth_dev_mode: config.auth_dev_mode,
+            jwt_ttl_secs: config.jwt_ttl_secs,
+            cors_origins: config.cors_origins.clone(),
+        },
         openid_states: std::sync::Mutex::new(std::collections::HashMap::new()),
         ticket_limiter: RateLimiter::new(10, std::time::Duration::from_secs(60)),
         test_token_limiter: RateLimiter::new(20, std::time::Duration::from_secs(60)),
@@ -162,35 +173,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         .route("/auth/steam/callback", get(routes::steam_callback))
         .route("/auth/ticket", axum::routing::post(routes::ticket_auth))
         .route("/auth/logout", axum::routing::post(routes::logout))
-        .route(
-            "/ws",
-            get(|ws: axum::extract::WebSocketUpgrade,
-                 State(app_state): axum::extract::State<Arc<AppState>>,
-                 ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-                 headers: axum::http::HeaderMap| async move {
-                if let Some(origin) = headers.get(axum::http::header::ORIGIN) {
-                    let s = origin.to_str().unwrap_or_default();
-                    // Allowed if the origin is in the CORS allowlist, is the
-                    // file:// null origin in dev mode, or is the same origin
-                    // that served the page (the demo is embedded at /).
-                    let same_origin = headers
-                        .get(axum::http::header::HOST)
-                        .and_then(|h| h.to_str().ok())
-                        .is_some_and(|host| {
-                            s == format!("http://{host}") || s == format!("https://{host}")
-                        });
-                    let allowed = app_state.allowed_origins.iter().any(|a| a == s)
-                        || (app_state.auth_dev_mode && origin.as_bytes() == b"null")
-                        || same_origin;
-                    if !allowed {
-                        return axum::http::StatusCode::FORBIDDEN.into_response();
-                    }
-                }
-                ws.max_message_size(64 * 1024)
-                    .max_frame_size(64 * 1024)
-                    .on_upgrade(move |socket| ws::handle_ws(socket, app_state, peer))
-            }),
-        );
+        .route("/ws", get(ws::ws_route));
 
     if config.auth_dev_mode {
         router = router.route("/auth/test-token", axum::routing::post(routes::test_token));
@@ -199,27 +182,6 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
     if mock_enabled {
         router = router.route("/internal/mock/allocate", axum::routing::post(routes::mock_allocate));
     }
-
-    let mut allowed: Vec<String> = config.cors_origins.clone();
-    if let Some(pu) = &config.public_url {
-        if let Ok(u) = url::Url::parse(pu) {
-            allowed.push(u.origin().ascii_serialization());
-        }
-    }
-    let allowed = Arc::new(allowed);
-    let dev = config.auth_dev_mode;
-    let cors = CorsLayer::new()
-        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
-        .allow_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::header::AUTHORIZATION,
-        ])
-        .allow_origin(tower_http::cors::AllowOrigin::predicate(
-            move |origin: &axum::http::HeaderValue, _| {
-                let s = origin.to_str().unwrap_or_default();
-                allowed.iter().any(|a| a == s) || (dev && origin.as_bytes() == b"null")
-            },
-        ));
 
     let app = router
         .layer(cors)
@@ -231,4 +193,29 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         .with_state(state.clone());
 
     (app, state)
+}
+
+/// CORS layer from config: GET/POST, content-type + authorization headers,
+/// origins = cors_origins + the public_url origin; dev mode allows null origin.
+fn cors_layer(config: &AppConfig) -> CorsLayer {
+    let mut allowed: Vec<String> = config.cors_origins.clone();
+    if let Some(pu) = &config.public_url {
+        if let Ok(u) = url::Url::parse(pu) {
+            allowed.push(u.origin().ascii_serialization());
+        }
+    }
+    let allowed = Arc::new(allowed);
+    let dev = config.auth_dev_mode;
+    CorsLayer::new()
+        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+        ])
+        .allow_origin(tower_http::cors::AllowOrigin::predicate(
+            move |origin: &axum::http::HeaderValue, _| {
+                let s = origin.to_str().unwrap_or_default();
+                allowed.iter().any(|a| a == s) || (dev && origin.as_bytes() == b"null")
+            },
+        ))
 }

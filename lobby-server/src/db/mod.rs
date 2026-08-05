@@ -1,3 +1,6 @@
+//! `PostgresStore`: the production impl of the core storage traits. Shared
+//! row types and parse helpers used by the per-trait impl files (`players`,
+//! `matches`, `queue`, `ratings`).
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use lobby_core::error::{LobbyError, Result};

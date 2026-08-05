@@ -1,3 +1,5 @@
+//! `LobbyError` variants and the crate-wide `Result` alias, built on
+//! `thiserror`. Every fallible API in the core returns `Result<T>`.
 use crate::types::{PlayerState, SteamId};
 use thiserror::Error;
 
