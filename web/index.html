@@ -48,6 +48,8 @@ connect both, then start matchmaking in each.</p>
 
 <section id="controls" style="display:none">
   <div id="ctrl-connected">
+    <label>Mode</label>
+    <select id="mode"></select>
     <label>Difficulty</label>
     <select id="difficulty"><option>easy</option><option selected>normal</option><option>hard</option></select>
     <button id="btn-queue" class="primary">Start Matchmaking</button>
@@ -70,6 +72,7 @@ connect both, then start matchmaking in each.</p>
     <button id="btn-decline">Decline Match</button>
   </div>
   <div id="ctrl-inmatch" style="display:none">
+    <p id="server-info" style="display:none"></p>
     <p>P2P: <span id="opp-p2p">Waiting for opponent P2P…</span></p>
     <p>Result: <span id="report-status">—</span></p>
     <button id="btn-p2p" class="primary">P2P Connected (simulated)</button>
@@ -85,7 +88,7 @@ connect both, then start matchmaking in each.</p>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-const state = { ws: null, steamId: null, matchToken: null, opponentId: null };
+const state = { ws: null, steamId: null, matchToken: null, opponentId: null, gameType: null };
 // Consume an OpenID-issued fragment token (#token=…) if present, then strip it
 // from the URL so it isn't re-sent or stored in history.
 let fragmentToken = null;
@@ -118,14 +121,11 @@ function showControls(name) {
   $("ctrl-queueing").style.display = name === "queueing" ? "" : "none";
   $("ctrl-match").style.display = name === "match" ? "" : "none";
   $("ctrl-inmatch").style.display = name === "inmatch" ? "" : "none";
-  // The queue entry only survives while the client heartbeats. Heartbeat
-  // while the queueing panel is up; stop as soon as we leave it.
-  if (name === "queueing") startHeartbeat(); else stopHeartbeat();
 }
 let hbTimer = null;
-function startHeartbeat() {
+function startHeartbeat(intervalMs) {
   stopHeartbeat();
-  hbTimer = setInterval(() => send({ type: "heartbeat" }), 5000);
+  hbTimer = setInterval(() => send({ type: "heartbeat" }), intervalMs);
 }
 function stopHeartbeat() {
   if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
@@ -172,6 +172,30 @@ $("btn-connect").addEventListener("click", async () => {
     }
   }
 
+  // Populate the mode dropdown from the server (same base the user typed).
+  try {
+    const resp = await fetch(base + "/modes");
+    if (resp.ok) {
+      const body = await resp.json();
+      const sel = $("mode");
+      sel.innerHTML = "";
+      for (const m of body.modes) {
+        const opt = document.createElement("option");
+        opt.value = m.name;
+        opt.textContent = m.name + " (" + m.game_type + ")";
+        sel.appendChild(opt);
+      }
+    }
+  } catch (e) {
+    log("sys", "modes fetch failed: " + e.message);
+  }
+  if ($("mode").options.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = "ranked_1v1";
+    opt.textContent = "ranked_1v1 (p2p)";
+    $("mode").appendChild(opt);
+  }
+
   const wsUrl = base.replace(/^http/, "ws") + "/ws";
   try {
     state.ws = new WebSocket(wsUrl);
@@ -205,16 +229,35 @@ function handleServer(raw) {
       setStatus(msg.state === "queueing" ? "Connected — still in queue" : "Connected", "ok");
       $("controls").style.display = "";
       showControls(msg.state === "queueing" ? "queueing" : "connected");
+      // Passive liveness: heartbeat for as long as we're connected. The server
+      // drops the connection after 30s without a heartbeat (10s cadence gives
+      // margin); while queueing this also keeps the queue entry alive.
+      startHeartbeat(10000);
       log("sys", "server state on connect: " + msg.state);
       break;
     case "match_found":
       setStatus("MatchFound", "ok");
       state.matchToken = msg.match_token;
       state.opponentId = msg.opponent.steam_id;
+      state.gameType = msg.game_type;
       $("opponent").textContent = msg.opponent.steam_id + " (" + msg.opponent.display_name + ")";
       $("match-token").textContent = msg.match_token;
       $("opp-p2p").textContent = "Waiting for opponent P2P…";
       $("report-status").textContent = "—";
+      if (msg.game_type === "server") {
+        $("server-info").style.display = "";
+        $("server-info").textContent = "Waiting for server allocation…";
+        $("btn-p2p").style.display = "none";
+        $("btn-report-win").style.display = "none";
+        $("btn-report-loss").style.display = "none";
+        $("btn-report-draw").style.display = "none";
+      } else {
+        $("server-info").style.display = "none";
+        $("btn-p2p").style.display = "";
+        $("btn-report-win").style.display = "none";
+        $("btn-report-loss").style.display = "none";
+        $("btn-report-draw").style.display = "none";
+      }
       showControls("match");
       break;
     case "queue_status":
@@ -271,6 +314,30 @@ function handleServer(raw) {
       setStatus("Match declined", "");
       showControls("connected");
       state.matchToken = null;
+      state.gameType = null;
+      $("server-info").style.display = "none";
+      break;
+    case "game_server_ready":
+      $("server-info").textContent = "Server ready: " + msg.address
+        + (msg.join_token ? " (join token " + msg.join_token + ")" : "");
+      log("sys", "game server ready: " + msg.address);
+      setStatus("Playing on game server — awaiting result", "ok");
+      break;
+    case "game_server_error":
+      setStatus("Game server error: " + msg.message, "err");
+      log("sys", "game server error: " + msg.message);
+      break;
+    case "match_result":
+      const o = msg.outcome;
+      const txt = typeof o === "object"
+        ? (o.Disputed ? "Match disputed" : Object.keys(o)[0] + (o[Object.keys(o)[0]].mu_change !== undefined ? " (mu change " + o[Object.keys(o)[0]].mu_change.toFixed(2) + ")" : ""))
+        : String(o);
+      setStatus("Match resolved: " + txt, "ok");
+      log("sys", "match resolved: " + JSON.stringify(o));
+      showControls("connected");
+      state.matchToken = null;
+      state.gameType = null;
+      $("server-info").style.display = "none";
       break;
     case "error":
       setStatus("Error: " + msg.message, "err");
@@ -281,7 +348,7 @@ function handleServer(raw) {
   }
 }
 $("btn-queue").addEventListener("click", () => {
-  send({ type: "begin_matchmaking", mode: "ranked_1v1", difficulty: $("difficulty").value });
+  send({ type: "begin_matchmaking", mode: $("mode").value, difficulty: $("difficulty").value });
   setStatus("Queueing…", "");
   showControls("queueing");
   $("q-wait").textContent = "waiting…";
@@ -304,11 +371,21 @@ $("btn-accept").addEventListener("click", () => {
   showControls("inmatch");
   // Reset the in-match panel so a previous game's state never leaks in.
   $("btn-p2p").style.display = "";
+  $("server-info").style.display = "none";
   $("btn-report-win").style.display = "none";
   $("btn-report-loss").style.display = "none";
   $("btn-report-draw").style.display = "none";
   $("opp-p2p").textContent = "Waiting for opponent P2P…";
   $("report-status").textContent = "—";
+});
+$("btn-decline").addEventListener("click", () => {
+  send({ type: "decline_match", match_token: state.matchToken });
+  setStatus("Match declined", "");
+  log("sys", "match declined");
+  showControls("connected");
+  state.matchToken = null;
+  state.gameType = null;
+  $("server-info").style.display = "none";
 });
 $("btn-p2p").addEventListener("click", () => {
   send({ type: "p2p_connected", match_token: state.matchToken });

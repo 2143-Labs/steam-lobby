@@ -18,6 +18,10 @@ pub struct TestHarness {
 
 
 pub async fn setup() -> TestHarness {
+    setup_with_creator(None).await
+}
+
+pub async fn setup_with_creator(creator_url: Option<&str>) -> TestHarness {
     let _lock_guard = DB_LOCK.lock().await;
 
     let root_url = "postgres://lobby:lobby@localhost:5432/lobby";
@@ -47,7 +51,7 @@ pub async fn setup() -> TestHarness {
     // Clean slate: truncate all tables (RESTART IDENTITY resets serials; CASCADE handles FKs).
     sqlx::query(
         "TRUNCATE users, player_state, ratings, matchmaking_queue, matches, \
-         match_reports, match_results RESTART IDENTITY CASCADE",
+         match_reports, match_results, match_events RESTART IDENTITY CASCADE",
     )
     .execute(&pool)
     .await
@@ -67,6 +71,13 @@ pub async fn setup() -> TestHarness {
         auth_dev_mode: true,
         jwt_ttl_secs: 86400,
         cors_origins: vec!["https://lobby.example.com".into()],
+        game_modes: vec![
+            ("ranked_1v1".into(), lobby_core::types::GameType::P2p),
+            ("server_arena".into(), lobby_core::types::GameType::Server),
+        ],
+        gameserver_creator_url: creator_url.map(|s| s.to_string()),
+        gameserver_alloc_timeout_secs: 60,
+        gameserver_result_timeout_secs: 300,
     };
 
     let (app, state) = build_app(config).await; // runs migrations + spawns ticker

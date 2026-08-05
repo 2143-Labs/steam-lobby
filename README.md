@@ -27,7 +27,7 @@ openssl rand -base64 48   # paste the output into JWT_SECRET in .env
 nix-shell shell.nix       # enter dev shell (provides cargo, rustc, just)
 just db-up                # start PostgreSQL in Docker
 just test                 # run unit tests
-just itest                # run integration tests against Postgres (9 pass)
+just itest                # run integration tests against Postgres (21 pass)
 just run                  # start server on :8080
 ```
 
@@ -68,6 +68,8 @@ need a POSIX shell. Use WSL2 or Git Bash, or run the server directly:
 | POST | `/auth/ticket` | Steam ticket auth -> JWT (rate-limited 10/min per IP) |
 | POST | `/auth/test-token` | Dev-only: JWT for any steam_id (only when `AUTH_DEV_MODE=true`) |
 | POST | `/auth/logout` | Revoke the current session token (all earlier tokens die) |
+| GET | `/modes` | Configured matchmaking modes + their game types (the demo dropdown) |
+| POST | `/internal/game-result/{token}/{secret}` | Gameserver result webhook; the URL itself is the auth |
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -85,6 +87,10 @@ need a POSIX shell. Use WSL2 or Git Bash, or run the server directly:
 | `LOBBY_HOST` | `0.0.0.0` | Bind address |
 | `LOBBY_PORT` | `8080` | Bind port |
 | `PUBLIC_URL` | — | Required for Steam OpenID login (absolute public origin); login returns `400` without it |
+| `GAME_MODES` | `ranked_1v1:p2p,server_arena:server` | Comma-separated `mode:type` pairs; `type` = `p2p` \| `server` |
+| `GAMESERVER_CREATOR_URL` | — | Absolute URL of the gameserver creator's allocate endpoint (required for server modes) |
+| `GAMESERVER_ALLOC_TIMEOUT_S` | `60` | Seconds before an unallocated server match is disputed |
+| `GAMESERVER_RESULT_TIMEOUT_S` | `300` | Seconds after the server is ready before a missing result is disputed |
 
 > **Production:** `JWT_SECRET` is required (≥32 random bytes) and `AUTH_DEV_MODE`
 > must stay `false`. Set `STEAM_API_KEY` to a real [Steam Web API
@@ -174,6 +180,8 @@ Players connect over WebSocket and authenticate with a JWT (obtained via Steam O
 
 When a match is found, both players receive a `MatchFound` message. Both must accept before the match transitions to `InProgress`. After the match, each player submits a report (winner + optional demo hash). If both agree, ratings update via the Weng-Lin algorithm (a modern Bayesian system with uncertainty tracking). If they disagree or demo hashes mismatch, the match is disputed.
 
+Every pairing, accept, and decline is appended to the `match_events` audit table (`event_type` `paired`/`accepted`/`declined`, actor `steam_id`, timestamp), and a declined match is immediately marked `Disputed`.
+
 ## Client Protocol
 
 All communication happens over a single WebSocket connection at `/ws`. Messages are JSON with a `"type"` field (`snake_case`).
@@ -190,14 +198,14 @@ All communication happens over a single WebSocket connection at `/ws`. Messages 
 | `decline_match` | `match_token: String` | Decline a found match (rare — acceptance is the default) |
 | `p2p_connected` | `match_token: String` | Notify server that P2P connection to opponent is established |
 | `match_report` | `match_token: String`, `winner: u64?`, `demo_hash: String?` | Submit match result (winner is the victor's steam_id; `null` for draw) |
-| `heartbeat` | — | Client liveness signal. While queueing, send every ~5s to keep your queue entry alive indefinitely; without heartbeats the entry is dropped 30s after the last one |
+| `heartbeat` | — | Client liveness signal. Send every ~10s for as long as you're connected — the server drops the connection 30s after the last heartbeat, and while queueing the queue entry is dropped 30s after the last heartbeat too (so a 10s cadence keeps both alive indefinitely) |
 
 ### Server → Client
 
 | Type | Fields | Description |
 |------|--------|-------------|
 | `auth_ok` | `steam_id: u64`, `display_name: String`, `state: string` | Authentication succeeded; `state` is the player's persisted status (`in_menus`/`queueing`/`match_accepted`/`in_match`/`reporting`) so a reconnect knows where it left off |
-| `match_found` | `match_token: String`, `opponent: { steam_id, display_name }`, `timeout_ms: u64` | A match is ready — accept or it expires |
+| `match_found` | `match_token: String`, `opponent: { steam_id, display_name }`, `timeout_ms: u64`, `game_type: "p2p" \| "server"` | A match is ready — accept or it expires; `game_type` tells the client which lifecycle to run |
 | `queue_status` | `elapsed_ms`, `band_lo/hi`, `candidates`, `queue_size`, `my_mu/sigma/rating`, `leaderboard: [{steam_id, mu, sigma, rating}]` | Live queue stats pushed every ~2s while queueing (wait time, expanding MMR band, opponents available, your rating, full MMR leaderboard) |
 | `opponent_connected` | `match_token` | The opponent's `p2p_connected` signal was accepted |
 | `report_received` | `match_token`, `reporting_player`, `winner: Option<steam_id>`, `demo_hash` | A player submitted a match report — sent to both players before resolution |
@@ -205,6 +213,8 @@ All communication happens over a single WebSocket connection at `/ws`. Messages 
 | `match_result` | `match_token: String`, `outcome: Value` | The reports agreed and the match resolved (`Win`/`Loss`/`Draw`/`Disputed` with mu change) — sent to **both** players |
 | `match_declined` | `match_token: String` | A player declined the found match — sent to **both** players (the decliner's ack + the opponent's notification) |
 | `queue_expired` | — | The player's queue entry was dropped (30s without a heartbeat) — sent to the player so the UI never freezes on a dead queue |
+| `game_server_ready` | `match_token`, `address: String`, `join_token: String?` | A server-authoritative match's gameserver is up — join it |
+| `game_server_error` | `match_token`, `message: String` | The gameserver could not be provisioned (allocation failed or timed out) |
 
 ### Typical flow
 
@@ -222,8 +232,37 @@ Client                           Server
   |        (match in progress)    |
   |                                |
   |--- match_report { ... } ----->|
-  |<--- match_found (if re-queued)|
-```
+| `just test` | Run all unit tests (14) + doc test |
+| `just itest` | Run 21 DB-backed integration tests (needs `just db-up`) |
+
+### Server-authoritative games
+
+When a mode's game type is `server` (see `GAME_MODES`), the coordinator does not
+relay P2P state — it provisions a dedicated game server and the **server**
+reports the result via webhook:
+
+1. Both players accept (same as P2P). The match becomes `InProgress`.
+2. The coordinator calls the **creator**: `POST {GAMESERVER_CREATOR_URL}` with
+   `{ match_token, game_mode, player_a, player_b, result_callback_url }` →
+   `{ server_address, join_token? }`. Retried every 2s until
+   `GAMESERVER_ALLOC_TIMEOUT_S` elapses, then the match is disputed.
+3. Both players receive `game_server_ready { address, join_token? }` and play
+   on the server. The match status is now `Playing`; the p2p signal is rejected
+   for server matches.
+4. The gameserver reports the outcome by POSTing to the callback URL
+   (`/internal/game-result/{token}/{secret}`, body `{ winner: steam_id | null }`).
+   **The unguessable URL is the authentication** — possession of the secret is
+   proof. The coordinator resolves ratings exactly as for agreed player reports
+   and sends `match_result` to both players.
+5. If no result arrives within `GAMESERVER_RESULT_TIMEOUT_S` of the server being
+   ready, the match is disputed.
+
+For development, set `AUTH_DEV_MODE=true` and leave `GAMESERVER_CREATOR_URL`
+unset: the coordinator falls back to a built-in **mock creator**
+(`POST /internal/mock/allocate`) that returns `127.0.0.1:25565` and auto-reports
+player_a's win 3 seconds after allocation, so the whole flow is visible without
+any external service. In production set `GAMESERVER_CREATOR_URL` and `PUBLIC_URL`
+(the gameserver must be able to reach the callback URL).
 
 ## Just Recipes
 
@@ -248,12 +287,12 @@ Client                           Server
 
 ## Testing
 
-**Unit tests** (no Postgres needed): `just test` — 10 tests covering the match
+**Unit tests** (no Postgres needed): `just test` — 14 tests covering the match
 lifecycle (accept/connect/report/expiry, winner validation, double-accept
-idempotency, auto-loss on report timeout) and the Weng-Lin rating algorithm,
-using in-memory mock stores.
+idempotency, auto-loss on report timeout, gameserver resolution + expiry) and
+the Weng-Lin rating algorithm, using in-memory mock stores.
 
-**Integration tests** (Postgres needed): `just db-up` then `just itest` — 9
+**Integration tests** (Postgres needed): `just db-up` then `just itest` — 21
 tests that start the real server in-process (`lobby-server/src/lib.rs`'s
 `build_app`), run it against PostgreSQL, and drive it with `lobby-client`:
 
@@ -266,6 +305,15 @@ tests that start the real server in-process (`lobby-server/src/lib.rs`'s
 - `dispute_on_winner_mismatch` — players report different winners; asserts the
   match is marked `Disputed` and no outcome is persisted.
 - `queue_cancel` — a player cancels matchmaking; asserts no match ever arrives.
+- `server_game_full_lifecycle` — a server-authoritative match: creator
+  allocation, `game_server_ready` to both players, webhook result, ratings
+  update, and the callback URL carrying token + secret.
+- `server_game_alloc_timeout` — a failing creator; the match is disputed after
+  `GAMESERVER_ALLOC_TIMEOUT_S` with `game_server_error` + `match_result`.
+- `server_game_result_timeout` — a ready server that never reports; the match
+  is disputed after `GAMESERVER_RESULT_TIMEOUT_S`.
+- `game_result_callback_security` — wrong secret → 401, duplicate callback →
+  409, unknown token → 404.
 
 The tests use a shared `lobby_test` database (auto-created on first run,
 truncated before each test). It is intentionally never dropped — the next run
@@ -279,15 +327,21 @@ connection error.
 serves it at `/` — with the server running, just open `http://localhost:8080/`
 in two browser tabs. To test multiple users locally:
 
-4. Click **Start Matchmaking** in both — the queueing panel shows live wait
-   time, the expanding MMR band and opponents in it, your own μ/σ/rating, and
-   a leaderboard of every player's rating.
-5. **Accept** on both, then **P2P Connected (simulated)** — this demo has no
-   real P2P transport; the button only sends the game's `p2p_connected`
-   signal, and each tab shows the other's signal (`Opponent P2P connected ✓`).
-6. Report a result — each tab immediately shows what the other player selected
-   (`You reported: Win (you)` / `Opponent reported: …`) before the match
-   resolves.
+4. Pick a **mode** — the dropdown is populated from `GET /modes`
+   (`ranked_1v1 (p2p)` by default; `server_arena (server)` when the default
+   `GAME_MODES` is in force). Click **Start Matchmaking** in both — the
+   queueing panel shows live wait time, the expanding MMR band and opponents in
+   it, your own μ/σ/rating, and a leaderboard of every player's rating.
+5. **Accept** on both. For a p2p mode, click **P2P Connected (simulated)** —
+   this demo has no real P2P transport; the button only sends the game's
+   `p2p_connected` signal, and each tab shows the other's signal
+   (`Opponent P2P connected ✓`). For a server mode the panel shows
+   "Waiting for server allocation…", then the (simulated) server address; the
+   built-in mock creator auto-reports player_a's win ~3s later, and both tabs
+   show the resolved result.
+6. Report a result (p2p) — each tab immediately shows what the other player
+   selected (`You reported: Win (you)` / `Opponent reported: …`) before the
+   match resolves.
 
 The event log shows every JSON message sent and received — a live protocol
 reference. No Steam account or API key is involved.

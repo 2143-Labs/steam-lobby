@@ -4,12 +4,12 @@ use skillratings::Outcomes;
 use crate::error::{LobbyError, Result};
 use crate::mmr;
 use crate::traits::{GameCallbacks, MatchStore, RatingStore};
-use crate::types::{MatchOutcome, MatchReport, MatchStatus, SteamId};
+use crate::types::{MatchEvent, MatchOutcome, MatchReport, MatchStatus, SteamId};
 
 pub struct MatchManager<CB: GameCallbacks> {
     callbacks: CB,
-    match_accept_timeout_secs: u64,
-    report_timeout_secs: u64,
+    pub(crate) match_accept_timeout_secs: u64,
+    pub(crate) report_timeout_secs: u64,
 }
 
 impl<CB: GameCallbacks> MatchManager<CB> {
@@ -37,6 +37,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         if steam_id != m.player_a && steam_id != m.player_b {
             return Err(LobbyError::NotParticipant(token.to_string()));
         }
+        let first_accept = if steam_id == m.player_a { !m.accepted_a } else { !m.accepted_b };
         if match_store.mark_accepted(token, steam_id).await? {
             // Both players have now accepted — transition to InProgress.
             tracing::info!(
@@ -49,6 +50,11 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                 .update_match_status(token, MatchStatus::InProgress)
                 .await?;
             self.callbacks.on_match_accepted(&m).await?;
+        }
+        if first_accept {
+            match_store
+                .record_match_event(token, MatchEvent::Accepted, Some(steam_id))
+                .await?;
         }
         Ok(())
     }
@@ -64,6 +70,9 @@ impl<CB: GameCallbacks> MatchManager<CB> {
             .await?
             .ok_or_else(|| LobbyError::MatchNotFound(token.to_string()))?;
         if m.status != MatchStatus::InProgress {
+            return Err(LobbyError::MatchStateMismatch(token.to_string()));
+        }
+        if m.game_type == crate::types::GameType::Server {
             return Err(LobbyError::MatchStateMismatch(token.to_string()));
         }
         if steam_id != m.player_a && steam_id != m.player_b {
@@ -127,47 +136,9 @@ impl<CB: GameCallbacks> MatchManager<CB> {
             ra.demo_hash.is_some() && rb.demo_hash.is_some() && ra.demo_hash != rb.demo_hash;
 
         if agree && !hashes_differ {
-            let rating_a = rating_store.get_rating(m.player_a, &m.game_mode).await?;
-            let rating_b = rating_store.get_rating(m.player_b, &m.game_mode).await?;
-            let sk = if winner_a == Some(m.player_a) {
-                Outcomes::WIN
-            } else if winner_a == Some(m.player_b) {
-                Outcomes::LOSS
-            } else {
-                Outcomes::DRAW
-            };
-            let (new_a, new_b) = mmr::update_ratings(&rating_a, &rating_b, sk);
-            let outcome_str = if winner_a == Some(m.player_a) { "Win" } else if winner_a == Some(m.player_b) { "Loss" } else { "Draw" };
-            let mu_change_b = new_b.mu - rating_b.mu;
-            let mu_change_a = new_a.mu - rating_a.mu;
-            match_store
-                .resolve_match(
-                    token,
-                    &m.game_mode,
-                    m.player_a,
-                    m.player_b,
-                    outcome_str,
-                    Some(mu_change_a),
-                    Some(mu_change_b),
-                    &new_a,
-                    &new_b,
-                )
-                .await?;
-            let outcome = if winner_a == Some(m.player_a) {
-                MatchOutcome::Win {
-                    mu_change: mu_change_a,
-                }
-            } else if winner_a == Some(m.player_b) {
-                MatchOutcome::Loss {
-                    mu_change: mu_change_a,
-                }
-            } else {
-                MatchOutcome::Draw {
-                    mu_change: mu_change_a,
-                }
-            };
-            self.callbacks.on_match_ended(&m, &outcome).await?;
-            Ok(outcome)
+            return self
+                .resolve_agreed(&m, winner_a, match_store, rating_store)
+                .await;
         } else if agree && hashes_differ {
             match_store
                 .update_match(token, MatchStatus::Disputed, Utc::now())
@@ -185,127 +156,84 @@ impl<CB: GameCallbacks> MatchManager<CB> {
             }
         }
     }
-    pub async fn expire_pending_accepts(&self, match_store: &dyn MatchStore) -> Result<Vec<String>> {
-        let matches = match_store
-            .get_matches_by_status(MatchStatus::PendingAccept)
-            .await?;
-        let now = Utc::now();
-        let mut expired = Vec::new();
-        for m in &matches {
-            if (now - m.created_at).num_seconds().max(0) as u64 > self.match_accept_timeout_secs {
-                tracing::info!(
-                    "match {} expired: no accept within {}s ({}, {})",
-                    m.match_token,
-                    self.match_accept_timeout_secs,
-                    m.player_a,
-                    m.player_b
-                );
-                match_store
-                    .update_match_status(&m.match_token, MatchStatus::Disputed)
-                    .await?;
-                expired.push(m.match_token.clone());
-            }
-        }
-        Ok(expired)
-    }
 
-    pub async fn expire_pending_reports(
+    /// Compute ratings for an agreed outcome, write match_results + Resolved,
+    /// fire on_match_ended, return the outcome. `winner` is the victor (None =
+    /// draw). Shared by submit_report's agreement branch, the lone-report expiry
+    /// path, and the gameserver webhook — they must never drift.
+    pub(crate) async fn resolve_agreed(
         &self,
+        m: &crate::types::MatchInfo,
+        winner: Option<SteamId>,
         match_store: &dyn MatchStore,
         rating_store: &dyn RatingStore,
-    ) -> Result<Vec<(String, MatchOutcome)>> {
-        let matches = match_store
-            .get_matches_by_status(MatchStatus::Reporting)
+    ) -> Result<MatchOutcome> {
+        let rating_a = rating_store.get_rating(m.player_a, &m.game_mode).await?;
+        let rating_b = rating_store.get_rating(m.player_b, &m.game_mode).await?;
+        let sk = if winner == Some(m.player_a) {
+            Outcomes::WIN
+        } else if winner == Some(m.player_b) {
+            Outcomes::LOSS
+        } else {
+            Outcomes::DRAW
+        };
+        let (new_a, new_b) = mmr::update_ratings(&rating_a, &rating_b, sk);
+        let outcome_str = if winner == Some(m.player_a) { "Win" } else if winner == Some(m.player_b) { "Loss" } else { "Draw" };
+        let mu_change_b = new_b.mu - rating_b.mu;
+        let mu_change_a = new_a.mu - rating_a.mu;
+        match_store
+            .resolve_match(
+                &m.match_token,
+                &m.game_mode,
+                m.player_a,
+                m.player_b,
+                outcome_str,
+                Some(mu_change_a),
+                Some(mu_change_b),
+                &new_a,
+                &new_b,
+            )
             .await?;
-        let now = Utc::now();
-        let mut resolved = Vec::new();
-        for m in &matches {
-            if let Some(ended_at) = m.ended_at {
-                if (now - ended_at).num_seconds().max(0) as u64 > self.report_timeout_secs {
-                    let reports = match_store.get_reports(&m.match_token).await?;
-                    if reports.is_empty() {
-                        tracing::info!(
-                            "match {} report window expired with no reports -> Disputed",
-                            m.match_token
-                        );
-                        match_store
-                            .update_match_status(&m.match_token, MatchStatus::Disputed)
-                            .await?;
-                        resolved.push((m.match_token.clone(), MatchOutcome::Disputed));
-                    } else if reports.len() == 1 {
-                        let report = &reports[0];
-                        let winner_ok = match report.winner {
-                            None => true,
-                            Some(w) => w == m.player_a || w == m.player_b,
-                        };
-                        if !winner_ok {
-                            // A lone report claiming a non-participant winner cannot be trusted.
-                            tracing::info!(
-                                "match {} lone report claims non-participant winner -> Disputed",
-                                m.match_token
-                            );
-                            match_store
-                                .update_match_status(&m.match_token, MatchStatus::Disputed)
-                                .await?;
-                            resolved.push((m.match_token.clone(), MatchOutcome::Disputed));
-                            continue;
-                        }
-                        let rating_a = rating_store.get_rating(m.player_a, &m.game_mode).await?;
-                        let rating_b = rating_store.get_rating(m.player_b, &m.game_mode).await?;
-                        let sk = if report.winner == Some(m.player_a) {
-                            Outcomes::WIN
-                        } else if report.winner == Some(m.player_b) {
-                            Outcomes::LOSS
-                        } else {
-                            Outcomes::DRAW
-                        };
-                        let (new_a, new_b) = mmr::update_ratings(&rating_a, &rating_b, sk);
-                        let outcome_str = if report.winner == Some(m.player_a) {
-                            "Win"
-                        } else if report.winner == Some(m.player_b) {
-                            "Loss"
-                        } else {
-                            "Draw"
-                        };
-                        let mu_change_a = new_a.mu - rating_a.mu;
-                        let mu_change_b = new_b.mu - rating_b.mu;
-                        tracing::info!(
-                            "match {} report window expired, single report -> {} for {}",
-                            m.match_token,
-                            outcome_str,
-                            m.player_a
-                        );
-                        match_store
-                            .resolve_match(
-                                &m.match_token,
-                                &m.game_mode,
-                                m.player_a,
-                                m.player_b,
-                                outcome_str,
-                                Some(mu_change_a),
-                                Some(mu_change_b),
-                                &new_a,
-                                &new_b,
-                            )
-                            .await?;
-                        let outcome = if report.winner == Some(m.player_a) {
-                            MatchOutcome::Win {
-                                mu_change: mu_change_a,
-                            }
-                        } else if report.winner == Some(m.player_b) {
-                            MatchOutcome::Loss {
-                                mu_change: mu_change_a,
-                            }
-                        } else {
-                            MatchOutcome::Draw {
-                                mu_change: mu_change_a,
-                            }
-                        };
-                        resolved.push((m.match_token.clone(), outcome));
-                    }
-                }
+        let outcome = if winner == Some(m.player_a) {
+            MatchOutcome::Win {
+                mu_change: mu_change_a,
+            }
+        } else if winner == Some(m.player_b) {
+            MatchOutcome::Loss {
+                mu_change: mu_change_a,
+            }
+        } else {
+            MatchOutcome::Draw {
+                mu_change: mu_change_a,
+            }
+        };
+        self.callbacks.on_match_ended(m, &outcome).await?;
+        Ok(outcome)
+    }
+
+    /// Resolve a server-authoritative match from the gameserver's webhook result.
+    /// `winner` is the victor's Steam ID (or None for a draw). Validates the
+    /// match is Playing and the winner is a participant, then resolves.
+    pub async fn resolve_from_gameserver(
+        &self,
+        token: &str,
+        winner: Option<SteamId>,
+        match_store: &dyn MatchStore,
+        rating_store: &dyn RatingStore,
+    ) -> Result<MatchOutcome> {
+        let m = match_store
+            .get_match(token)
+            .await?
+            .ok_or_else(|| LobbyError::MatchNotFound(token.to_string()))?;
+        if m.status != MatchStatus::Playing {
+            return Err(LobbyError::MatchStateMismatch(token.to_string()));
+        }
+        if let Some(w) = winner {
+            if w != m.player_a && w != m.player_b {
+                return Err(LobbyError::InvalidReport(token.to_string()));
             }
         }
-        Ok(resolved)
+        self.resolve_agreed(&m, winner, match_store, rating_store).await
     }
+
 }

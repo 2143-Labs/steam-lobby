@@ -85,9 +85,24 @@ pub enum PlayerState {
 pub enum MatchStatus {
     PendingAccept,
     InProgress,
+    Playing,
     Reporting,
     Disputed,
     Resolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GameType {
+    P2p,
+    Server,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchEvent {
+    Paired,
+    Accepted,
+    Declined,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,11 +149,16 @@ pub struct MatchInfo {
     pub player_b: SteamId,
     pub player_b_difficulty: MatchDifficulty,
     pub game_mode: String,
+    pub game_type: GameType,
     pub status: MatchStatus,
     pub created_at: DateTime<Utc>,
     pub accepted_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
+    pub server_address: Option<String>, // set by mark_server_ready
+    pub join_token: Option<String>,     // set by mark_server_ready, relayed in game_server_ready
+    #[serde(skip_serializing)]          // never leaves the server (URL secret)
+    pub result_secret: Option<String>,  // generated at match creation for Server games
     pub accepted_a: bool,
     pub accepted_b: bool,
     pub connected_a: bool,
@@ -169,4 +189,144 @@ pub struct QueueEntry {
     pub difficulty: MatchDifficulty,
     pub mu: f64,
     pub queued_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use serde_json::json;
+
+    /// The Steam ID helpers are the JS-precision boundary: browser clients
+    /// cannot hold 17-digit IDs exactly, so serialization must emit strings
+    /// and deserialization must accept both numbers and strings.
+    #[derive(Serialize, Deserialize)]
+    struct SteamIdProbe {
+        #[serde(
+            serialize_with = "serialize_steam_id",
+            deserialize_with = "deserialize_steam_id"
+        )]
+        id: SteamId,
+    }
+
+    #[derive(Deserialize)]
+    struct OptionalSteamIdProbe {
+        #[serde(default, deserialize_with = "deserialize_optional_steam_id")]
+        winner: Option<SteamId>,
+    }
+
+    #[test]
+    fn steam_id_serializes_as_string() {
+        let v = serde_json::to_value(SteamIdProbe { id: 76_561_198_000_000_000 }).unwrap();
+        assert_eq!(v, json!({ "id": "76561198000000000" }));
+    }
+
+    #[test]
+    fn steam_id_deserializes_from_number_or_string() {
+        let from_num: SteamIdProbe =
+            serde_json::from_value(json!({ "id": 76561198000000000_i64 })).unwrap();
+        let from_str: SteamIdProbe =
+            serde_json::from_value(json!({ "id": "76561198000000000" })).unwrap();
+        assert_eq!(from_num.id, from_str.id);
+        assert_eq!(from_num.id, 76_561_198_000_000_000);
+    }
+
+    #[test]
+    fn steam_id_round_trips_u64_max() {
+        // Guards against a future naive u64->f64 conversion losing precision.
+        let original = SteamIdProbe { id: u64::MAX };
+        let v = serde_json::to_value(&original).unwrap();
+        let back: SteamIdProbe = serde_json::from_value(v).unwrap();
+        assert_eq!(original.id, back.id);
+    }
+
+    #[test]
+    fn optional_steam_id_accepts_null_and_string() {
+        let none: OptionalSteamIdProbe = serde_json::from_value(json!({ "winner": null })).unwrap();
+        let some: OptionalSteamIdProbe =
+            serde_json::from_value(json!({ "winner": "402" })).unwrap();
+        assert_eq!(none.winner, None);
+        assert_eq!(some.winner, Some(402));
+    }
+
+    #[test]
+    fn snake_case_enums_serialize_lowercase() {
+        assert_eq!(serde_json::to_string(&PlayerState::InMenus).unwrap(), "\"in_menus\"");
+        assert_eq!(
+            serde_json::to_string(&PlayerState::MatchAccepted).unwrap(),
+            "\"match_accepted\""
+        );
+        assert_eq!(serde_json::to_string(&GameType::P2p).unwrap(), "\"p2p\"");
+        assert_eq!(serde_json::to_string(&GameType::Server).unwrap(), "\"server\"");
+        assert_eq!(serde_json::to_string(&MatchEvent::Paired).unwrap(), "\"paired\"");
+        assert_eq!(serde_json::to_string(&MatchEvent::Declined).unwrap(), "\"declined\"");
+        assert_eq!(serde_json::to_string(&MatchDifficulty::Hard).unwrap(), "\"hard\"");
+    }
+
+    #[test]
+    fn match_status_uses_exact_variant_names() {
+        // No rename_all on MatchStatus: the strings are the DB contract.
+        assert_eq!(
+            serde_json::to_string(&MatchStatus::PendingAccept).unwrap(),
+            "\"PendingAccept\""
+        );
+        assert_eq!(serde_json::to_string(&MatchStatus::InProgress).unwrap(), "\"InProgress\"");
+        assert_eq!(serde_json::to_string(&MatchStatus::Disputed).unwrap(), "\"Disputed\"");
+        assert_eq!(serde_json::from_str::<MatchStatus>("\"PendingAccept\"").unwrap(), MatchStatus::PendingAccept);
+    }
+
+    #[test]
+    fn leaderboard_entry_round_trips() {
+        let entry = LeaderboardEntry {
+            steam_id: 76_561_198_000_000_000,
+            mu: 27.0,
+            sigma: 8.3,
+            rating: 2.1,
+        };
+        let v = serde_json::to_value(&entry).unwrap();
+        assert_eq!(v["steam_id"], json!("76561198000000000"), "leaderboard IDs are strings");
+        let back: LeaderboardEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back.steam_id, entry.steam_id);
+    }
+
+    #[test]
+    fn match_info_round_trips_and_hides_result_secret() {
+        let m = MatchInfo {
+            match_token: "token-1".to_string(),
+            player_a: 400,
+            player_a_difficulty: MatchDifficulty::Normal,
+            player_b: 401,
+            player_b_difficulty: MatchDifficulty::Easy,
+            game_mode: "ranked_1v1".to_string(),
+            game_type: GameType::Server,
+            status: MatchStatus::PendingAccept,
+            created_at: Utc::now(),
+            accepted_at: None,
+            started_at: None,
+            ended_at: None,
+            server_address: None,
+            join_token: Some("join-abc".to_string()),
+            result_secret: Some("secret-xyz".to_string()),
+            accepted_a: true,
+            accepted_b: false,
+            connected_a: false,
+            connected_b: false,
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        assert!(
+            v.get("result_secret").is_none(),
+            "result_secret must never leave the server"
+        );
+        let back: MatchInfo = serde_json::from_value(v).unwrap();
+        // MatchInfo intentionally lacks PartialEq; compare the fields that the
+        // round-trip must preserve exactly.
+        assert_eq!(back.match_token, m.match_token);
+        assert_eq!(back.player_a, m.player_a);
+        assert_eq!(back.player_b, m.player_b);
+        assert_eq!(back.game_type, m.game_type);
+        assert_eq!(back.status, m.status);
+        assert_eq!(back.join_token, m.join_token);
+        assert_eq!(back.accepted_a, m.accepted_a);
+        assert_eq!(back.connected_b, m.connected_b);
+    }
 }

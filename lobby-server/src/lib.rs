@@ -8,6 +8,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 mod db;
+mod gameserver;
 mod rate_limit;
 mod routes;
 mod state;
@@ -21,6 +22,7 @@ use state::DefaultCallbacks;
 use steam_auth::SteamAuthService;
 
 use lobby_core::traits::QueueStore;
+use lobby_core::types::GameType;
 pub use state::AppState; // re-exported so integration tests can name the type
 
 pub struct AppConfig {
@@ -37,6 +39,10 @@ pub struct AppConfig {
     pub auth_dev_mode: bool,        // AUTH_DEV_MODE; true = /auth/test-token enabled
     pub jwt_ttl_secs: u64,
     pub cors_origins: Vec<String>,
+    pub game_modes: Vec<(String, GameType)>,
+    pub gameserver_creator_url: Option<String>,
+    pub gameserver_alloc_timeout_secs: u64,
+    pub gameserver_result_timeout_secs: u64,
 }
 
 /// Build the full axum Router + shared state.
@@ -73,6 +79,31 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
 
     let store = PostgresStore::new(pool);
 
+    // Server-authoritative modes need a gameserver creator. With AUTH_DEV_MODE
+    // and no explicit URL, fall back to the built-in dev mock creator.
+    let (creator_url, mock_enabled) = match &config.gameserver_creator_url {
+        Some(u) => (Some(u.clone()), false),
+        None if config.auth_dev_mode
+            && config.game_modes.iter().any(|(_, t)| *t == GameType::Server) =>
+        {
+            (
+                Some(format!("http://127.0.0.1:{}/internal/mock/allocate", config.port)),
+                true,
+            )
+        }
+        None => (None, false),
+    };
+    if config.game_modes.iter().any(|(_, t)| *t == GameType::Server) && creator_url.is_none() {
+        tracing::warn!("server-authoritative modes configured but GAMESERVER_CREATOR_URL is unset — their matches will all end Disputed");
+    }
+    let callback_base = config
+        .public_url
+        .clone()
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", config.port));
+    if config.game_modes.iter().any(|(_, t)| *t == GameType::Server) && config.public_url.is_none() {
+        tracing::warn!("PUBLIC_URL unset — result callbacks will use {callback_base}; set PUBLIC_URL in production");
+    }
+
     // The queue lives in Postgres and survives restarts; entries from a dead
     // session (no heartbeats) must not phantom-match on boot.
     if let Err(e) = store
@@ -99,6 +130,13 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         match_manager,
         steam_auth,
         store,
+        game_modes: config.game_modes.clone(),
+        gameserver: crate::gameserver::GameserverClient {
+            creator_url,
+            callback_base,
+        },
+        gameserver_alloc_timeout_secs: config.gameserver_alloc_timeout_secs,
+        gameserver_result_timeout_secs: config.gameserver_result_timeout_secs,
         connections: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         public_url: config.public_url.clone(),
         auth_dev_mode: config.auth_dev_mode,
@@ -115,6 +153,11 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
     let mut router = Router::new()
         .route("/", get(routes::index))
         .route("/health", get(routes::health))
+        .route("/modes", get(routes::modes))
+        .route(
+            "/internal/game-result/{token}/{secret}",
+            axum::routing::post(routes::game_result),
+        )
         .route("/auth/steam/login", get(routes::steam_login))
         .route("/auth/steam/callback", get(routes::steam_callback))
         .route("/auth/ticket", axum::routing::post(routes::ticket_auth))
@@ -151,6 +194,10 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
 
     if config.auth_dev_mode {
         router = router.route("/auth/test-token", axum::routing::post(routes::test_token));
+    }
+
+    if mock_enabled {
+        router = router.route("/internal/mock/allocate", axum::routing::post(routes::mock_allocate));
     }
 
     let mut allowed: Vec<String> = config.cors_origins.clone();

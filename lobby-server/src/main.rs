@@ -49,6 +49,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .collect()
             })
             .unwrap_or_default(),
+        game_modes: parse_game_modes(
+            &std::env::var("GAME_MODES")
+                .unwrap_or_else(|_| "ranked_1v1:p2p,server_arena:server".into()),
+        ),
+        gameserver_creator_url: std::env::var("GAMESERVER_CREATOR_URL")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        gameserver_alloc_timeout_secs: std::env::var("GAMESERVER_ALLOC_TIMEOUT_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60),
+        gameserver_result_timeout_secs: std::env::var("GAMESERVER_RESULT_TIMEOUT_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300),
     };
 
     let (app, _state) = build_app(config).await;
@@ -61,6 +76,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
     Ok(())
+}
+
+/// Parse `GAME_MODES` (`mode:type,mode:type`) into (mode, GameType) pairs.
+/// Unknown type tokens are logged and skipped — a bad mode must not kill the server.
+fn parse_game_modes(s: &str) -> Vec<(String, lobby_core::types::GameType)> {
+    s.split(',')
+        .filter_map(|pair| {
+            let mut it = pair.split(':');
+            let name = it.next()?.trim();
+            let ty = it.next()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let game_type = match ty {
+                "p2p" => lobby_core::types::GameType::P2p,
+                "server" => lobby_core::types::GameType::Server,
+                other => {
+                    eprintln!("GAME_MODES: unknown game type '{other}' for mode '{name}' — skipping");
+                    return None;
+                }
+            };
+            Some((name.to_string(), game_type))
+        })
+        .collect()
 }
 
 /// Wait for SIGINT (ctrl-c) or SIGTERM, then let axum drain in-flight connections.

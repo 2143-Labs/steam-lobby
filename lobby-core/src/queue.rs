@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::traits::{GameCallbacks, MatchStore, PlayerStore, QueueStore, RatingStore};
-use crate::types::{MatchInfo, MatchStatus, SteamId};
+use crate::types::{GameType, MatchEvent, MatchInfo, MatchStatus, SteamId};
 
 /// Expanding search band: 50 at t=0, +25 every 10s of wait, capped at 400.
 /// Returns `(lo, hi)` in MMR terms, both shifted by the difficulty offset.
@@ -38,6 +38,7 @@ impl<CB: GameCallbacks> MatchmakingQueue<CB> {
     pub async fn tick(
         &self,
         mode: &str,
+        game_type: GameType,
         queue_store: &dyn QueueStore,
         match_store: &dyn MatchStore,
         player_store: &dyn PlayerStore,
@@ -121,11 +122,15 @@ impl<CB: GameCallbacks> MatchmakingQueue<CB> {
                     player_b: player_b.steam_id,
                     player_b_difficulty: player_b.difficulty,
                     game_mode: mode.to_string(),
+                    game_type,
                     status: MatchStatus::PendingAccept,
                     created_at: now,
                     accepted_at: None,
                     started_at: None,
                     ended_at: None,
+                    server_address: None,
+                    join_token: None,
+                    result_secret: (game_type == GameType::Server).then(|| Uuid::new_v4().to_string()),
                     accepted_a: false,
                     accepted_b: false,
                     connected_a: false,
@@ -141,6 +146,7 @@ impl<CB: GameCallbacks> MatchmakingQueue<CB> {
                 }
 
                 match_store.create_match(&match_info).await?;
+                match_store.record_match_event(&match_info.match_token, MatchEvent::Paired, None).await?;
                 return Ok(Some(match_info));
             }
         }
@@ -154,5 +160,45 @@ impl<CB: GameCallbacks> MatchmakingQueue<CB> {
         queue_store
             .remove_stale_queue_entries(chrono::Duration::seconds(30))
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::search_band;
+
+    #[test]
+    fn band_starts_50_wide() {
+        assert_eq!(search_band(0.0, 1000.0, 0.0), (950.0, 1050.0));
+    }
+
+    #[test]
+    fn band_widens_in_ten_second_steps() {
+        // Sub-step waits keep the base 50-wide band.
+        assert_eq!(search_band(9.9, 1000.0, 0.0), (950.0, 1050.0));
+        // Each full 10s of waiting widens the band by 25 per side.
+        assert_eq!(search_band(10.0, 1000.0, 0.0), (925.0, 1075.0));
+        assert_eq!(search_band(30.0, 1000.0, 0.0), (875.0, 1125.0));
+    }
+
+    #[test]
+    fn band_caps_at_400() {
+        assert_eq!(search_band(200.0, 1000.0, 0.0), (600.0, 1400.0));
+        // Far longer waits never widen past the cap.
+        assert_eq!(search_band(10_000.0, 1000.0, 0.0), (600.0, 1400.0));
+    }
+
+    #[test]
+    fn difficulty_offset_shifts_the_whole_band() {
+        // Easy (-150) targets weaker opponents; Hard (+150) targets stronger.
+        assert_eq!(search_band(0.0, 1000.0, -150.0), (800.0, 900.0));
+        assert_eq!(search_band(0.0, 1000.0, 150.0), (1100.0, 1200.0));
+    }
+
+    #[test]
+    fn low_mmr_easy_offset_can_go_negative() {
+        // The lower bound may dip below zero for a new player on Easy; that is
+        // fine because pairing compares `opponent.mu >= lo` (everyone passes).
+        assert_eq!(search_band(0.0, 25.0, -150.0), (-175.0, -75.0));
     }
 }

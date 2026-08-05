@@ -1,11 +1,14 @@
+use std::sync::Arc;
 use std::time::Duration;
 
-use lobby_client::LobbyClient;
+use axum::{http::StatusCode, routing::post, Json, Router};
+use lobby_client::{LobbyClient, ServerEvent};
 use sqlx::PgPool;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 mod common; // lobby-server/tests/common.rs — TestHarness + setup()
-use common::setup;
+use common::{setup, setup_with_creator};
 
 /// Poll `query` (a fresh sqlx query for `token`) until it returns a row or 5s elapses.
 /// The server processes WS reports asynchronously, so a straight fetch could race.
@@ -53,14 +56,14 @@ async fn wait_for_status(pool: &PgPool, token: &str, expected: &str) -> bool {
 }
 
 /// Connect two clients, auth with distinct test tokens, queue, and get a shared match.
-async fn pair_up(h: &common::TestHarness, p1_id: u64, p2_id: u64) -> (LobbyClient, LobbyClient, String) {
+async fn pair_up(h: &common::TestHarness, p1_id: u64, p2_id: u64, mode: &str) -> (LobbyClient, LobbyClient, String) {
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
     let mut p2 = LobbyClient::connect(&h.ws_url).await.unwrap();
     p1.authenticate_test_token(p1_id, &h.base_url).await.unwrap();
     p2.authenticate_test_token(p2_id, &h.base_url).await.unwrap();
 
-    p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
-    p2.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+    p1.begin_matchmaking(mode, "normal").await.unwrap();
+    p2.begin_matchmaking(mode, "normal").await.unwrap();
 
     // Ticker runs every 2s; wait up to 15s.
     let m1 = timeout(Duration::from_secs(15), p1.wait_for_match())
@@ -102,7 +105,7 @@ async fn accept_and_connect(
 #[tokio::test]
 async fn full_match_lifecycle() {
     let h = setup().await;
-    let (mut p1, mut p2, token) = pair_up(&h, 100, 200).await;
+    let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
     let a1 = 100u64;
 
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
@@ -144,7 +147,7 @@ async fn full_match_lifecycle() {
 async fn dispute_on_winner_mismatch() {
     let h = setup().await;
 
-    let (mut p1, mut p2, token) = pair_up(&h, 100, 200).await;
+    let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
 
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
@@ -246,7 +249,7 @@ async fn queue_stats_received() {
 async fn p2p_and_report_visibility() {
     let h = setup().await;
 
-    let (mut p1, mut p2, token) = pair_up(&h, 100, 200).await;
+    let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
     // accept_and_connect sends both p2p_connected signals; p1 must learn that
@@ -320,7 +323,7 @@ async fn p2p_and_report_visibility() {
 async fn decline_notifies_opponent() {
     let h = setup().await;
 
-    let (mut p1, mut p2, token) = pair_up(&h, 100, 200).await;
+    let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
 
     p1.decline_match(&token).await.unwrap();
 
@@ -364,6 +367,59 @@ async fn decline_notifies_opponent() {
 }
 
 #[tokio::test]
+async fn match_events_logged() {
+    let h = setup().await;
+
+    // Scenario 1: pairing + both accepts are logged.
+    let (mut p1, mut p2, token) = pair_up(&h, 400, 401, "ranked_1v1").await;
+    p1.accept_match(&token).await.unwrap();
+    p2.accept_match(&token).await.unwrap();
+    assert!(
+        wait_for_status(&h.pool, &token, "InProgress").await,
+        "accepts must land"
+    );
+    let counts: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT event_type, COUNT(*) FROM match_events WHERE match_token = $1 GROUP BY event_type",
+    )
+    .bind(&token)
+    .fetch_all(&h.pool)
+    .await
+    .unwrap();
+    let map: std::collections::HashMap<String, i64> = counts.into_iter().collect();
+    assert_eq!(map.get("paired"), Some(&1), "exactly one pairing event");
+    assert_eq!(map.get("accepted"), Some(&2), "one accept event per player");
+    drop(p1);
+    drop(p2);
+
+    // Scenario 2: decline is logged and the match is immediately terminal.
+    let (mut q1, _q2, token2) = pair_up(&h, 402, 403, "ranked_1v1").await;
+    q1.decline_match(&token2).await.unwrap();
+    assert!(
+        wait_for_status(&h.pool, &token2, "Disputed").await,
+        "declined match must be Disputed immediately (no 30s linger)"
+    );
+    let declined: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT event_type, COUNT(*) FROM match_events WHERE match_token = $1 GROUP BY event_type",
+    )
+    .bind(&token2)
+    .fetch_all(&h.pool)
+    .await
+    .unwrap();
+    let map2: std::collections::HashMap<String, i64> = declined.into_iter().collect();
+    assert_eq!(map2.get("paired"), Some(&1));
+    assert_eq!(map2.get("declined"), Some(&1), "decline event must be logged");
+    let actor: i64 = sqlx::query_scalar(
+        "SELECT steam_id FROM match_events WHERE match_token = $1 AND event_type = 'declined'",
+    )
+    .bind(&token2)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(actor, 402, "decline event records the declining player");
+    drop(q1);
+}
+
+#[tokio::test]
 async fn auth_ok_reports_state() {
     use lobby_core::types::PlayerState;
 
@@ -392,7 +448,7 @@ async fn auth_ok_reports_state() {
 async fn match_expired_notifies_players() {
     let h = setup().await;
 
-    let (mut p1, mut p2, token) = pair_up(&h, 100, 200).await;
+    let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
 
     // Pretend the accept window already lapsed (30s); the next tick expires it.
     sqlx::query("UPDATE matches SET created_at = NOW() - INTERVAL '40 seconds' WHERE match_token = $1")
@@ -429,7 +485,7 @@ async fn match_expired_notifies_players() {
 async fn report_timeout_resolves_and_notifies() {
     let h = setup().await;
 
-    let (mut p1, mut p2, token) = pair_up(&h, 100, 200).await;
+    let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
     // One report in, then the report window (300s) lapses -> auto-resolution.
@@ -818,4 +874,331 @@ async fn ws_origin_restriction() {
         .unwrap()
         .status();
     assert_eq!(status, reqwest::StatusCode::SWITCHING_PROTOCOLS);
+}
+
+// ── Server-authoritative game helpers ──────────────────────────────────────
+
+/// Spawn a mock gameserver creator (axum app on a random port) and return
+/// (allocate_url, recorded_request_bodies, callback_base_slot). `/allocate`
+/// records each request body and replies `{ server_address, join_token }`.
+/// When `report` is true it also auto-posts the result (player_a's win) to the
+/// callback URL 300ms after allocation, exercising the full webhook path.
+///
+/// The callback URL from the coordinator points at the configured `PUBLIC_URL`
+/// (an unreachable fake in tests), so the test fills `callback_base_slot` with
+/// the harness's real `base_url` and the mock re-targets the callback there.
+async fn spawn_mock_creator(
+    report: bool,
+) -> (String, Arc<Mutex<Vec<serde_json::Value>>>, Arc<Mutex<Option<String>>>) {
+    let recorded: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let callback_base: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let recorded_route = recorded.clone();
+    let base_route = callback_base.clone();
+    let app = Router::new().route(
+        "/allocate",
+        post(move |Json(body): Json<serde_json::Value>| {
+            let rec = recorded_route.clone();
+            let base = base_route.clone();
+            async move {
+                rec.lock().await.push(body.clone());
+                if report {
+                    let cb = body["result_callback_url"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let winner = body["player_a"]
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        if let Some(b) = base.lock().await.clone() {
+                            if let Ok(u) = url::Url::parse(&cb) {
+                                let target = format!("{}{}", b.trim_end_matches('/'), u.path());
+                                let client = reqwest::Client::new();
+                                let _ = client
+                                    .post(&target)
+                                    .json(&serde_json::json!({ "winner": winner }))
+                                    .send()
+                                    .await;
+                            }
+                        }
+                    });
+                }
+                Json(serde_json::json!({ "server_address": "mock-gs:27015", "join_token": "tok" }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    (format!("http://{addr}/allocate"), recorded, callback_base)
+}
+
+/// Spawn a mock creator that always returns 500 (allocation can never succeed).
+async fn spawn_failing_mock_creator() -> String {
+    let app = Router::new().route(
+        "/allocate",
+        post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    format!("http://{addr}/allocate")
+}
+
+/// Consume events until `pred` matches, skipping everything else (mirror the
+/// `queue_expired_notifies_player` loop). Panics with the events seen if
+/// nothing matches by deadline.
+async fn wait_for_event<E>(
+    label: &str,
+    p: &mut LobbyClient,
+    deadline: std::time::Instant,
+    mut pred: impl FnMut(ServerEvent) -> Option<E>,
+) -> E {
+    let mut seen: Vec<String> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(2), p.next_event()).await {
+            Ok(Some(Ok(ev))) => {
+                seen.push(format!("{ev:?}"));
+                if let Some(out) = pred(ev) {
+                    return out;
+                }
+            }
+            Ok(Some(Err(e))) => panic!("client error: {e}"),
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    panic!("{label}: event not received within deadline; saw: {seen:?}");
+}
+
+#[tokio::test]
+async fn server_game_full_lifecycle() {
+    let (mock_url, recorded, base_slot) = spawn_mock_creator(true).await;
+    let h = setup_with_creator(Some(&mock_url)).await;
+    *base_slot.lock().await = Some(h.base_url.clone());
+    let (mut p1, mut p2, token) = pair_up(&h, 300, 301, "server_arena").await;
+
+    // Accept only — server matches reject p2p_connected (mark_connected guard).
+    p1.accept_match(&token).await.unwrap();
+    p2.accept_match(&token).await.unwrap();
+    assert!(wait_for_status(&h.pool, &token, "InProgress").await,
+        "both accepts must transition the match to InProgress");
+
+    // The ticker allocates ~2s after the match is InProgress.
+    let _ = wait_for_event("gs-ready p1", &mut p1, std::time::Instant::now() + Duration::from_secs(15), |ev| match ev {
+        ServerEvent::GameServerReady { address, .. } if address == "mock-gs:27015" => Some(()),
+        _ => None,
+    }).await;
+    let _ = wait_for_event("gs-ready p2", &mut p2, std::time::Instant::now() + Duration::from_secs(15), |ev| match ev {
+        ServerEvent::GameServerReady { address, .. } if address == "mock-gs:27015" => Some(()),
+        _ => None,
+    }).await;
+
+    // The creator received the match and a callback URL carrying token + secret.
+    let alloc_body = recorded
+        .lock()
+        .await
+        .iter()
+        .find(|b| b["match_token"].as_str() == Some(token.as_str()))
+        .expect("allocate request recorded for the match")
+        .clone();
+    assert_eq!(alloc_body["game_mode"].as_str(), Some("server_arena"));
+    let cb = alloc_body["result_callback_url"].as_str().unwrap_or_default();
+    assert!(
+        cb.contains(&format!("/internal/game-result/{token}/")),
+        "callback URL must carry token + secret, got {cb}"
+    );
+    assert!(!cb.ends_with('/'), "callback URL must have a non-empty secret, got {cb}");
+
+    // The mock auto-reports player_a's win; both players get the same outcome.
+    let outcome1 = wait_for_event("match-result p1", &mut p1, std::time::Instant::now() + Duration::from_secs(15), |ev| match ev {
+        ServerEvent::MatchResult { outcome, .. } => Some(outcome),
+        _ => None,
+    }).await;
+    let outcome2 = wait_for_event("match-result p2", &mut p2, std::time::Instant::now() + Duration::from_secs(15), |ev| match ev {
+        ServerEvent::MatchResult { outcome, .. } => Some(outcome),
+        _ => None,
+    }).await;
+    assert!(
+        outcome1.get("Win").is_some() && outcome2.get("Win").is_some(),
+        "both players must receive Win (player_a's perspective), got {outcome1} / {outcome2}"
+    );
+
+    assert!(wait_for_status(&h.pool, &token, "Resolved").await, "match must end Resolved");
+    let row = wait_for_row(&h.pool, &token,
+        "SELECT outcome, mu_change_a FROM match_results WHERE match_token = $1")
+        .await
+        .expect("match_results row exists");
+    assert_eq!(row.0, "Win", "stored outcome must be Win");
+    assert!(row.1 > 0.0, "winner's mu change must be positive, got {}", row.1);
+    let server_address: Option<String> = sqlx::query_scalar(
+        "SELECT server_address FROM matches WHERE match_token = $1",
+    )
+    .bind(&token)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(server_address.as_deref(), Some("mock-gs:27015"));
+
+    drop(p1);
+    drop(p2);
+}
+
+#[tokio::test]
+async fn server_game_alloc_timeout() {
+    let mock_url = spawn_failing_mock_creator().await;
+    let h = setup_with_creator(Some(&mock_url)).await;
+    let (mut p1, mut p2, token) = pair_up(&h, 300, 301, "server_arena").await;
+
+    p1.accept_match(&token).await.unwrap();
+    p2.accept_match(&token).await.unwrap();
+    assert!(wait_for_status(&h.pool, &token, "InProgress").await, "accepts must land");
+
+    // Backdate past the 60s allocation timeout; the next tick disputes it.
+    sqlx::query(
+        "UPDATE matches SET accepted_at = NOW() - INTERVAL '90 seconds' WHERE match_token = $1",
+    )
+    .bind(&token)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let err1 = wait_for_event("gs-error p1", &mut p1, deadline, |ev| match ev {
+        ServerEvent::GameServerError { message, .. } => Some(message),
+        _ => None,
+    }).await;
+    assert!(err1.contains("timed out"), "unexpected error message: {err1}");
+    let _ = wait_for_event("gs-error p2", &mut p2, deadline, |ev| match ev {
+        ServerEvent::GameServerError { .. } => Some(()),
+        _ => None,
+    }).await;
+    let _ = wait_for_event("disputed-result p1", &mut p1, deadline, |ev| match ev {
+        ServerEvent::MatchResult { outcome, .. } if outcome.as_str() == Some("Disputed") => Some(()),
+        _ => None,
+    }).await;
+    let _ = wait_for_event("disputed-result p2", &mut p2, deadline, |ev| match ev {
+        ServerEvent::MatchResult { outcome, .. } if outcome.as_str() == Some("Disputed") => Some(()),
+        _ => None,
+    }).await;
+    assert!(wait_for_status(&h.pool, &token, "Disputed").await, "match must be Disputed");
+
+    drop(p1);
+    drop(p2);
+}
+
+#[tokio::test]
+async fn server_game_result_timeout() {
+    let (mock_url, _recorded, _base_slot) = spawn_mock_creator(false).await;
+    let h = setup_with_creator(Some(&mock_url)).await;
+    let (mut p1, mut p2, token) = pair_up(&h, 300, 301, "server_arena").await;
+
+    p1.accept_match(&token).await.unwrap();
+    p2.accept_match(&token).await.unwrap();
+    assert!(wait_for_status(&h.pool, &token, "InProgress").await, "accepts must land");
+
+    // Allocation succeeds; wait for server-ready so started_at is set.
+    let _ = wait_for_event("gs-ready p1", &mut p1, std::time::Instant::now() + Duration::from_secs(15), |ev| match ev {
+        ServerEvent::GameServerReady { .. } => Some(()),
+        _ => None,
+    }).await;
+    let _ = wait_for_event("gs-ready p2", &mut p2, std::time::Instant::now() + Duration::from_secs(15), |ev| match ev {
+        ServerEvent::GameServerReady { .. } => Some(()),
+        _ => None,
+    }).await;
+
+    // Backdate past the 300s result timeout; the next tick disputes it.
+    sqlx::query(
+        "UPDATE matches SET started_at = NOW() - INTERVAL '320 seconds' WHERE match_token = $1",
+    )
+    .bind(&token)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let _ = wait_for_event("disputed-result p1", &mut p1, deadline, |ev| match ev {
+        ServerEvent::MatchResult { outcome, .. } if outcome.as_str() == Some("Disputed") => Some(()),
+        _ => None,
+    }).await;
+    let _ = wait_for_event("disputed-result p2", &mut p2, deadline, |ev| match ev {
+        ServerEvent::MatchResult { outcome, .. } if outcome.as_str() == Some("Disputed") => Some(()),
+        _ => None,
+    }).await;
+    assert!(wait_for_status(&h.pool, &token, "Disputed").await, "match must be Disputed");
+
+    drop(p1);
+    drop(p2);
+}
+
+#[tokio::test]
+async fn game_result_callback_security() {
+    let (mock_url, _recorded, base_slot) = spawn_mock_creator(true).await;
+    let h = setup_with_creator(Some(&mock_url)).await;
+    *base_slot.lock().await = Some(h.base_url.clone());
+    let (mut p1, mut p2, token) = pair_up(&h, 300, 301, "server_arena").await;
+
+    p1.accept_match(&token).await.unwrap();
+    p2.accept_match(&token).await.unwrap();
+    assert!(wait_for_status(&h.pool, &token, "InProgress").await, "accepts must land");
+    let _ = wait_for_event("match-result p1", &mut p1, std::time::Instant::now() + Duration::from_secs(15), |ev| match ev {
+        ServerEvent::MatchResult { .. } => Some(()),
+        _ => None,
+    }).await;
+    assert!(wait_for_status(&h.pool, &token, "Resolved").await, "happy path must resolve");
+
+    let client = reqwest::Client::new();
+
+    // Wrong secret -> 401.
+    let resp = client
+        .post(format!("{}/internal/game-result/{token}/wrong-secret", h.base_url))
+        .json(&serde_json::json!({ "winner": "300" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // Correct secret but already resolved -> 409.
+    let secret: String = sqlx::query_scalar(
+        "SELECT result_secret FROM matches WHERE match_token = $1",
+    )
+    .bind(&token)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let resp = client
+        .post(format!("{}/internal/game-result/{token}/{secret}", h.base_url))
+        .json(&serde_json::json!({ "winner": "300" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+
+    // Unknown token -> 404.
+    let resp = client
+        .post(format!("{}/internal/game-result/nonexistent-token/some-secret", h.base_url))
+        .json(&serde_json::json!({ "winner": "300" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    drop(p1);
+    drop(p2);
 }

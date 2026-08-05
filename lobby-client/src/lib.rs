@@ -95,7 +95,20 @@ pub enum ServerEvent {
         state: lobby_core::types::PlayerState,
     },
     #[serde(rename = "match_found")]
-    MatchFound { match_token: String, opponent: OpponentInfo, timeout_ms: u64 },
+    MatchFound {
+        match_token: String,
+        opponent: OpponentInfo,
+        timeout_ms: u64,
+        game_type: lobby_core::types::GameType,
+    },
+    #[serde(rename = "game_server_ready")]
+    GameServerReady {
+        match_token: String,
+        address: String,
+        join_token: Option<String>,
+    },
+    #[serde(rename = "game_server_error")]
+    GameServerError { match_token: String, message: String },
     QueueStatus {
         elapsed_ms: u64,
         band_lo: f64,
@@ -147,6 +160,7 @@ pub struct MatchFound {
     pub match_token: String,
     pub opponent: OpponentInfo,
     pub timeout_ms: u64,
+    pub game_type: lobby_core::types::GameType,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -355,8 +369,8 @@ impl LobbyClient {
     pub async fn wait_for_match(&mut self) -> Result<Option<MatchFound>, ClientError> {
         loop {
             match self.rx.recv().await {
-                Some(Ok(ServerEvent::MatchFound { match_token, opponent, timeout_ms })) => {
-                    return Ok(Some(MatchFound { match_token, opponent, timeout_ms }));
+                Some(Ok(ServerEvent::MatchFound { match_token, opponent, timeout_ms, game_type })) => {
+                    return Ok(Some(MatchFound { match_token, opponent, timeout_ms, game_type }));
                 }
                 Some(Ok(ServerEvent::Error { message })) => {
                     return Err(ClientError::Server(message));

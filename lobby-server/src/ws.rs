@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use lobby_core::traits::{MatchStore, PlayerStore, QueueStore};
-use lobby_core::types::{MatchDifficulty, MatchReport, SteamId};
+use lobby_core::types::{MatchDifficulty, MatchEvent, MatchReport, MatchStatus, SteamId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
@@ -79,6 +79,7 @@ pub enum ServerMessage {
         match_token: String,
         opponent: OpponentInfo,
         timeout_ms: u64,
+        game_type: lobby_core::types::GameType,
     },
     MatchAccepted {
         match_token: String,
@@ -86,6 +87,15 @@ pub enum ServerMessage {
     },
     MatchStarted {
         match_token: String,
+    },
+    GameServerReady {
+        match_token: String,
+        address: String,
+        join_token: Option<String>,
+    },
+    GameServerError {
+        match_token: String,
+        message: String,
     },
     MatchResult {
         match_token: String,
@@ -195,7 +205,7 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
     let mut disconnect_reason;
     loop {
         tokio::select! {
-            msg = timeout(Duration::from_secs(60), receiver.next()) => {
+            msg = timeout(Duration::from_secs(30), receiver.next()) => {
                 match msg {
                     Ok(Some(Ok(Message::Text(text)))) => {
                         let cm: ClientMessage = match serde_json::from_str(&text) {
@@ -226,8 +236,11 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
                         break;
                     }
                     Err(_) => {
-                        // No frames at all for 60s (an idle client) — drop it.
-                        disconnect_reason = "idle timeout (60s)";
+                        // No frames for 30s — a client that stopped heartbeating.
+                        // Clients send a passive heartbeat every ~10s while
+                        // connected; 30s of silence means the connection is dead
+                        // or the client is gone, so drop it.
+                        disconnect_reason = "no heartbeat for 30s";
                         break;
                     }
                     _ => {
@@ -437,9 +450,25 @@ async fn handle_client_message(
                 let other = if steam_id == m.player_a { m.player_b } else { m.player_a };
                 let connections = state.connections.lock().await;
                 if let Some(e) = connections.get(&other) {
-                    let _ = e.tx.send(ServerMessage::MatchDeclined { match_token });
+                    let _ = e.tx.send(ServerMessage::MatchDeclined { match_token: match_token.clone() });
                 }
             }
+            // Terminal: a declined match must not linger PendingAccept — otherwise the
+            // 30s accept-expiry fires a spurious match_expired to both players later.
+            // Only force it when still PendingAccept; a late decline of a live match
+            // (both already accepted) leaves the lifecycle alone.
+            if let Ok(Some(m)) = state.store.get_match(&match_token).await {
+                if m.status == MatchStatus::PendingAccept {
+                    let _ = state
+                        .store
+                        .update_match_status(&match_token, MatchStatus::Disputed)
+                        .await;
+                }
+            }
+            let _ = state
+                .store
+                .record_match_event(&match_token, MatchEvent::Declined, Some(steam_id))
+                .await;
         }
         ClientMessage::P2pConnected { match_token } => {
             match state
@@ -448,6 +477,7 @@ async fn handle_client_message(
                 .await
             {
                 Ok(()) => {
+                    tracing::info!("player {steam_id} p2p connected for match {match_token}");
                     if let Ok(Some(m)) = state.store.get_match(&match_token).await {
                         let other = if steam_id == m.player_a { m.player_b } else { m.player_a };
                         let connections = state.connections.lock().await;
@@ -530,8 +560,20 @@ async fn handle_client_message(
             }
         }
         ClientMessage::Heartbeat => {
+            tracing::trace!("heartbeat from {steam_id}");
             let _ = state.player_manager.heartbeat(steam_id, &state.store).await;
         }
         _ => {}
+    }
+}
+
+pub async fn notify_match_players(state: &Arc<AppState>, token: &str, msg: ServerMessage) {
+    if let Ok(Some(m)) = state.store.get_match(token).await {
+        let connections = state.connections.lock().await;
+        for pid in [m.player_a, m.player_b] {
+            if let Some(e) = connections.get(&pid) {
+                let _ = e.tx.send(msg.clone());
+            }
+        }
     }
 }

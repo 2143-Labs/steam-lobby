@@ -93,6 +93,21 @@ pub trait MatchStore: Send + Sync {
     /// Record one player's P2P connection.
     /// Returns true when, after this call, BOTH players have connected.
     async fn mark_started(&self, token: &str, steam_id: SteamId) -> Result<bool>;
+    /// Record that a server-authoritative match's gameserver is ready and the
+    /// match is now Playing (sets server_address, join_token, started_at=NOW()).
+    async fn mark_server_ready(
+        &self,
+        token: &str,
+        address: &str,
+        join_token: Option<&str>,
+    ) -> Result<()>;
+    /// Append an audit event (match paired / player accepted / player declined).
+    async fn record_match_event(
+        &self,
+        match_token: &str,
+        event: crate::types::MatchEvent,
+        steam_id: Option<SteamId>,
+    ) -> Result<()>;
     /// Persist a resolved match outcome record.
     async fn write_match_result(
         &self,
@@ -136,8 +151,8 @@ pub trait QueueStore: Send + Sync {
 #[async_trait]
 pub trait RatingStore: Send + Sync {
     async fn get_rating(&self, steam_id: SteamId, mode: &str) -> Result<OpenSkillRating>;
-    /// All ratings, ordered by display rating (`mu - 3*sigma`) descending.
-    async fn list_ratings(&self) -> Result<Vec<(SteamId, OpenSkillRating)>>;
+    /// All ratings for one mode, ordered by display rating (`mu - 3*sigma`) descending.
+    async fn list_ratings(&self, mode: &str) -> Result<Vec<(SteamId, OpenSkillRating)>>;
     async fn update_rating(
         &self,
         steam_id: SteamId,

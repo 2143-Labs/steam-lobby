@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::state::{AppState, OpenIdState};
-use lobby_core::traits::PlayerStore;
+use lobby_core::traits::{MatchStore, PlayerStore};
 
 pub async fn health() -> &'static str {
     "ok"
@@ -396,4 +396,88 @@ mod tests {
             "https://lobby.example.com/cb#token=xyz"
         );
     }
+}
+
+#[derive(Deserialize)]
+pub struct GameResultBody {
+    #[serde(default, deserialize_with = "lobby_core::types::deserialize_optional_steam_id")]
+    pub winner: Option<u64>, // None = draw
+}
+
+/// The gameserver reports the match outcome. The URL itself is the
+/// authentication: {token}/{secret} — 401 unless the secret matches.
+pub async fn game_result(
+    State(state): State<Arc<AppState>>,
+    Path((token, secret)): Path<(String, String)>,
+    Json(body): Json<GameResultBody>,
+) -> impl IntoResponse {
+    let m = match state.store.get_match(&token).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return StatusCode::NOT_FOUND,
+        Err(e) => {
+            tracing::warn!("game_result db error: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+    if m.result_secret.as_deref() != Some(secret.as_str()) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    match state
+        .match_manager
+        .resolve_from_gameserver(&token, body.winner, &state.store, &state.store)
+        .await
+    {
+        Ok(outcome) => {
+            tracing::info!("match {token} gameserver result resolved: {outcome:?}");
+            crate::ws::notify_match_players(
+                &state,
+                &token,
+                crate::ws::ServerMessage::MatchResult {
+                    match_token: token.clone(),
+                    outcome: serde_json::to_value(&outcome).unwrap(),
+                },
+            )
+            .await;
+            StatusCode::OK
+        }
+        Err(e) => {
+            // wrong status (already resolved/disputed) or invalid winner
+            tracing::warn!("game_result rejected for match {token}: {e}");
+            StatusCode::CONFLICT
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct ModeInfo {
+    pub name: String,
+    pub game_type: lobby_core::types::GameType,
+}
+
+/// The modes the server actually runs — the demo populates its dropdown from this.
+pub async fn modes(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "modes": state.game_modes.iter().map(|(n, t)| ModeInfo { name: n.clone(), game_type: *t }).collect::<Vec<_>>() }))
+}
+
+/// Dev-only fake creator: returns a (simulated) server address and auto-reports
+/// player_a's win 3s after allocation, exercising the full webhook path.
+pub async fn mock_allocate(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
+    let callback = body["result_callback_url"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let winner = body["player_a"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(&callback)
+            .json(&serde_json::json!({ "winner": winner }))
+            .send()
+            .await;
+    });
+    Json(serde_json::json!({ "server_address": "127.0.0.1:25565", "join_token": "mock-join" }))
 }

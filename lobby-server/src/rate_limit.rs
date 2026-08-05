@@ -36,3 +36,46 @@ impl RateLimiter {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::thread;
+
+    fn ip(n: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, n))
+    }
+
+    #[test]
+    fn allows_up_to_max_then_blocks() {
+        let rl = RateLimiter::new(3, Duration::from_secs(60));
+        assert!(rl.check(ip(1)));
+        assert!(rl.check(ip(1)));
+        assert!(rl.check(ip(1)));
+        assert!(!rl.check(ip(1)), "4th hit within the window must be rejected");
+    }
+
+    #[test]
+    fn distinct_ips_are_isolated() {
+        let rl = RateLimiter::new(1, Duration::from_secs(60));
+        assert!(rl.check(ip(1)));
+        assert!(rl.check(ip(2)), "a fresh IP has its own budget");
+        assert!(!rl.check(ip(1)), "the exhausted IP stays exhausted");
+    }
+
+    #[test]
+    fn expired_hits_free_slots() {
+        let rl = RateLimiter::new(1, Duration::from_millis(50));
+        assert!(rl.check(ip(1)));
+        assert!(!rl.check(ip(1)));
+        thread::sleep(Duration::from_millis(60));
+        assert!(rl.check(ip(1)), "after the window, the slot opens again");
+    }
+
+    #[test]
+    fn zero_max_rejects_everything() {
+        let rl = RateLimiter::new(0, Duration::from_secs(60));
+        assert!(!rl.check(ip(1)));
+    }
+}
