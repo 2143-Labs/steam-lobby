@@ -427,7 +427,7 @@ pub async fn game_result(
     }
     match state
         .match_manager
-        .resolve_from_gameserver(&token, body.winner, &state.store, &state.store)
+        .resolve_from_gameserver(&token, body.winner, &state.store, &state.store, &state.store)
         .await
     {
         Ok(outcome) => {

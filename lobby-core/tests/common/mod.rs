@@ -333,6 +333,10 @@ impl QueueStore for MockStore {
         }
         Ok(stale)
     }
+
+    async fn is_queued(&self, steam_id: SteamId) -> Result<bool> {
+        Ok(self.queue.lock().keys().any(|(sid, _)| *sid == steam_id))
+    }
 }
 
 #[async_trait]

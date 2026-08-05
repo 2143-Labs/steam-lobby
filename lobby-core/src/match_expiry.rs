@@ -6,8 +6,8 @@ use chrono::Utc;
 
 use crate::error::Result;
 use crate::match_lifecycle::MatchManager;
-use crate::traits::{GameCallbacks, MatchStore, RatingStore};
-use crate::types::{MatchOutcome, MatchStatus};
+use crate::traits::{GameCallbacks, MatchStore, PlayerStore, RatingStore};
+use crate::types::{MatchOutcome, MatchStatus, PlayerState};
 
 impl<CB: GameCallbacks> MatchManager<CB> {
     /// Expire server-authoritative matches whose gameserver never reported.
@@ -16,6 +16,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         &self,
         match_store: &dyn MatchStore,
         timeout_secs: u64,
+        player_store: &dyn PlayerStore,
     ) -> Result<Vec<String>> {
         let matches = match_store.get_matches_by_status(MatchStatus::Playing).await?;
         let now = Utc::now();
@@ -30,6 +31,9 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                     match_store
                         .update_match_status(&m.match_token, MatchStatus::Disputed)
                         .await?;
+                    // Terminal: both players are free to queue again.
+                    player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
+                    player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
                     expired.push(m.match_token.clone());
                 }
             }
@@ -39,7 +43,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
 
     /// Expire matches whose 30s accept window elapsed with at least one player
     /// still undecided. Returns the tokens that were flipped to Disputed.
-    pub async fn expire_pending_accepts(&self, match_store: &dyn MatchStore) -> Result<Vec<String>> {
+    pub async fn expire_pending_accepts(&self, match_store: &dyn MatchStore, player_store: &dyn PlayerStore) -> Result<Vec<String>> {
         let matches = match_store
             .get_matches_by_status(MatchStatus::PendingAccept)
             .await?;
@@ -57,6 +61,9 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                 match_store
                     .update_match_status(&m.match_token, MatchStatus::Disputed)
                     .await?;
+                // Terminal: both players are free to queue again.
+                player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
+                player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
                 expired.push(m.match_token.clone());
             }
         }
@@ -70,6 +77,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         &self,
         match_store: &dyn MatchStore,
         rating_store: &dyn RatingStore,
+        player_store: &dyn PlayerStore,
     ) -> Result<Vec<(String, MatchOutcome)>> {
         let matches = match_store
             .get_matches_by_status(MatchStatus::Reporting)
@@ -88,6 +96,9 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                         match_store
                             .update_match_status(&m.match_token, MatchStatus::Disputed)
                             .await?;
+                        // Terminal: both players are free to queue again.
+                        player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
+                        player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
                         resolved.push((m.match_token.clone(), MatchOutcome::Disputed));
                     } else if reports.len() == 1 {
                         let report = &reports[0];
@@ -104,11 +115,14 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                             match_store
                                 .update_match_status(&m.match_token, MatchStatus::Disputed)
                                 .await?;
+                            // Terminal: both players are free to queue again.
+                            player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
+                            player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
                             resolved.push((m.match_token.clone(), MatchOutcome::Disputed));
                             continue;
                         }
                         let outcome = self
-                            .resolve_agreed(m, report.winner, match_store, rating_store)
+                            .resolve_agreed(m, report.winner, match_store, rating_store, player_store)
                             .await?;
                         let outcome_str = match &outcome {
                             MatchOutcome::Win { .. } => "Win",

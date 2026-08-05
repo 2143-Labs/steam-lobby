@@ -8,8 +8,8 @@ use skillratings::Outcomes;
 
 use crate::error::{LobbyError, Result};
 use crate::mmr;
-use crate::traits::{GameCallbacks, MatchStore, RatingStore};
-use crate::types::{MatchEvent, MatchOutcome, MatchReport, MatchStatus, SteamId};
+use crate::traits::{GameCallbacks, MatchStore, PlayerStore, RatingStore};
+use crate::types::{MatchEvent, MatchOutcome, MatchReport, MatchStatus, PlayerState, SteamId};
 
 pub struct MatchManager<CB: GameCallbacks> {
     callbacks: CB,
@@ -105,6 +105,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         report: MatchReport,
         match_store: &dyn MatchStore,
         rating_store: &dyn RatingStore,
+        player_store: &dyn PlayerStore,
     ) -> Result<MatchOutcome> {
         let token = &report.match_token;
         let m = match_store
@@ -127,6 +128,13 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                 return Err(LobbyError::InvalidReport(token.clone()));
             }
         }
+        // One report per player per match: a repeat is a client bug or a
+        // retry, never a second vote. The DB INSERT also has ON CONFLICT
+        // DO NOTHING as defense-in-depth against concurrent duplicates.
+        let existing = match_store.get_reports(token).await?;
+        if existing.iter().any(|r| r.reporting_player == report.reporting_player) {
+            return Err(LobbyError::InvalidReport(token.clone()));
+        }
         match_store.submit_report(&report).await?;
         let reports = match_store.get_reports(token).await?;
         if reports.len() < 2 {
@@ -142,18 +150,24 @@ impl<CB: GameCallbacks> MatchManager<CB> {
 
         if agree && !hashes_differ {
             return self
-                .resolve_agreed(&m, winner_a, match_store, rating_store)
+                .resolve_agreed(&m, winner_a, match_store, rating_store, player_store)
                 .await;
         } else if agree && hashes_differ {
             match_store
                 .update_match(token, MatchStatus::Disputed, Utc::now())
                 .await?;
+            // Terminal: both players are free to queue again.
+            player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
+            player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
             Ok(MatchOutcome::Disputed)
         } else {
             let missing = ra.demo_hash.is_none() || rb.demo_hash.is_none();
             match_store
                 .update_match(token, MatchStatus::Disputed, Utc::now())
                 .await?;
+            // Terminal: both players are free to queue again.
+            player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
+            player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
             if missing {
                 Ok(MatchOutcome::UnreviewableDispute)
             } else {
@@ -172,6 +186,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         winner: Option<SteamId>,
         match_store: &dyn MatchStore,
         rating_store: &dyn RatingStore,
+        player_store: &dyn PlayerStore,
     ) -> Result<MatchOutcome> {
         let rating_a = rating_store.get_rating(m.player_a, &m.game_mode).await?;
         let rating_b = rating_store.get_rating(m.player_b, &m.game_mode).await?;
@@ -213,6 +228,9 @@ impl<CB: GameCallbacks> MatchManager<CB> {
             }
         };
         self.callbacks.on_match_ended(m, &outcome).await?;
+        // Terminal: both players are free to queue again.
+        player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
+        player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
         Ok(outcome)
     }
 
@@ -225,6 +243,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         winner: Option<SteamId>,
         match_store: &dyn MatchStore,
         rating_store: &dyn RatingStore,
+        player_store: &dyn PlayerStore,
     ) -> Result<MatchOutcome> {
         let m = match_store
             .get_match(token)
@@ -238,7 +257,8 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                 return Err(LobbyError::InvalidReport(token.to_string()));
             }
         }
-        self.resolve_agreed(&m, winner, match_store, rating_store).await
+        self.resolve_agreed(&m, winner, match_store, rating_store, player_store)
+            .await
     }
 
 }

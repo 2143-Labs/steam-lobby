@@ -445,6 +445,51 @@ async fn auth_ok_reports_state() {
 }
 
 #[tokio::test]
+async fn reconnect_reports_queueing() {
+    use lobby_core::types::PlayerState;
+
+    let h = setup().await;
+
+    let mut c1 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    c1.authenticate_test_token(602, &h.base_url).await.unwrap();
+    c1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+
+    // begin_matchmaking is fire-and-forget: wait for the entry to land before
+    // dropping the connection, so the drop happens while the player is queued.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let queued: Option<i64> = sqlx::query_scalar(
+            "SELECT steam_id FROM matchmaking_queue WHERE steam_id = 602",
+        )
+        .fetch_optional(&h.pool)
+        .await
+        .unwrap();
+        if queued.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queue row never appeared for the queued player"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Dropping the connection must NOT reset the player: the queue entry is
+    // still alive, so a reconnect within the stale window stays queued.
+    drop(c1);
+
+    let mut c2 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    let auth = c2.authenticate_test_token(602, &h.base_url).await.unwrap();
+    assert_eq!(
+        auth.state,
+        PlayerState::Queueing,
+        "close-then-reconnect while queued must report queueing"
+    );
+
+    drop(c2);
+}
+
+#[tokio::test]
 async fn match_expired_notifies_players() {
     let h = setup().await;
 
@@ -475,6 +520,26 @@ async fn match_expired_notifies_players() {
             }
         }
         assert!(told, "{name} must be told the match expired");
+    }
+    // The accept-expiry must have reset both players to the menus (terminal
+    // path), so they can queue again without a disconnect/reconnect cycle.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        let state: Option<String> = sqlx::query_scalar(
+            "SELECT state FROM player_state WHERE steam_id = 100",
+        )
+        .fetch_optional(&h.pool)
+        .await
+        .unwrap();
+        if state.as_deref() == Some("InMenus") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expired-match players must be reset to the menus, got {:?}",
+            state
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     drop(p1);
@@ -522,6 +587,88 @@ async fn report_timeout_resolves_and_notifies() {
         "a single report must resolve as win/loss, got {}",
         row.0
     );
+
+    drop(p1);
+    drop(p2);
+}
+
+#[tokio::test]
+async fn duplicate_report_rejected() {
+    let h = setup().await;
+
+    let (mut p1, mut p2, token) = pair_up(&h, 110, 210, "ranked_1v1").await;
+    accept_and_connect(&h, &mut p1, &mut p2, &token).await;
+
+    // First report is accepted and broadcast to both players.
+    p1.submit_report(&token, Some(110), Some("demo-a"))
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut saw = false;
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(2), p1.next_event()).await {
+            Ok(Some(Ok(lobby_client::ServerEvent::ReportReceived {
+                ..
+            }))) => {
+                saw = true;
+                break;
+            }
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(e))) => panic!("p1 client error: {e}"),
+            Ok(None) => break,
+        }
+    }
+    assert!(saw, "p1 must see its own report_received");
+
+    // The same player reporting again must be rejected with an error event,
+    // and the rejection must not be presented as a stored report.
+    p1.submit_report(&token, Some(110), Some("demo-a"))
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut told = false;
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(2), p1.next_event()).await {
+            Ok(Some(Ok(lobby_client::ServerEvent::Error { message }))) => {
+                assert!(
+                    message.contains("invalid report"),
+                    "expected invalid-report rejection, got: {message}"
+                );
+                told = true;
+                break;
+            }
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(e))) => panic!("p1 client error: {e}"),
+            Ok(None) => break,
+        }
+    }
+    assert!(told, "p1 must be told its duplicate report was rejected");
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM match_reports WHERE match_token = $1",
+    )
+    .bind(&token)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "only the first report may be stored");
+
+    // The opponent's report still resolves the match.
+    p2.submit_report(&token, Some(110), Some("demo-a"))
+        .await
+        .unwrap();
+    assert!(
+        wait_for_status(&h.pool, &token, "Resolved").await,
+        "match must resolve after both players report"
+    );
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM match_reports WHERE match_token = $1",
+    )
+    .bind(&token)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 2);
 
     drop(p1);
     drop(p2);
@@ -576,6 +723,61 @@ async fn queue_expired_notifies_player() {
         }
     }
     assert!(told, "queued player must be told when its entry expires");
+
+    drop(p1);
+}
+
+#[tokio::test]
+async fn stale_entry_resets_player_state() {
+    let h = setup().await;
+
+    let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    p1.authenticate_test_token(703, &h.base_url).await.unwrap();
+    p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+
+    // Wait for the entry, then pretend the player idled past the 30s stale
+    // window. The next tick evicts the entry AND must reset the owner to the
+    // menus so a reconnect reports "in_menus", not a stale "queueing".
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let queued: Option<i64> = sqlx::query_scalar(
+            "SELECT steam_id FROM matchmaking_queue WHERE steam_id = 703",
+        )
+        .fetch_optional(&h.pool)
+        .await
+        .unwrap();
+        if queued.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queue row never appeared for the queued player"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    sqlx::query("UPDATE player_state SET last_heartbeat = NOW() - INTERVAL '40 seconds' WHERE steam_id = 703")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        let state: Option<String> = sqlx::query_scalar(
+            "SELECT state FROM player_state WHERE steam_id = 703",
+        )
+        .fetch_optional(&h.pool)
+        .await
+        .unwrap();
+        if state.as_deref() == Some("InMenus") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "evicted player must be reset to the menus, got {:?}",
+            state
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     drop(p1);
 }

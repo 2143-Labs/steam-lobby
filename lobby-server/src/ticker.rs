@@ -144,6 +144,11 @@ pub async fn tick_loop(state: Arc<AppState>) {
             }
         }
         if let Ok(removed) = state.matchmaking_queue.cleanup_stale(&state.store).await {
+            for sid in &removed {
+                // The entry is gone — the owner must be back in the menus so a
+                // later reconnect reports "in_menus", not a stale "queueing".
+                let _ = state.player_manager.handle_disconnect(*sid, &state.store).await;
+            }
             if !removed.is_empty() {
                 let connections = state.connections.lock().await;
                 for sid in removed {
@@ -158,7 +163,7 @@ pub async fn tick_loop(state: Arc<AppState>) {
         // waiting on a panel that can never resolve.
         if let Ok(expired) = state
             .match_manager
-            .expire_pending_accepts(&state.store)
+            .expire_pending_accepts(&state.store, &state.store)
             .await
         {
             for token in expired {
@@ -253,7 +258,7 @@ pub async fn tick_loop(state: Arc<AppState>) {
         // Gameserver never reported -> Disputed (mirrors the report-timeout path).
         if let Ok(expired) = state
             .match_manager
-            .expire_playing_matches(&state.store, state.gameserver_result_timeout_secs)
+            .expire_playing_matches(&state.store, state.gameserver_result_timeout_secs, &state.store)
             .await
         {
             for token in expired {
@@ -271,7 +276,7 @@ pub async fn tick_loop(state: Arc<AppState>) {
         }
         if let Ok(resolved) = state
             .match_manager
-            .expire_pending_reports(&state.store, &state.store)
+            .expire_pending_reports(&state.store, &state.store, &state.store)
             .await
         {
             for (token, outcome) in resolved {

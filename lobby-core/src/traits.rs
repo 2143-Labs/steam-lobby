@@ -150,6 +150,8 @@ pub trait QueueStore: Send + Sync {
     async fn get_queue(&self, mode: &str) -> Result<Vec<QueueEntry>>;
     /// Remove stale entries; returns the steam_ids that were removed.
     async fn remove_stale_queue_entries(&self, timeout: chrono::Duration) -> Result<Vec<SteamId>>;
+    /// True if the player currently has a queue entry in any mode.
+    async fn is_queued(&self, steam_id: SteamId) -> Result<bool>;
 }
 
 #[async_trait]

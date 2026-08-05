@@ -71,4 +71,14 @@ impl QueueStore for PostgresStore {
         }
         Ok(rows.into_iter().map(|id| id as SteamId).collect())
     }
+
+    async fn is_queued(&self, steam_id: SteamId) -> Result<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM matchmaking_queue WHERE steam_id = $1)",
+        )
+        .bind(steam_id as i64)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_db_error)
+    }
 }

@@ -326,10 +326,17 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
             .unwrap_or(false)
     };
     if is_current {
-        let _ = state
-            .player_manager
-            .handle_disconnect(steam_id, &state.store)
-            .await;
+        // A brief drop keeps the player queued: the queue entry lives until
+        // the stale sweep evicts it (30s without heartbeat), so a reconnect
+        // within that window must still report "queueing". Only a disconnect
+        // with no queue entry resets the player to the menus.
+        let still_queued = state.store.is_queued(steam_id).await.unwrap_or(false);
+        if !still_queued {
+            let _ = state
+                .player_manager
+                .handle_disconnect(steam_id, &state.store)
+                .await;
+        }
         state.connections.lock().await.remove(&steam_id);
     } else {
         disconnect_reason = "replaced by newer connection";
@@ -571,7 +578,7 @@ async fn handle_client_message(
             };
             let outcome = state
                 .match_manager
-                .submit_report(report.clone(), &state.store, &state.store)
+                .submit_report(report.clone(), &state.store, &state.store, &state.store)
                 .await;
 
             match &outcome {
@@ -579,7 +586,15 @@ async fn handle_client_message(
                     "report from {steam_id} for match {match_token}: winner {:?}",
                     report.winner
                 ),
-                Err(e) => tracing::warn!("report from {steam_id} for match {match_token} rejected: {e}"),
+                Err(e) => {
+                    tracing::warn!("report from {steam_id} for match {match_token} rejected: {e}");
+                    // Tell the reporter the report was not accepted (e.g. a
+                    // duplicate) so their UI can stop showing it as pending.
+                    let _ = tx.send(ServerMessage::Error {
+                        code: "invalid_report".into(),
+                        message: e.to_string(),
+                    });
+                }
             }
             // Broadcast the received report to BOTH players so each sees what the
             // other selected before resolution. Gated on the report actually being

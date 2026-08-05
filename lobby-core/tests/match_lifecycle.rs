@@ -3,7 +3,7 @@ mod common;
 use chrono::{Duration, Utc};
 use common::{queued_player, MockStore, TestCallbacks};
 use lobby_core::error::LobbyError;
-use lobby_core::types::{GameType, MatchDifficulty, MatchInfo, MatchReport, MatchStatus, QueueEntry};
+use lobby_core::types::{GameType, MatchDifficulty, MatchInfo, MatchReport, MatchStatus, PlayerState, QueueEntry};
 use lobby_core::traits::{MatchStore, QueueStore};
 
 // ── Tests ────────────────────────────────────────────────
@@ -75,6 +75,7 @@ async fn full_match_lifecycle() {
             },
             &store,
             &store,
+            &store,
         )
         .await
         .unwrap();
@@ -91,6 +92,7 @@ async fn full_match_lifecycle() {
             },
             &store,
             &store,
+            &store,
         )
         .await
         .unwrap();
@@ -99,12 +101,24 @@ async fn full_match_lifecycle() {
         lobby_core::types::MatchOutcome::Win { mu_change } => assert!(mu_change > 0.0),
         _ => panic!("expected Win, got {outcome:?}"),
     }
+
+    // Terminal: both players must be back in the menus so they can re-queue.
+    assert_eq!(
+        store.players.lock().get(&100).unwrap().state,
+        PlayerState::InMenus
+    );
+    assert_eq!(
+        store.players.lock().get(&200).unwrap().state,
+        PlayerState::InMenus
+    );
 }
 
 #[tokio::test]
 async fn dispute_on_winner_mismatch() {
     let store = MockStore::new();
     let token = "dispute-test".to_string();
+    store.players.lock().insert(100, queued_player(100, 25.0));
+    store.players.lock().insert(200, queued_player(200, 25.0));
     store
         .create_match(&MatchInfo {
             match_token: token.clone(),
@@ -141,6 +155,7 @@ async fn dispute_on_winner_mismatch() {
         },
         &store,
         &store,
+        &store,
     )
     .await
     .unwrap();
@@ -154,11 +169,21 @@ async fn dispute_on_winner_mismatch() {
             },
             &store,
             &store,
+            &store,
         )
         .await
         .unwrap();
 
     assert!(matches!(outcome, lobby_core::types::MatchOutcome::Disputed));
+    // Terminal: both players must be back in the menus so they can re-queue.
+    assert_eq!(
+        store.players.lock().get(&100).unwrap().state,
+        PlayerState::InMenus
+    );
+    assert_eq!(
+        store.players.lock().get(&200).unwrap().state,
+        PlayerState::InMenus
+    );
 }
 
 #[tokio::test]
@@ -201,7 +226,7 @@ async fn auto_loss_on_timeout() {
         .unwrap();
 
     let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
-    mgr.expire_pending_reports(&store, &store).await.unwrap();
+    mgr.expire_pending_reports(&store, &store, &store).await.unwrap();
 
     let m = store.get_match(&token).await.unwrap().unwrap();
     assert_eq!(m.status, MatchStatus::Resolved);
@@ -251,6 +276,7 @@ async fn winner_must_be_participant() {
                 winner: Some(999), // a third steam_id — not a participant
                 demo_hash: None,
             },
+            &store,
             &store,
             &store,
         )
@@ -336,7 +362,7 @@ async fn server_result_resolves() {
 
     let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
     let outcome = mgr
-        .resolve_from_gameserver(&token, Some(100), &store, &store)
+        .resolve_from_gameserver(&token, Some(100), &store, &store, &store)
         .await
         .unwrap();
     match outcome {
@@ -384,8 +410,128 @@ async fn playing_match_expires() {
         .unwrap();
 
     let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
-    let expired = mgr.expire_playing_matches(&store, 1).await.unwrap();
+    let expired = mgr.expire_playing_matches(&store, 1, &store).await.unwrap();
     assert_eq!(expired, vec![token.clone()]);
     let m = store.get_match(&token).await.unwrap().unwrap();
     assert_eq!(m.status, MatchStatus::Disputed);
+}
+
+#[tokio::test]
+async fn accept_expiry_resets_players() {
+    let store = MockStore::new();
+    let token = "accept-expire".to_string();
+    store.players.lock().insert(100, queued_player(100, 25.0));
+    store.players.lock().insert(200, queued_player(200, 25.0));
+    store
+        .create_match(&MatchInfo {
+            match_token: token.clone(),
+            player_a: 100,
+            player_a_difficulty: MatchDifficulty::Normal,
+            player_b: 200,
+            player_b_difficulty: MatchDifficulty::Normal,
+            game_mode: "ranked_1v1".into(),
+            game_type: GameType::P2p,
+            server_address: None,
+            join_token: None,
+            result_secret: None,
+            status: MatchStatus::PendingAccept,
+            created_at: Utc::now() - Duration::seconds(31),
+            accepted_at: None,
+            started_at: None,
+            ended_at: None,
+            accepted_a: false,
+            accepted_b: false,
+            connected_a: false,
+            connected_b: false,
+        })
+        .await
+        .unwrap();
+
+    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
+    let expired = mgr.expire_pending_accepts(&store, &store).await.unwrap();
+    assert_eq!(expired, vec![token.clone()]);
+    let m = store.get_match(&token).await.unwrap().unwrap();
+    assert_eq!(m.status, MatchStatus::Disputed);
+    // Terminal: both players must be back in the menus so they can re-queue.
+    assert_eq!(
+        store.players.lock().get(&100).unwrap().state,
+        PlayerState::InMenus
+    );
+    assert_eq!(
+        store.players.lock().get(&200).unwrap().state,
+        PlayerState::InMenus
+    );
+}
+
+#[tokio::test]
+async fn duplicate_report_rejected() {
+    let store = MockStore::new();
+    let token = "dup-report".to_string();
+    store.players.lock().insert(100, queued_player(100, 25.0));
+    store.players.lock().insert(200, queued_player(200, 25.0));
+    store
+        .create_match(&MatchInfo {
+            match_token: token.clone(),
+            player_a: 100,
+            player_a_difficulty: MatchDifficulty::Normal,
+            player_b: 200,
+            player_b_difficulty: MatchDifficulty::Normal,
+            game_mode: "ranked_1v1".into(),
+            game_type: GameType::P2p,
+            server_address: None,
+            join_token: None,
+            result_secret: None,
+            status: MatchStatus::Reporting,
+            created_at: Utc::now(),
+            accepted_at: Some(Utc::now()),
+            started_at: Some(Utc::now()),
+            ended_at: Some(Utc::now()),
+            accepted_a: true,
+            accepted_b: true,
+            connected_a: true,
+            connected_b: true,
+        })
+        .await
+        .unwrap();
+
+    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
+    let report_a = MatchReport {
+        match_token: token.clone(),
+        reporting_player: 100,
+        winner: Some(100),
+        demo_hash: Some("demo-a".into()),
+    };
+    let report_b = MatchReport {
+        match_token: token.clone(),
+        reporting_player: 200,
+        winner: Some(100),
+        demo_hash: Some("demo-a".into()),
+    };
+
+    mgr.submit_report(report_a.clone(), &store, &store, &store)
+        .await
+        .unwrap();
+
+    // A second report from the same player must be rejected, not stored.
+    let err = mgr
+        .submit_report(report_a, &store, &store, &store)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, LobbyError::InvalidReport(_)));
+    assert_eq!(store.get_reports(&token).await.unwrap().len(), 1);
+
+    // The opponent's report still resolves the match.
+    let outcome = mgr
+        .submit_report(report_b, &store, &store, &store)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, lobby_core::types::MatchOutcome::Win { .. }));
+    assert_eq!(
+        store.players.lock().get(&100).unwrap().state,
+        PlayerState::InMenus
+    );
+    assert_eq!(
+        store.players.lock().get(&200).unwrap().state,
+        PlayerState::InMenus
+    );
 }

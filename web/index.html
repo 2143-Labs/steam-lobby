@@ -311,6 +311,13 @@ function handleServer(raw) {
         : (msg.winner === state.steamId ? "Win (you)" : "Win (opponent)");
       $("report-status").textContent = who + " reported: " + w;
       log("sys", who + " reported: " + w);
+      if (msg.reporting_player === state.steamId) {
+        // The server stores one report per player per match — once ours is in,
+        // hide the buttons so a repeat can't be submitted from the UI.
+        $("btn-report-win").style.display = "none";
+        $("btn-report-loss").style.display = "none";
+        $("btn-report-draw").style.display = "none";
+      }
       break;
     case "match_expired":
       setStatus("Match expired — no one accepted in time", "");
@@ -357,6 +364,12 @@ function handleServer(raw) {
       $("server-info").style.display = "none";
       break;
     case "error":
+      if (msg.code === "invalid_report") {
+        // A rejected (e.g. duplicate) report: log it, don't yank a mid-match
+        // player back to the connected panel.
+        log("sys", msg.message);
+        break;
+      }
       setStatus("Error: " + msg.message, "err");
       showControls("connected");
       break;
