@@ -95,7 +95,7 @@ fn parse_game_modes(s: &str) -> Vec<(String, lobby_core::types::GameType)> {
                 "p2p" => lobby_core::types::GameType::P2p,
                 "server" => lobby_core::types::GameType::Server,
                 other => {
-                    eprintln!("GAME_MODES: unknown game type '{other}' for mode '{name}' — skipping");
+                    tracing::warn!("GAME_MODES: unknown game type '{other}' for mode '{name}' — skipping");
                     return None;
                 }
             };
