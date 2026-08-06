@@ -98,7 +98,7 @@ connect both, then start matchmaking in each.</p>
 const $ = (id) => document.getElementById(id);
 const state = { ws: null, steamId: null, matchToken: null, opponentId: null, gameType: null,
   inputTarget: 0.5, gameMode: "off", game: null, lastSentTarget: null, lastInputAt: 0,
-  practiceRaf: null, pongRaf: null };
+  practiceRaf: null, pongRaf: null, iAmPlayerA: undefined };
 // Consume an OpenID-issued fragment token (#token=…) if present, then strip it
 // from the URL so it isn't re-sent or stored in history.
 let fragmentToken = null;
@@ -370,9 +370,27 @@ function handleServer(raw) {
     case "match_result":
       stopGame();
       const o = msg.outcome;
-      const txt = typeof o === "object"
-        ? (o.Disputed ? "Match disputed" : Object.keys(o)[0] + (o[Object.keys(o)[0]].mu_change !== undefined ? " (mu change " + o[Object.keys(o)[0]].mu_change.toFixed(2) + ")" : ""))
-        : String(o);
+      // The server stores and broadcasts ONE outcome, keyed to player_a's
+      // perspective (Win = player_a won, Loss = player_b won). The pong
+      // frames told us our side, so render OUR verdict — the two players must
+      // see opposite results. mu_change is only ours when we are player_a.
+      let txt;
+      if (o && typeof o === "object" && !o.Disputed) {
+        const kind = Object.keys(o)[0];
+        const muChange = o[kind] && o[kind].mu_change;
+        if (state.iAmPlayerA === undefined) {
+          // Manual-report flow: sides unknown, fall back to the raw outcome.
+          txt = kind + (muChange !== undefined ? " (mu change " + muChange.toFixed(2) + ")" : "");
+        } else if (kind === "Draw") {
+          txt = "Draw";
+        } else {
+          const iWon = (kind === "Win" && state.iAmPlayerA) || (kind === "Loss" && !state.iAmPlayerA);
+          txt = (iWon ? "You won" : "You lost")
+            + (state.iAmPlayerA && muChange !== undefined ? " (mu change " + muChange.toFixed(2) + ")" : "");
+        }
+      } else {
+        txt = o && o.Disputed ? "Match disputed" : String(o);
+      }
       setStatus("Match resolved: " + txt, "ok");
       log("sys", "match resolved: " + JSON.stringify(o));
       showControls("connected");
@@ -389,7 +407,8 @@ function handleServer(raw) {
         left_score: msg.left_score, right_score: msg.right_score,
         speed: msg.speed };
       if (!state.pongRaf) state.pongRaf = requestAnimationFrame(pongLoop);
-      const iAmLeft = state.steamId === msg.player_a;
+      state.iAmPlayerA = state.steamId === msg.player_a;
+      const iAmLeft = state.iAmPlayerA;
       const myScore = iAmLeft ? msg.left_score : msg.right_score;
       const oppScore = iAmLeft ? msg.right_score : msg.left_score;
       $("game-status").textContent = "You " + myScore + " – " + oppScore
