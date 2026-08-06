@@ -3,6 +3,7 @@
 //! - `error` — `LobbyError` variants + `Result` alias.
 //! - `match_lifecycle` — `MatchManager`'s player-facing actions; expiry lives in `match_expiry`.
 //! - `mmr` — Weng-Lin rating updates.
+//! - `pong` — the pure, deterministic Pong game logic (server-authoritative).
 //! - `player` — `PlayerManager`'s `PlayerState` machine.
 //! - `queue` — matchmaking + expanding `search_band`.
 //! - `traits` — the storage/callback traits the core depends on.
@@ -12,6 +13,7 @@ pub mod match_lifecycle;
 mod match_expiry;
 pub mod mmr;
 pub mod player;
+pub mod pong;
 pub mod queue;
 pub mod traits;
 pub mod types;

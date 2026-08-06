@@ -8,11 +8,13 @@ use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use lobby_core::traits::{MatchStore, PlayerStore, QueueStore};
+use lobby_core::pong::PongSide;
 use lobby_core::types::{MatchDifficulty, MatchEvent, MatchReport, MatchStatus, SteamId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
+use crate::pong::PongInput;
 use crate::state::{AppState, ConnectionEntry};
 
 #[derive(Debug, Deserialize)]
@@ -46,6 +48,11 @@ pub enum ClientMessage {
     /// Signal that both peers connected (P2P game start).
     P2pConnected {
         match_token: String,
+    },
+    /// Pong paddle target (normalized paddle-center Y, 0..1).
+    GameInput {
+        match_token: String,
+        target: f64,
     },
     /// Submit a match report (`winner` None = draw).
     MatchReport {
@@ -121,6 +128,28 @@ pub enum ServerMessage {
     GameServerError {
         match_token: String,
         message: String,
+    },
+    /// Authoritative pong frame, broadcast ~30x/sec to both players.
+    /// `player_a` is Left, `player_b` is Right (so each client renders itself).
+    GameState {
+        match_token: String,
+        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
+        player_a: u64,
+        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
+        player_b: u64,
+        left_y: f64,
+        right_y: f64,
+        ball_x: f64,
+        ball_y: f64,
+        left_score: u8,
+        right_score: u8,
+        speed: f64,
+    },
+    /// The pong match ended (first to 3, or forfeit on disconnect).
+    GameOver {
+        match_token: String,
+        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
+        winner: u64,
     },
     /// Final outcome of a match.
     MatchResult {
@@ -336,6 +365,44 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
                 .player_manager
                 .handle_disconnect(steam_id, &state.store)
                 .await;
+        }
+        // Mid-game disconnect: end the pong match and award it to the other player.
+        let forfeit = {
+            let mut games = state.pong_games.lock().unwrap();
+            let key = games
+                .iter()
+                .find(|(_, g)| g.player_a == steam_id || g.player_b == steam_id)
+                .map(|(k, _)| k.clone());
+            key.map(|k| {
+                let game = games.remove(&k).unwrap();
+                (k, game)
+            })
+        };
+        if let Some((token, game)) = forfeit {
+            game.abort.abort();
+            let other = if game.player_a == steam_id {
+                game.player_b
+            } else {
+                game.player_a
+            };
+            let outcome = state
+                .match_manager
+                .resolve_pong(&token, other, &state.store, &state.store, &state.store)
+                .await;
+            if let Some(e) = state.connections.lock().await.get(&other) {
+                let _ = e.tx.send(ServerMessage::GameOver {
+                    match_token: token.clone(),
+                    winner: other,
+                });
+                // Mirror the game task: the survivor's demo needs match_result
+                // to leave the in-match panel.
+                if let Ok(o) = &outcome {
+                    let _ = e.tx.send(ServerMessage::MatchResult {
+                        match_token: token.clone(),
+                        outcome: serde_json::to_value(o).unwrap(),
+                    });
+                }
+            }
         }
         state.connections.lock().await.remove(&steam_id);
     } else {
@@ -557,10 +624,34 @@ async fn handle_client_message(
                         if let Some(e) = connections.get(&other) {
                             let _ = e.tx.send(ServerMessage::OpponentConnected { match_token });
                         }
+                        // Both players connected: the match just flipped to
+                        // Reporting — start the server-authoritative pong game.
+                        if state.config.pong_enabled
+                            && m.game_type == lobby_core::types::GameType::P2p
+                            && m.status == lobby_core::types::MatchStatus::Reporting
+                        {
+                            crate::pong::spawn_game(state, &m);
+                        }
                     }
                 }
                 Err(e) => {
                     tracing::warn!("player {steam_id} p2p signal rejected for match {match_token}: {e}")
+                }
+            }
+        }
+        ClientMessage::GameInput { match_token, target } => {
+            let target = target.clamp(0.0, 1.0);
+            // Resolve the side BEFORE taking the std Mutex (a std guard is
+            // !Send and must not be held across an await).
+            let side = match state.store.get_match(&match_token).await {
+                Ok(Some(m)) if m.player_a == steam_id => Some(PongSide::Left),
+                Ok(Some(m)) if m.player_b == steam_id => Some(PongSide::Right),
+                _ => None,
+            };
+            if let Some(side) = side {
+                let games = state.pong_games.lock().unwrap();
+                if let Some(g) = games.get(&match_token) {
+                    let _ = g.input_tx.send(PongInput { side, target });
                 }
             }
         }

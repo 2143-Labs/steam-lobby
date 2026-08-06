@@ -18,10 +18,19 @@ pub struct TestHarness {
 
 
 pub async fn setup() -> TestHarness {
-    setup_with_creator(None).await
+    setup_full(false, None).await
+}
+
+/// Harness with the pong game enabled (LOBBY_PONG = true) for p2p matches.
+pub async fn setup_pong() -> TestHarness {
+    setup_full(true, None).await
 }
 
 pub async fn setup_with_creator(creator_url: Option<&str>) -> TestHarness {
+    setup_full(false, creator_url).await
+}
+
+async fn setup_full(pong_enabled: bool, creator_url: Option<&str>) -> TestHarness {
     let _lock_guard = DB_LOCK.lock().await;
 
     let root_url = "postgres://lobby:lobby@localhost:5432/lobby";
@@ -78,6 +87,7 @@ pub async fn setup_with_creator(creator_url: Option<&str>) -> TestHarness {
         gameserver_creator_url: creator_url.map(|s| s.to_string()),
         gameserver_alloc_timeout_secs: 60,
         gameserver_result_timeout_secs: 300,
+        pong_enabled,
     };
 
     let (app, state) = build_app(config).await; // runs migrations + spawns ticker

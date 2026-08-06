@@ -42,6 +42,7 @@ enum ClientMsg {
     AcceptMatch { match_token: String },
     DeclineMatch { match_token: String },
     P2pConnected { match_token: String },
+    GameInput { match_token: String, target: f64 },
     MatchReport { match_token: String, winner: Option<u64>, demo_hash: Option<String> },
     Heartbeat,
 }
@@ -71,6 +72,11 @@ impl std::fmt::Debug for ClientMsg {
             ClientMsg::P2pConnected { match_token } => f
                 .debug_struct("P2pConnected")
                 .field("match_token", match_token)
+                .finish(),
+            ClientMsg::GameInput { match_token, target } => f
+                .debug_struct("GameInput")
+                .field("match_token", match_token)
+                .field("target", target)
                 .finish(),
             ClientMsg::MatchReport { match_token, winner, demo_hash } => f
                 .debug_struct("MatchReport")
@@ -109,6 +115,25 @@ pub enum ServerEvent {
     },
     #[serde(rename = "game_server_error")]
     GameServerError { match_token: String, message: String },
+    GameState {
+        match_token: String,
+        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
+        player_a: u64,
+        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
+        player_b: u64,
+        left_y: f64,
+        right_y: f64,
+        ball_x: f64,
+        ball_y: f64,
+        left_score: u8,
+        right_score: u8,
+        speed: f64,
+    },
+    GameOver {
+        match_token: String,
+        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
+        winner: u64,
+    },
     QueueStatus {
         elapsed_ms: u64,
         band_lo: f64,
@@ -318,6 +343,11 @@ impl LobbyClient {
             mode: mode.to_string(),
             difficulty: difficulty.to_string(),
         })
+    }
+
+    /// Set this player's pong paddle target (normalized 0..1). Fire-and-forget.
+    pub async fn game_input(&mut self, match_token: &str, target: f64) -> Result<(), ClientError> {
+        self.send(ClientMsg::GameInput { match_token: match_token.to_string(), target })
     }
 
     /// Leave the queue (no server response expected).

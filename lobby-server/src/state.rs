@@ -25,6 +25,8 @@ pub struct RuntimeConfig {
     pub jwt_ttl_secs: u64,
     /// CORS allowlist origins (may be empty; same-origin always allowed).
     pub cors_origins: Vec<String>,
+    /// Pong: run p2p matches as server-authoritative pong games (LOBBY_PONG).
+    pub pong_enabled: bool,
 }
 
 pub struct AppState {
@@ -60,6 +62,8 @@ pub struct AppState {
     pub test_token_limiter: RateLimiter,
     /// Bumped per connection so a reconnecting client supersedes a stale one.
     pub next_generation: AtomicU64,
+    /// Active pong matches: match_token -> input channel + task handle.
+    pub pong_games: StdMutex<std::collections::HashMap<String, crate::pong::ActivePong>>,
 }
 
 pub struct OpenIdState {

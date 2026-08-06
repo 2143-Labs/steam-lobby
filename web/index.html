@@ -26,6 +26,9 @@
   #log { height: 240px; overflow-y: auto; background: #0a0a0a; border: 1px solid #333;
          border-radius: 6px; padding: 0.5rem; font-size: 0.75rem; white-space: pre-wrap;
          word-break: break-all; }
+  #pong { border: 1px solid #333; border-radius: 6px; width: 100%; height: auto;
+         background: #0a0a0a; }
+  #game-status { font-size: 0.8rem; color: #aaa; margin: 0.5rem 0 0; }
   .in { color: #7fb3ff; } .out { color: #ffd28f; } .sys { color: #888; }
 </style>
 </head>
@@ -81,6 +84,10 @@ connect both, then start matchmaking in each.</p>
     <button id="btn-report-loss" style="display:none">Report Loss</button>
     <button id="btn-report-draw" style="display:none">Report Draw</button>
   </div>
+  <div id="game-area" style="display:none">
+    <canvas id="pong" width="640" height="400"></canvas>
+    <p id="game-status">—</p>
+  </div>
 <section>
   <label>Event log</label>
   <div id="log"></div>
@@ -89,7 +96,9 @@ connect both, then start matchmaking in each.</p>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-const state = { ws: null, steamId: null, matchToken: null, opponentId: null, gameType: null };
+const state = { ws: null, steamId: null, matchToken: null, opponentId: null, gameType: null,
+  inputTarget: 0.5, gameMode: "off", game: null, lastSentTarget: null, lastInputAt: 0,
+  practiceRaf: null, pongRaf: null };
 // Consume an OpenID-issued fragment token (#token=…) if present, then strip it
 // from the URL so it isn't re-sent or stored in history.
 let fragmentToken = null;
@@ -122,6 +131,7 @@ function showControls(name) {
   $("ctrl-queueing").style.display = name === "queueing" ? "" : "none";
   $("ctrl-match").style.display = name === "match" ? "" : "none";
   $("ctrl-inmatch").style.display = name === "inmatch" ? "" : "none";
+  $("game-area").style.display = (name === "queueing" || name === "inmatch") ? "" : "none";
 }
 let hbTimer = null;
 function startHeartbeat(intervalMs) {
@@ -215,6 +225,7 @@ $("btn-connect").addEventListener("click", async () => {
   state.ws.onmessage = (ev) => handleServer(ev.data);
   state.ws.onclose = () => {
     stopHeartbeat();
+    stopGame();
     log("sys", "WS closed");
     if (state.ws) { state.ws = null; }
     $("btn-connect").disabled = false;
@@ -246,6 +257,7 @@ function handleServer(raw) {
       setStatus(msg.state === "queueing" ? "Connected — still in queue" : "Connected", "ok");
       $("controls").style.display = "";
       showControls(msg.state === "queueing" ? "queueing" : "connected");
+      if (msg.state === "queueing") startPractice();
       // Passive liveness: heartbeat for as long as we're connected. The server
       // drops the connection after 30s without a heartbeat (10s cadence gives
       // margin); while queueing this also keeps the queue entry alive.
@@ -253,6 +265,7 @@ function handleServer(raw) {
       log("sys", "server state on connect: " + msg.state);
       break;
     case "match_found":
+      stopGame(); // the match replaces the practice game
       setStatus("MatchFound", "ok");
       state.matchToken = msg.match_token;
       state.opponentId = msg.opponent.steam_id;
@@ -323,12 +336,14 @@ function handleServer(raw) {
       setStatus("Match expired — no one accepted in time", "");
       log("sys", "match expired — no one accepted in time");
       showControls("connected");
+      stopGame();
       state.matchToken = null;
       break;
     case "queue_expired":
       setStatus("Removed from queue — no opponent found in time", "");
       log("sys", "removed from queue (no heartbeat / no match found)");
       showControls("connected");
+      stopGame();
       $("q-wait").textContent = "—";
       $("q-band").textContent = "—";
       $("q-cands").textContent = "—";
@@ -337,6 +352,7 @@ function handleServer(raw) {
     case "match_declined":
       setStatus("Match declined", "");
       showControls("connected");
+      stopGame();
       state.matchToken = null;
       state.gameType = null;
       $("server-info").style.display = "none";
@@ -352,6 +368,7 @@ function handleServer(raw) {
       log("sys", "game server error: " + msg.message);
       break;
     case "match_result":
+      stopGame();
       const o = msg.outcome;
       const txt = typeof o === "object"
         ? (o.Disputed ? "Match disputed" : Object.keys(o)[0] + (o[Object.keys(o)[0]].mu_change !== undefined ? " (mu change " + o[Object.keys(o)[0]].mu_change.toFixed(2) + ")" : ""))
@@ -362,6 +379,25 @@ function handleServer(raw) {
       state.matchToken = null;
       state.gameType = null;
       $("server-info").style.display = "none";
+      break;
+    case "game_state":
+      // Server-authoritative pong frame (~30Hz). player_a is Left, player_b is
+      // Right — render your own paddle and score from your side.
+      state.gameMode = "pong";
+      state.game = { left_y: msg.left_y, right_y: msg.right_y,
+        ball_x: msg.ball_x, ball_y: msg.ball_y,
+        left_score: msg.left_score, right_score: msg.right_score,
+        speed: msg.speed };
+      if (!state.pongRaf) state.pongRaf = requestAnimationFrame(pongLoop);
+      const iAmLeft = state.steamId === msg.player_a;
+      const myScore = iAmLeft ? msg.left_score : msg.right_score;
+      const oppScore = iAmLeft ? msg.right_score : msg.left_score;
+      $("game-status").textContent = "You " + myScore + " – " + oppScore
+        + " Opponent — ball speed ×" + (msg.speed / 0.3).toFixed(2);
+      break;
+    case "game_over":
+      stopGame(); // stop both rAF loops; the canvas keeps the final frame
+      $("game-status").textContent = msg.winner === state.steamId ? "You win!" : "You lose";
       break;
     case "error":
       if (msg.code === "invalid_report") {
@@ -377,10 +413,122 @@ function handleServer(raw) {
       log("sys", "unhandled event type: " + msg.type);
   }
 }
+// ── Pong game ──
+const PONG_H = 400; // canvas height, px
+const PADDLE_H = 0.08, PADDLE_X_L = 0.03, PADDLE_X_R = 0.97;
+const PADDLE_SPEED = 0.8, BALL_SPEED0 = 0.3, SPEED_UP = 1.06, MAX_SPEED = 1.2;
+const pongCtx = $("pong").getContext("2d");
+
+function startPractice() {
+  state.gameMode = "practice";
+  state.game = { left_y: 0.5, right_y: 0.5, ball_x: 0.5, ball_y: 0.5,
+    ball_vx: BALL_SPEED0, ball_vy: 0, speed: BALL_SPEED0,
+    left_score: 0, right_score: 0 };
+  $("game-status").textContent = "Practice — waiting for opponent";
+  if (!state.practiceRaf) practiceLoop(performance.now());
+}
+function practiceLoop(last) {
+  if (state.gameMode !== "practice") { state.practiceRaf = null; return; }
+  const t = performance.now();
+  simPractice(Math.min(0.05, (t - last) / 1000));
+  state.practiceRaf = requestAnimationFrame(() => practiceLoop(t));
+}
+function simPractice(dt) {
+  const g = state.game;
+  if (!g) return;
+  // paddles: yours follows inputTarget, the AI tracks the ball at half speed
+  const aiSpeed = PADDLE_SPEED * 0.5;
+  for (const [key, target, speed] of [["left_y", state.inputTarget, PADDLE_SPEED],
+                                      ["right_y", g.ball_y, aiSpeed]]) {
+    const maxMove = speed * dt;
+    const move = Math.max(-maxMove, Math.min(maxMove, target - g[key]));
+    g[key] = Math.max(0.08, Math.min(0.92, g[key] + move));
+  }
+  // ball: same 0..1 physics as the server game (sub-stepped so it never tunnels)
+  const steps = Math.max(1, Math.ceil(g.speed * dt / 0.005));
+  for (let i = 0; i < steps; i++) {
+    const d = dt / steps;
+    const len = Math.hypot(g.ball_vx, g.ball_vy) || 1;
+    g.ball_x += (g.ball_vx / len) * g.speed * d;
+    g.ball_y += (g.ball_vy / len) * g.speed * d;
+    if (g.ball_y < 0) { g.ball_y = -g.ball_y; g.ball_vy = -g.ball_vy; }
+    else if (g.ball_y > 1) { g.ball_y = 2 - g.ball_y; g.ball_vy = -g.ball_vy; }
+    const leftHit = g.ball_vx < 0 && Math.abs(g.ball_x - PADDLE_X_L) < 0.02
+      && Math.abs(g.ball_y - g.left_y) <= PADDLE_H;
+    const rightHit = g.ball_vx > 0 && Math.abs(g.ball_x - PADDLE_X_R) < 0.02
+      && Math.abs(g.ball_y - g.right_y) <= PADDLE_H;
+    if (leftHit) {
+      g.ball_vx = Math.abs(g.ball_vx);
+      g.ball_vy = (g.ball_y - g.left_y) * 3;
+      g.speed = Math.min(MAX_SPEED, g.speed * SPEED_UP);
+    } else if (rightHit) {
+      g.ball_vx = -Math.abs(g.ball_vx);
+      g.ball_vy = (g.ball_y - g.right_y) * 3;
+      g.speed = Math.min(MAX_SPEED, g.speed * SPEED_UP);
+    }
+  }
+  // no scoring in practice: a miss just resets the ball to center
+  if (g.ball_x < 0 || g.ball_x > 1) {
+    g.ball_x = 0.5; g.ball_y = 0.5; g.ball_vx = BALL_SPEED0; g.ball_vy = 0; g.speed = BALL_SPEED0;
+  }
+  renderFrame();
+}
+function pongLoop() {
+  if (state.gameMode !== "pong") { state.pongRaf = null; return; }
+  renderFrame();
+  maybeSendInput();
+  state.pongRaf = requestAnimationFrame(pongLoop);
+}
+function renderFrame() {
+  const g = state.game;
+  if (!g) return;
+  const w = 640, h = PONG_H;
+  pongCtx.fillStyle = "#0a0a0a";
+  pongCtx.fillRect(0, 0, w, h);
+  pongCtx.strokeStyle = "#333";
+  pongCtx.beginPath();
+  pongCtx.moveTo(w / 2, 0); pongCtx.lineTo(w / 2, h);
+  pongCtx.stroke();
+  pongCtx.fillStyle = "#eee";
+  pongCtx.fillRect(PADDLE_X_L * w - 2, (g.left_y - PADDLE_H) * h, 4, PADDLE_H * 2 * h);
+  pongCtx.fillRect(PADDLE_X_R * w - 2, (g.right_y - PADDLE_H) * h, 4, PADDLE_H * 2 * h);
+  pongCtx.beginPath();
+  pongCtx.arc(g.ball_x * w, g.ball_y * h, 6, 0, Math.PI * 2);
+  pongCtx.fill();
+}
+function maybeSendInput() {
+  if (!state.matchToken) return;
+  const now = performance.now();
+  if (now - state.lastInputAt < 50) return;
+  state.lastInputAt = now;
+  const t = state.inputTarget;
+  if (state.lastSentTarget === null || Math.abs(t - state.lastSentTarget) > 0.01) {
+    send({ type: "game_input", match_token: state.matchToken, target: t });
+    state.lastSentTarget = t;
+  }
+}
+function stopGame() {
+  state.gameMode = "off";
+  state.game = null;
+  state.practiceRaf = null;
+  state.pongRaf = null;
+  state.lastSentTarget = null;
+}
+function computeTargetFromEvent(e) {
+  const y = e.offsetY / PONG_H;
+  state.inputTarget = Math.max(0, Math.min(1, y));
+}
+addEventListener("keydown", (e) => {
+  const step = 0.08;
+  if (e.key === "ArrowDown" || e.key === "s" || e.key === "S") state.inputTarget = Math.min(1, state.inputTarget + step);
+  else if (e.key === "ArrowUp" || e.key === "w" || e.key === "W") state.inputTarget = Math.max(0, state.inputTarget - step);
+});
+$("pong").addEventListener("mousemove", computeTargetFromEvent);
 $("btn-queue").addEventListener("click", () => {
   send({ type: "begin_matchmaking", mode: $("mode").value, difficulty: $("difficulty").value });
   setStatus("Queueing…", "");
   showControls("queueing");
+  startPractice();
   $("q-wait").textContent = "waiting…";
   $("q-band").textContent = "—";
   $("q-cands").textContent = "—";
@@ -420,9 +568,9 @@ $("btn-decline").addEventListener("click", () => {
 $("btn-p2p").addEventListener("click", () => {
   send({ type: "p2p_connected", match_token: state.matchToken });
   $("btn-p2p").style.display = "none";
-  $("btn-report-win").style.display = "";
-  $("btn-report-loss").style.display = "";
-  $("btn-report-draw").style.display = "";
+  // No report buttons for p2p: the server-authoritative pong game decides the
+  // winner and auto-resolves the match. (They stay hidden in the HTML and
+  // remain the fallback if the server runs with LOBBY_PONG=false.)
 });
 $("btn-report-win").addEventListener("click", () => {
   send({ type: "match_report", match_token: state.matchToken, winner: state.steamId, demo_hash: "web-demo" });

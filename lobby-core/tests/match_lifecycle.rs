@@ -381,6 +381,67 @@ async fn server_result_resolves() {
 }
 
 #[tokio::test]
+async fn pong_resolve_declares_winner() {
+    let store = MockStore::new();
+    let token = "pong-resolve".to_string();
+    store.players.lock().insert(100, queued_player(100, 25.0));
+    store.players.lock().insert(200, queued_player(200, 25.0));
+    store
+        .create_match(&MatchInfo {
+            match_token: token.clone(),
+            player_a: 100,
+            player_a_difficulty: MatchDifficulty::Normal,
+            player_b: 200,
+            player_b_difficulty: MatchDifficulty::Normal,
+            game_mode: "ranked_1v1".into(),
+            game_type: GameType::P2p,
+            status: MatchStatus::Reporting,
+            created_at: Utc::now(),
+            accepted_at: Some(Utc::now()),
+            started_at: Some(Utc::now()),
+            ended_at: None,
+            server_address: None,
+            join_token: None,
+            result_secret: None,
+            accepted_a: true,
+            accepted_b: true,
+            connected_a: true,
+            connected_b: true,
+        })
+        .await
+        .unwrap();
+
+    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
+    let outcome = mgr
+        .resolve_pong(&token, 100, &store, &store, &store)
+        .await
+        .unwrap();
+    match outcome {
+        lobby_core::types::MatchOutcome::Win { mu_change } => assert!(mu_change > 0.0),
+        _ => panic!("expected Win, got {outcome:?}"),
+    }
+    let m = store.get_match(&token).await.unwrap().unwrap();
+    assert_eq!(m.status, MatchStatus::Resolved);
+    let rating_100 = store
+        .ratings
+        .lock()
+        .get(&(100, "ranked_1v1".into()))
+        .cloned()
+        .unwrap();
+    assert!(rating_100.mu > 25.0, "winner's mu should increase, got {}", rating_100.mu);
+    assert_eq!(
+        store.players.lock().get(&100).unwrap().state,
+        PlayerState::InMenus,
+        "winner reset to InMenus"
+    );
+    assert_eq!(
+        store.players.lock().get(&200).unwrap().state,
+        PlayerState::InMenus,
+        "loser reset to InMenus"
+    );
+}
+
+#[tokio::test]
 async fn playing_match_expires() {
     let store = MockStore::new();
     let token = "playing-expire".to_string();

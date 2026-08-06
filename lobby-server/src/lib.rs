@@ -11,6 +11,7 @@ use tower_http::trace::TraceLayer;
 
 mod db;
 mod gameserver;
+mod pong;
 mod rate_limit;
 mod routes;
 mod state;
@@ -46,6 +47,7 @@ pub struct AppConfig {
     pub gameserver_creator_url: Option<String>,
     pub gameserver_alloc_timeout_secs: u64,
     pub gameserver_result_timeout_secs: u64,
+    pub pong_enabled: bool, // LOBBY_PONG; run p2p matches as server-authoritative pong
 }
 
 /// Build the full axum Router + shared state.
@@ -152,8 +154,10 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
             auth_dev_mode: config.auth_dev_mode,
             jwt_ttl_secs: config.jwt_ttl_secs,
             cors_origins: config.cors_origins.clone(),
+            pong_enabled: config.pong_enabled,
         },
         openid_states: std::sync::Mutex::new(std::collections::HashMap::new()),
+        pong_games: std::sync::Mutex::new(std::collections::HashMap::new()),
         ticket_limiter: RateLimiter::new(10, std::time::Duration::from_secs(60)),
         test_token_limiter: RateLimiter::new(20, std::time::Duration::from_secs(60)),
         next_generation: std::sync::atomic::AtomicU64::new(0),

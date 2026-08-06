@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 mod common; // lobby-server/tests/common.rs — TestHarness + setup()
-use common::{setup, setup_with_creator};
+use common::{setup, setup_pong, setup_with_creator};
 
 /// Poll `query` (a fresh sqlx query for `token`) until it returns a row or 5s elapses.
 /// The server processes WS reports asynchronously, so a straight fetch could race.
@@ -52,6 +52,29 @@ async fn wait_for_status(pool: &PgPool, token: &str, expected: &str) -> bool {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Like `wait_for_status` but with a caller-supplied deadline (seconds).
+/// The pong tests need up to 30s: 3 points take ~5s at base speed plus tick
+/// latency, far past `wait_for_status`'s 5s window.
+async fn wait_for_status_for(pool: &PgPool, token: &str, expected: &str, secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM matches WHERE match_token = $1",
+        )
+        .bind(token)
+        .fetch_optional(pool)
+        .await
+        .expect("query matches");
+        if status.as_deref() == Some(expected) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -1402,5 +1425,113 @@ async fn game_result_callback_security() {
     assert_eq!(resp.status(), 404);
 
     drop(p1);
+    drop(p2);
+}
+
+
+#[tokio::test]
+async fn pong_auto_resolves_on_three_points() {
+    let h = setup_pong().await;
+    let (mut p1, mut p2, token) = pair_up(&h, 110, 210, "ranked_1v1").await;
+
+    accept_and_connect(&h, &mut p1, &mut p2, &token).await;
+
+    // 110's paddle stays on the serve line (0.5); 210's parks at the top
+    // (clamps to 0.08). The deterministic serve goes toward the parked side
+    // at y = 0.5, so 110 scores every rally — regardless of which side the
+    // (racy) pairing assigns them.
+    p1.game_input(&token, 0.5).await.unwrap();
+    p2.game_input(&token, 0.05).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    p1.game_input(&token, 0.5).await.unwrap();
+    p2.game_input(&token, 0.05).await.unwrap();
+
+    // 3 points at base speed take ~5s; poll the terminal DB state for 30s.
+    assert!(
+        wait_for_status_for(&h.pool, &token, "Resolved", 30).await,
+        "first-to-3 must auto-resolve the match"
+    );
+    // `outcome` is player_a-perspective and pairing order is racy.
+    let player_a: i64 = sqlx::query_scalar("SELECT player_a FROM matches WHERE match_token = $1")
+        .bind(&token)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    let expected = if player_a as u64 == 110 { "Win" } else { "Loss" };
+    let outcome: String = sqlx::query_scalar("SELECT outcome FROM match_results WHERE match_token = $1")
+        .bind(&token)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(outcome, expected, "outcome must match player_a's perspective");
+
+    // Both players reset to the menus (resolve_agreed terminal reset).
+    let s110: String = sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = $1")
+        .bind(110i64)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    let s210: String = sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = $1")
+        .bind(210i64)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(s110, "InMenus", "winner must be free to queue again");
+    assert_eq!(s210, "InMenus", "loser must be free to queue again");
+
+    // p1's stream: at least one authoritative frame, then GameOver for 110.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let _ = wait_for_event("pong first-to-3", &mut p1, deadline, |ev| match ev {
+        ServerEvent::GameState { .. } => Some(true),
+        _ => None,
+    })
+    .await;
+    let winner = wait_for_event("pong game_over", &mut p1, deadline, |ev| match ev {
+        ServerEvent::GameOver { winner, .. } => Some(winner),
+        _ => None,
+    })
+    .await;
+    assert_eq!(winner, 110, "110 must claim the victory");
+
+    drop(p1);
+    drop(p2);
+}
+
+#[tokio::test]
+async fn pong_disconnect_forfeits_to_other() {
+    let h = setup_pong().await;
+    let (mut p1, mut p2, token) = pair_up(&h, 110, 210, "ranked_1v1").await;
+
+    accept_and_connect(&h, &mut p1, &mut p2, &token).await;
+
+    // 110 drops mid-game (no inputs sent, so no first-to-3 can win it first):
+    // the server forfeits the match to the survivor.
+    drop(p1);
+
+    assert!(
+        wait_for_status_for(&h.pool, &token, "Resolved", 10).await,
+        "a mid-game disconnect must forfeit-resolve the match"
+    );
+    let player_a: i64 = sqlx::query_scalar("SELECT player_a FROM matches WHERE match_token = $1")
+        .bind(&token)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    let expected = if player_a as u64 == 210 { "Win" } else { "Loss" };
+    let outcome: String = sqlx::query_scalar("SELECT outcome FROM match_results WHERE match_token = $1")
+        .bind(&token)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(outcome, expected, "the survivor must be recorded as the winner");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let winner = wait_for_event("forfeit game_over", &mut p2, deadline, |ev| match ev {
+        ServerEvent::GameOver { winner, .. } => Some(winner),
+        _ => None,
+    })
+    .await;
+    assert_eq!(winner, 210, "the survivor must be told it won");
+
     drop(p2);
 }

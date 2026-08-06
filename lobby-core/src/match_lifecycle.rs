@@ -261,4 +261,28 @@ impl<CB: GameCallbacks> MatchManager<CB> {
             .await
     }
 
+    /// Resolve a peer-to-peer match from the pong game's outcome
+    /// (server-authoritative, like the gameserver webhook but for Reporting).
+    pub async fn resolve_pong(
+        &self,
+        token: &str,
+        winner: SteamId,
+        match_store: &dyn MatchStore,
+        rating_store: &dyn RatingStore,
+        player_store: &dyn PlayerStore,
+    ) -> Result<MatchOutcome> {
+        let m = match_store
+            .get_match(token)
+            .await?
+            .ok_or_else(|| LobbyError::MatchNotFound(token.to_string()))?;
+        if m.status != MatchStatus::Reporting {
+            return Err(LobbyError::MatchStateMismatch(token.to_string()));
+        }
+        if winner != m.player_a && winner != m.player_b {
+            return Err(LobbyError::InvalidReport(token.to_string()));
+        }
+        self.resolve_agreed(&m, Some(winner), match_store, rating_store, player_store)
+            .await
+    }
+
 }
