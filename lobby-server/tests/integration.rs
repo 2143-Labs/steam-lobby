@@ -1535,3 +1535,50 @@ async fn pong_disconnect_forfeits_to_other() {
 
     drop(p2);
 }
+
+#[tokio::test]
+async fn queueing_survives_stale_sweep_after_reconnect() {
+    // A reconnect whose last heartbeat predates the 30s stale window must not
+    // be evicted the moment they queue: queueing itself refreshes liveness,
+    // so the entry gets the full grace period from the queue click.
+    let h = setup().await;
+
+    let mut c1 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    c1.authenticate_test_token(702, &h.base_url).await.unwrap();
+
+    // Age the player's liveness past the sweep cutoff (like a player who
+    // reconnects after their last session's heartbeats went stale).
+    sqlx::query(
+        "UPDATE player_state SET last_heartbeat = NOW() - INTERVAL '60 seconds' WHERE steam_id = $1",
+    )
+    .bind(702i64)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    c1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+
+    // Wait past two ticker ticks (2s each) — the pre-fix behavior swept the
+    // entry on the first tick after queueing.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let queued: Option<i64> = sqlx::query_scalar(
+        "SELECT steam_id FROM matchmaking_queue WHERE steam_id = 702",
+    )
+    .fetch_optional(&h.pool)
+    .await
+    .unwrap();
+    assert!(
+        queued.is_some(),
+        "a just-queued player must survive the stale sweep"
+    );
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM player_state WHERE steam_id = 702",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "Queueing", "queue state must be intact");
+
+    drop(c1);
+}

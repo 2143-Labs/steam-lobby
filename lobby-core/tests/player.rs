@@ -139,6 +139,18 @@ async fn heartbeat_refreshes_liveness() {
 }
 
 #[tokio::test]
+async fn queueing_refreshes_liveness() {
+    let store = MockStore::new();
+    let m = mgr();
+    m.enter_menus(109, &store).await.unwrap();
+    let before = store.get_player_state(109).await.unwrap().unwrap().last_heartbeat;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    m.begin_matchmaking(109, MatchDifficulty::Normal, &store).await.unwrap();
+    let after = store.get_player_state(109).await.unwrap().unwrap().last_heartbeat;
+    assert!(after > before, "queueing must refresh last_heartbeat so the stale sweep cannot evict a just-queued entry");
+}
+
+#[tokio::test]
 async fn disconnect_resets_mid_match_player_to_menus() {
     let store = MockStore::new();
     let m = mgr();

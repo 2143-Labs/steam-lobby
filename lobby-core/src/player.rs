@@ -41,7 +41,10 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
 
     /// `InMenus → Queueing`. A missing player row defaults to `InMenus`, so a
     /// player who skipped `enter_menus` can still queue; fires the
-    /// `on_player_queueing` callback, then sets the state.
+    /// `on_player_queueing` callback, sets the state, and refreshes
+    /// `last_heartbeat` — queueing is proof of life, so the stale-queue sweep
+    /// (30s since the last heartbeat) must not evict a just-queued entry whose
+    /// previous heartbeat predates the reconnect.
     pub async fn begin_matchmaking(
         &self,
         steam_id: SteamId,
@@ -65,6 +68,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
         player_store
             .set_player_state(steam_id, PlayerState::Queueing)
             .await?;
+        player_store.update_heartbeat(steam_id).await?;
         Ok(())
     }
 
