@@ -17,7 +17,7 @@ New `GET /internal/turn-credentials` endpoint. Returns:
   "username": "1786091000:steam-lobby",
   "password": "<base64(hmac-sha1(secret, username))>",
   "ttl": 3600,
-  "uris": ["turn:192.168.6.14:3478?transport=udp"]
+  "uris": ["turn:turn.john2143.com:3478?transport=udp"]
 }
 ```
 
@@ -88,7 +88,7 @@ The deterministic `PongGame` (fixed 33ms tick, velocity normalization on `sqrt` 
 
 **Only remaining step — Verizon forward:** add `45000-45063 UDP → 192.168.0.2` (3478 Both is already forwarded). Existing table forwards 50000-60000 to LiveKit — DO NOT touch that range.
 
-**Optional TLS TURN (5349):** if the lobby server's `/internal/turn-credentials` returns `turns:` URIs, add `cert` + `pkey` paths to coturn config (remove `no-tls`), provision a cert via cert-manager, and re-point the MikroTik dst-nat rule "Coturn TURN TLS" (`5349`, currently → dormant `.6.21`) at `192.168.6.14`. DNS: `turns-steam-lobby.john2143.com`.
+**Optional TLS TURN (5349):** if the lobby server's `/internal/turn-credentials` returns `turns:` URIs, add `cert` + `pkey` paths to coturn config (remove `no-tls`), provision a cert via cert-manager, and re-point the MikroTik dst-nat rule "Coturn TURN TLS" (`5349`, currently → dormant `.6.21`) at `192.168.6.14`. DNS: `turn.john2143.com` (A record → public IP, already live).
 ## 7. Lobby server in-cluster (future)
 
 `Dockerfile` already exists in the steam-lobby repo. Deploy via `workloads/steam-lobby/`:
@@ -105,11 +105,11 @@ The TURN server is deployed in `argo/workloads/steam-lobby/`:
 - Image: `coturn/coturn:4.17.0-alpine3.24`
 - Namespace: `steam-lobby`; Deployment is **unpinned** (no nodeSelector), 1 replica, `externalTrafficPolicy: Cluster` — any node forwards to the pod, so the MetalLB IP survives pod rescheduling
 - Service: LoadBalancer `192.168.6.14`, 66 declared ports: `3478` UDP+TCP and relay `45000-45063` UDP (each relay port must be a declared Service port — kube-proxy DNATs per declared port, there is no port-range concept)
-- Config: `realm=turns-steam-lobby.john2143.com`, `external-ip=192.168.6.14` (relayed transports advertise the LB IP), `use-auth-secret`, relay `min-port=45000 max-port=45063`, `no-tls`
+- Config: `realm=turns-steam-lobby.john2143.com`, `external-ip=turn.john2143.com` (resolved at startup via getaddrinfo — no hardcoded public IP; relayed transports advertise the public IP), `use-auth-secret`, relay `min-port=45000 max-port=45063`, `no-tls`
 - Auth: `render-auth` init container appends `static-auth-secret=<content of mounted steam-lobby-turn Secret>` (the option takes a literal value, not a path)
 - Router: MikroTik dst-nat `3478` TCP+UDP → `192.168.6.14` (comments "Coturn TURN TCP/UDP") and `45000-45063` UDP → `192.168.6.14` (comment "steam-lobby coturn relay"); `5349` still points at the dormant matrix coturn (we are no-TLS)
 - The matrix coturn (namespace `matrix`, realm `turns.john2143.com`) remains at 0 replicas — untouched
 
-**Verified (2026-08-07):** STUN Binding OK; TURN Allocate returns 401 challenge; **authenticated REST allocation succeeds through the LB** with relayed transport `192.168.6.14:<relay-port>` — server log shows `user <…:steam-lobby>: ALLOCATE processed, success`.
+**Verified (2026-08-07):** STUN Binding OK; TURN Allocate returns 401 challenge; **authenticated REST allocation succeeds** with relayed transport `<public-ip>:<relay-port>` (advertised via `turn.john2143.com`) — server log shows `user <…:steam-lobby>: ALLOCATE processed, success`.
 
 **Remaining for internet play:** add a Verizon forward row `45000-45063 UDP → 192.168.0.2` (3478 Both is already forwarded). LAN play needs nothing — host candidates + this STUN suffice.
