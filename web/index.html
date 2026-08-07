@@ -114,6 +114,7 @@ then start matchmaking in each.</p>
 "use strict";
 import { PongSim, PongSide } from "/pong-sim.mjs";
 import { RollbackSession } from "/pong-rollback.mjs";
+import { WrtcLink } from "/pong-wrtc.mjs";
 const $ = (id) => document.getElementById(id);
 
 // Decode the JWT payload's `sub` claim (base64url middle segment). The token
@@ -282,6 +283,7 @@ $("btn-connect").addEventListener("click", async () => {
   state.ws.onclose = () => {
     stopHeartbeat();
     stopGame();
+    if (state.link) { state.link.close(); state.link = null; }
     log("sys", "WS closed");
     if (state.ws) { state.ws = null; }
     $("btn-connect").disabled = false;
@@ -324,7 +326,7 @@ $("btn-signout").addEventListener("click", async () => {
   $("btn-steam-login").style.display = "";
   $("btn-signout").style.display = "none";
 });
-function handleServer(raw) {
+async function handleServer(raw) {
   log("in", "← " + raw);
   let msg;
   try { msg = JSON.parse(raw); } catch { return; }
@@ -458,6 +460,15 @@ function handleServer(raw) {
       // `target` is a decimal string (bit-exact wire); parseFloat is exact.
       if (state.session) state.session.remoteTarget(msg.frame, parseFloat(msg.target));
       break;
+    case "webrtc_offer":
+      state.link?.handleSignal("offer", msg.sdp);
+      break;
+    case "webrtc_answer":
+      state.link?.handleSignal("answer", msg.sdp);
+      break;
+    case "webrtc_ice":
+      state.link?.handleIce(msg.candidate);
+      break;
     case "match_result":
       const o = msg.outcome;
       // The server stores and broadcasts ONE outcome, keyed to player_a's
@@ -505,6 +516,37 @@ function handleServer(raw) {
         state.pongAcc = 0;
         state.stalled = false;
         if (!state.pongTimer) state.pongTimer = setInterval(pongLoop, 16);
+        // Create the WebRTC data channel for direct peer-to-peer inputs.
+        if (!state.link) {
+          const base = $("server-url").value.trim().replace(/\/+$/, "");
+          let iceServers = [];
+          try {
+            const resp = await fetch(base + "/internal/turn-credentials");
+            if (resp.ok) {
+              const body = await resp.json();
+              iceServers = [{ urls: body.uris, username: body.username, credential: body.password }];
+            } else {
+              log("sys", "TURN unavailable — host candidates only");
+            }
+          } catch {
+            log("sys", "TURN unavailable — host candidates only");
+          }
+          state.link = new WrtcLink({
+            role: state.iAmPlayerA ? "offer" : "answer",
+            iceServers,
+            sendSignal: (kind, payload) => send({ type: kind, match_token: state.matchToken, ...payload }),
+            onMessage: (m) => {
+              if (m.type === "game_input" && state.session) {
+                state.session.remoteTarget(m.frame, parseFloat(m.target));
+              }
+            },
+            onStateChange: (s) => {
+              log("sys", "WebRTC " + s);
+              if (s === "connected") log("sys", "inputs via data channel");
+            },
+          });
+          state.link.start();
+        }
       }
       state.session.setConfirmed(msg.frame);
       // Local desync check — meaningful only when no rollback is pending for
@@ -522,10 +564,6 @@ function handleServer(raw) {
       const oppScore = iAmLeft ? msg.right_score : msg.left_score;
       $("game-status").textContent = "You " + myScore + " – " + oppScore
         + " Opponent — ball speed ×" + (msg.speed / BALL_SPEED0).toFixed(2);
-      break;
-    case "peer_input":
-      // The opponent's real input for `frame` — feed the rollback engine.
-      if (state.session) state.session.remoteTarget(msg.frame, msg.target);
       break;
     case "input_ack":
       if (state.session) {
@@ -616,6 +654,7 @@ function pongLoop() {
     // Number and Rust str::parse round-trip exactly; serde_json's f64 parser
     // is not (off by 1 ULP for some values).
     send({ type: "game_input", match_token: state.matchToken, frame: session.frame + 1, target: state.inputTarget.toString() });
+    state.link?.send({ type: "game_input", frame: session.frame + 1, target: state.inputTarget.toString() });
     const result = session.step();
     state.stalled = result.stalled;
     if (result.snapshot) state.game = result.snapshot;
@@ -650,6 +689,7 @@ function stopGame() {
   state.practiceTimer = null;
   clearInterval(state.pongTimer);
   state.pongTimer = null;
+  if (state.link) { state.link.close(); state.link = null; }
 }
 function hexToBytes(hex) {
   const out = new Uint8Array(hex.length / 2);

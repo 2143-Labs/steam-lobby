@@ -171,6 +171,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
     tokio::spawn(ticker::tick_loop(state.clone()));
 
     let mut router = Router::new()
+        .route("/pong-wrtc.mjs", get(routes::pong_wrtc))
         .route("/", get(routes::index))
         .route("/pong-sim.mjs", get(routes::pong_sim))
         .route("/pong-rollback.mjs", get(routes::pong_rollback))

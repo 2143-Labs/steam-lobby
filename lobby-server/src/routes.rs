@@ -41,6 +41,14 @@ pub async fn pong_rollback() -> impl IntoResponse {
     )
 }
 
+/// The WebRTC glue module (`web/pong-wrtc.mjs`), embedded and served as JS.
+pub async fn pong_wrtc() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript")],
+        include_str!("../../web/pong-wrtc.mjs"),
+    )
+}
+
 #[derive(Deserialize)]
 pub struct LoginQuery {
     return_to: Option<String>,

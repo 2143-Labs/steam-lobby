@@ -21,7 +21,7 @@ itest:
 
 # JS-side determinism gauntlet + the Rust<->JS differential (needs node)
 js-test:
-  {{nix}}"node web/test/golden.mjs && node web/test/stress.mjs && node web/test/replica.mjs && node web/test/diff.mjs && cargo test -p lobby-core --test determinism -- --ignored differential_js_matches_rust"
+  {{nix}}"node web/test/golden.mjs && node web/test/stress.mjs && node web/test/replica.mjs && node web/test/diff.mjs && node web/test/wrtc.mjs && cargo test -p lobby-core --test determinism -- --ignored differential_js_matches_rust"
 
 lint:
   {{nix}}"cargo clippy --all-targets -- -D warnings"
