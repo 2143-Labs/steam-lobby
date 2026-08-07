@@ -1436,15 +1436,21 @@ async fn pong_auto_resolves_on_three_points() {
 
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
-    // 110's paddle stays on the serve line (0.5); 210's parks at the top
-    // (clamps to 0.08). The deterministic serve goes toward the parked side
-    // at y = 0.5, so 110 scores every rally — regardless of which side the
-    // (racy) pairing assigns them.
-    p1.game_input(&token, 0.5).await.unwrap();
-    p2.game_input(&token, 0.05).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    p1.game_input(&token, 0.5).await.unwrap();
-    p2.game_input(&token, 0.05).await.unwrap();
+    // The referee only advances a frame once BOTH players' inputs for it have
+    // arrived, so each side must keep sending frame-stamped inputs for the
+    // whole rally (~5s to 3 points at base speed). 110's paddle stays on the
+    // serve line (0.5); 210's parks at the top (clamps to 0.08). The
+    // deterministic serve goes toward the parked side at y = 0.5, so 110
+    // scores every rally — regardless of which side the (racy) pairing
+    // assigns them.
+    let mut frame = 0u32;
+    let deadline = std::time::Instant::now() + Duration::from_secs(7);
+    while std::time::Instant::now() < deadline {
+        p1.send_game_input(&token, frame, 0.5).await.unwrap();
+        p2.send_game_input(&token, frame, 0.05).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(33)).await;
+        frame += 1;
+    }
 
     // 3 points at base speed take ~5s; poll the terminal DB state for 30s.
     assert!(
@@ -1505,7 +1511,10 @@ async fn pong_disconnect_forfeits_to_other() {
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
     // 110 drops mid-game (no inputs sent, so no first-to-3 can win it first):
-    // the server forfeits the match to the survivor.
+    // the server forfeits the match to the survivor. close() sends a real ws
+    // Close frame (the browser demo's ws.close()) — the client must not rely
+    // on channel drops alone, which leave the socket half-open.
+    p1.close().unwrap();
     drop(p1);
 
     assert!(

@@ -1278,6 +1278,7 @@ dependencies = [
  "jsonwebtoken",
  "lobby-client",
  "lobby-core",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",

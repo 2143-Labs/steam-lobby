@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src http: https: ws: wss:; img-src data:">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline'; connect-src http: https: ws: wss:; img-src data:">
 <title>Steam Lobby — Protocol Demo</title>
 <style>
   :root { color-scheme: dark; }
@@ -93,11 +93,14 @@ connect both, then start matchmaking in each.</p>
   <div id="log"></div>
 </section>
 
-<script>
+<script type="module">
 "use strict";
+import { PongSim, PongSide } from "/pong-sim.mjs";
+import { RollbackSession } from "/pong-rollback.mjs";
 const $ = (id) => document.getElementById(id);
 const state = { ws: null, steamId: null, matchToken: null, opponentId: null, gameType: null,
-  inputTarget: 0.5, gameMode: "off", game: null, lastSentTarget: null, lastInputAt: 0,
+  inputTarget: 0.5, gameMode: "off", game: null,
+  sim: null, session: null, stalled: false, lastPongAt: 0, pongAcc: 0,
   practiceRaf: null, pongRaf: null, iAmPlayerA: undefined };
 // Consume an OpenID-issued fragment token (#token=…) if present, then strip it
 // from the URL so it isn't re-sent or stored in history.
@@ -399,20 +402,69 @@ function handleServer(raw) {
       $("server-info").style.display = "none";
       break;
     case "game_state":
-      // Server-authoritative pong frame (~30Hz). player_a is Left, player_b is
-      // Right — render your own paddle and score from your side.
+      // The referee's authoritative frame (~30Hz). The CANVAS renders the
+      // local rollback sim (responsive to your input immediately); the score
+      // and speed displays come from the server (authoritative).
       state.gameMode = "pong";
-      state.game = { left_y: msg.left_y, right_y: msg.right_y,
-        ball_x: msg.ball_x, ball_y: msg.ball_y,
-        left_score: msg.left_score, right_score: msg.right_score,
-        speed: msg.speed };
-      if (!state.pongRaf) state.pongRaf = requestAnimationFrame(pongLoop);
       state.iAmPlayerA = state.steamId === msg.player_a;
+      if (!state.session) {
+        // First frame: create the local bit-exact sim + rollback session.
+        state.sim = new PongSim();
+        state.session = new RollbackSession({
+          sim: state.sim,
+          side: state.iAmPlayerA ? PongSide.Left : PongSide.Right,
+        });
+        state.lastPongAt = performance.now();
+        state.pongAcc = 0;
+        state.stalled = false;
+        if (!state.pongRaf) state.pongRaf = requestAnimationFrame(pongLoop);
+      }
+      state.session.setConfirmed(msg.frame);
+      // Local desync check — meaningful only when no rollback is pending for
+      // this frame: a prediction that hasn't been replayed yet legitimately
+      // differs from the server. A persistent divergence with no pending
+      // rollback is a real bug → loud log.
+      const localCksum = state.session.checksumAt(msg.frame);
+      const rollbackPending = state.session.minIncorrect !== null
+        && msg.frame >= state.session.minIncorrect;
+      if (localCksum !== null && !rollbackPending && localCksum !== BigInt(msg.checksum)) {
+        log("sys", `desync at frame ${msg.frame} (server: ${msg.checksum}, local: ${localCksum})`);
+      }
       const iAmLeft = state.iAmPlayerA;
       const myScore = iAmLeft ? msg.left_score : msg.right_score;
       const oppScore = iAmLeft ? msg.right_score : msg.left_score;
       $("game-status").textContent = "You " + myScore + " – " + oppScore
         + " Opponent — ball speed ×" + (msg.speed / BALL_SPEED0).toFixed(2);
+      break;
+    case "peer_input":
+      // The opponent's real input for `frame` — feed the rollback engine.
+      if (state.session) state.session.remoteTarget(msg.frame, msg.target);
+      break;
+    case "input_ack":
+      if (state.session) {
+        state.session.setConfirmed(msg.frame);
+        // Referee health check: report the settled checksum for the confirmed
+        // frame. Skip while a rollback is pending — the local engine is
+        // converging on its own; a real (unfixable) divergence is reported on
+        // the next settled frame.
+        const pending = state.session.minIncorrect !== null
+          && msg.frame >= state.session.minIncorrect;
+        const cksum = state.session.checksumAt(msg.frame);
+        if (cksum !== null && !pending) {
+          send({
+            type: "rollback_health",
+            match_token: state.matchToken,
+            frame: msg.frame,
+            checksum: cksum.toString(),
+          });
+        }
+      }
+      break;
+    case "rollback_resync":
+      if (state.session) {
+        state.session.restore(msg.frame, hexToBytes(msg.state));
+        log("sys", `resynced to frame ${msg.frame}`);
+      }
       break;
     case "game_over":
       stopGame(); // stop both rAF loops; the canvas keeps the final frame
@@ -435,67 +487,47 @@ function handleServer(raw) {
 // ── Pong game ──
 const PONG_H = 400; // canvas height, px
 const PADDLE_H = 0.08, PADDLE_X_L = 0.03, PADDLE_X_R = 0.97;
-const PADDLE_SPEED = 0.8, BALL_SPEED0 = 0.9, SPEED_UP = 1.06, MAX_SPEED = 3.6;
+const BALL_SPEED0 = 0.9; // only for the speed display; the sim lives in PongSim
 const pongCtx = $("pong").getContext("2d");
 
 function startPractice() {
   state.gameMode = "practice";
-  state.game = { left_y: 0.5, right_y: 0.5, ball_x: 0.5, ball_y: 0.5,
-    ball_vx: BALL_SPEED0, ball_vy: 0, speed: BALL_SPEED0,
-    left_score: 0, right_score: 0 };
+  state.sim = new PongSim({ scoring: false });
   $("game-status").textContent = "Practice — waiting for opponent";
   if (!state.practiceRaf) practiceLoop(performance.now());
 }
 function practiceLoop(last) {
   if (state.gameMode !== "practice") { state.practiceRaf = null; return; }
   const t = performance.now();
-  simPractice(Math.min(0.05, (t - last) / 1000));
-  state.practiceRaf = requestAnimationFrame(() => practiceLoop(t));
-}
-function simPractice(dt) {
-  const g = state.game;
-  if (!g) return;
-  // paddles: yours follows inputTarget, the AI tracks the ball at half speed
-  const aiSpeed = PADDLE_SPEED * 0.5;
-  for (const [key, target, speed] of [["left_y", state.inputTarget, PADDLE_SPEED],
-                                      ["right_y", g.ball_y, aiSpeed]]) {
-    const maxMove = speed * dt;
-    const move = Math.max(-maxMove, Math.min(maxMove, target - g[key]));
-    g[key] = Math.max(0.08, Math.min(0.92, g[key] + move));
-  }
-  // ball: same 0..1 physics as the server game (sub-stepped so it never tunnels)
-  const steps = Math.max(1, Math.ceil(g.speed * dt / 0.005));
-  for (let i = 0; i < steps; i++) {
-    const d = dt / steps;
-    const len = Math.hypot(g.ball_vx, g.ball_vy) || 1;
-    g.ball_x += (g.ball_vx / len) * g.speed * d;
-    g.ball_y += (g.ball_vy / len) * g.speed * d;
-    if (g.ball_y < 0) { g.ball_y = -g.ball_y; g.ball_vy = -g.ball_vy; }
-    else if (g.ball_y > 1) { g.ball_y = 2 - g.ball_y; g.ball_vy = -g.ball_vy; }
-    const leftHit = g.ball_vx < 0 && Math.abs(g.ball_x - PADDLE_X_L) < 0.02
-      && Math.abs(g.ball_y - g.left_y) <= PADDLE_H;
-    const rightHit = g.ball_vx > 0 && Math.abs(g.ball_x - PADDLE_X_R) < 0.02
-      && Math.abs(g.ball_y - g.right_y) <= PADDLE_H;
-    if (leftHit) {
-      g.ball_vx = Math.abs(g.ball_vx);
-      g.ball_vy = (g.ball_y - g.left_y) * 3;
-      g.speed = Math.min(MAX_SPEED, g.speed * SPEED_UP);
-    } else if (rightHit) {
-      g.ball_vx = -Math.abs(g.ball_vx);
-      g.ball_vy = (g.ball_y - g.right_y) * 3;
-      g.speed = Math.min(MAX_SPEED, g.speed * SPEED_UP);
-    }
-  }
-  // no scoring in practice: a miss just resets the ball to center
-  if (g.ball_x < 0 || g.ball_x > 1) {
-    g.ball_x = 0.5; g.ball_y = 0.5; g.ball_vx = BALL_SPEED0; g.ball_vy = 0; g.speed = BALL_SPEED0;
-  }
+  const dt = Math.min(0.05, (t - last) / 1000);
+  const sim = state.sim;
+  sim.setTarget(PongSide.Left, state.inputTarget);
+  sim.setTarget(PongSide.Right, sim.snapshot().ball_y); // AI tracks the ball
+  sim.step(dt);
+  state.game = sim.snapshot();
   renderFrame();
+  state.practiceRaf = requestAnimationFrame(() => practiceLoop(t));
 }
 function pongLoop() {
   if (state.gameMode !== "pong") { state.pongRaf = null; return; }
-  renderFrame();
-  maybeSendInput();
+  const t = performance.now();
+  state.pongAcc += Math.min(0.05, (t - state.lastPongAt) / 1000);
+  state.lastPongAt = t;
+  const DT = 33 / 1000;
+  while (state.session && state.pongAcc >= DT && !state.stalled) {
+    state.pongAcc -= DT;
+    const session = state.session;
+    // My real input for the next frame: apply locally AND send to the
+    // server (per-frame sends are ~360 B/s — no deadband/throttle needed).
+    const frame = session.frame + 1;
+    session.localTarget(frame, state.inputTarget);
+    send({ type: "game_input", match_token: state.matchToken, frame, target: state.inputTarget });
+    const result = session.step();
+    state.stalled = result.stalled;
+    if (result.snapshot) state.game = result.snapshot;
+    if (result.rolledBack) log("sys", "rolled back to correct trajectory");
+  }
+  if (state.game) renderFrame();
   state.pongRaf = requestAnimationFrame(pongLoop);
 }
 function renderFrame() {
@@ -515,23 +547,19 @@ function renderFrame() {
   pongCtx.arc(g.ball_x * w, g.ball_y * h, 6, 0, Math.PI * 2);
   pongCtx.fill();
 }
-function maybeSendInput() {
-  if (!state.matchToken) return;
-  const now = performance.now();
-  if (now - state.lastInputAt < 50) return;
-  state.lastInputAt = now;
-  const t = state.inputTarget;
-  if (state.lastSentTarget === null || Math.abs(t - state.lastSentTarget) > 0.01) {
-    send({ type: "game_input", match_token: state.matchToken, target: t });
-    state.lastSentTarget = t;
-  }
-}
 function stopGame() {
   state.gameMode = "off";
   state.game = null;
+  state.sim = null;
+  state.session = null;
+  state.stalled = false;
   state.practiceRaf = null;
   state.pongRaf = null;
-  state.lastSentTarget = null;
+}
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
 }
 function computeTargetFromEvent(e) {
   const y = e.offsetY / PONG_H;

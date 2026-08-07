@@ -157,7 +157,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
             pong_enabled: config.pong_enabled,
         },
         openid_states: std::sync::Mutex::new(std::collections::HashMap::new()),
-        pong_games: std::sync::Mutex::new(std::collections::HashMap::new()),
+        pong_games: parking_lot::Mutex::new(std::collections::HashMap::new()),
         ticket_limiter: RateLimiter::new(10, std::time::Duration::from_secs(60)),
         test_token_limiter: RateLimiter::new(20, std::time::Duration::from_secs(60)),
         next_generation: std::sync::atomic::AtomicU64::new(0),
@@ -167,6 +167,8 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
 
     let mut router = Router::new()
         .route("/", get(routes::index))
+        .route("/pong-sim.mjs", get(routes::pong_sim))
+        .route("/pong-rollback.mjs", get(routes::pong_rollback))
         .route("/health", get(routes::health))
         .route("/modes", get(routes::modes))
         .route(

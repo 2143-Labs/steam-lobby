@@ -42,7 +42,8 @@ enum ClientMsg {
     AcceptMatch { match_token: String },
     DeclineMatch { match_token: String },
     P2pConnected { match_token: String },
-    GameInput { match_token: String, target: f64 },
+    GameInput { match_token: String, frame: u32, target: f64 },
+    RollbackHealth { match_token: String, frame: u32, checksum: String },
     MatchReport { match_token: String, winner: Option<u64>, demo_hash: Option<String> },
     Heartbeat,
 }
@@ -73,10 +74,17 @@ impl std::fmt::Debug for ClientMsg {
                 .debug_struct("P2pConnected")
                 .field("match_token", match_token)
                 .finish(),
-            ClientMsg::GameInput { match_token, target } => f
+            ClientMsg::GameInput { match_token, frame, target } => f
                 .debug_struct("GameInput")
                 .field("match_token", match_token)
+                .field("frame", frame)
                 .field("target", target)
+                .finish(),
+            ClientMsg::RollbackHealth { match_token, frame, checksum } => f
+                .debug_struct("RollbackHealth")
+                .field("match_token", match_token)
+                .field("frame", frame)
+                .field("checksum", checksum)
                 .finish(),
             ClientMsg::MatchReport { match_token, winner, demo_hash } => f
                 .debug_struct("MatchReport")
@@ -117,6 +125,7 @@ pub enum ServerEvent {
     GameServerError { match_token: String, message: String },
     GameState {
         match_token: String,
+        frame: u32,
         #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
         player_a: u64,
         #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
@@ -128,7 +137,20 @@ pub enum ServerEvent {
         left_score: u8,
         right_score: u8,
         speed: f64,
+        checksum: String,
     },
+    #[serde(rename = "input_ack")]
+    InputAck { match_token: String, frame: u32 },
+    #[serde(rename = "peer_input")]
+    PeerInput {
+        match_token: String,
+        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
+        from: u64,
+        frame: u32,
+        target: f64,
+    },
+    #[serde(rename = "rollback_resync")]
+    RollbackResync { match_token: String, frame: u32, state: String },
     GameOver {
         match_token: String,
         #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
@@ -207,7 +229,7 @@ pub enum ClientError {
 // ── Client ──
 
 pub struct LobbyClient {
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::UnboundedSender<Message>,
     rx: mpsc::UnboundedReceiver<Result<ServerEvent, ClientError>>,
 }
 
@@ -242,13 +264,17 @@ impl LobbyClient {
 
         let (mut ws_tx, mut ws_rx) = ws.split();
 
-        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<String>();
+        // The outbound channel carries `Message` (not just JSON text) so
+        // `close()` can send a real Close frame — dropping the channels alone
+        // never closes a tungstenite socket whose stream half is still parked
+        // on `next()`, and the server would not see the disconnect.
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Message>();
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel::<Result<ServerEvent, ClientError>>();
 
-        // Outbound task: send JSON frames from the channel to the socket
+        // Outbound task: send frames from the channel to the socket
         tokio::spawn(async move {
             while let Some(msg) = outgoing_rx.recv().await {
-                if ws_tx.send(Message::Text(msg.into())).await.is_err() {
+                if ws_tx.send(msg).await.is_err() {
                     break;
                 }
             }
@@ -288,7 +314,19 @@ impl LobbyClient {
 
     fn send(&self, msg: ClientMsg) -> Result<(), ClientError> {
         let text = serde_json::to_string(&msg)?;
-        self.tx.send(text).map_err(|_| ClientError::ChannelClosed)
+        self.tx
+            .send(Message::Text(text.into()))
+            .map_err(|_| ClientError::ChannelClosed)
+    }
+
+    /// Close the WebSocket cleanly (sends a Close frame, like the browser
+    /// demo's `ws.close()`). Without this, a dropped `LobbyClient` leaves the
+    /// socket half-open — its background reader task never wakes to notice the
+    /// channel closures, so the server does not see the disconnect.
+    pub fn close(&mut self) -> Result<(), ClientError> {
+        self.tx
+            .send(Message::Close(None))
+            .map_err(|_| ClientError::ChannelClosed)
     }
 
     /// Authenticate with a JWT session token. Returns player info on success.
@@ -345,10 +383,6 @@ impl LobbyClient {
         })
     }
 
-    /// Set this player's pong paddle target (normalized 0..1). Fire-and-forget.
-    pub async fn game_input(&mut self, match_token: &str, target: f64) -> Result<(), ClientError> {
-        self.send(ClientMsg::GameInput { match_token: match_token.to_string(), target })
-    }
 
     /// Leave the queue (no server response expected).
     pub async fn cancel_matchmaking(&mut self) -> Result<(), ClientError> {
@@ -374,6 +408,37 @@ impl LobbyClient {
     /// Notify the server that the P2P connection to the opponent is established.
     pub async fn p2p_connected(&mut self, match_token: &str) -> Result<(), ClientError> {
         self.send(ClientMsg::P2pConnected { match_token: match_token.to_string() })
+    }
+
+    /// Send a frame-stamped paddle target for the rollback protocol.
+    /// `frame` is the sim frame the input applies to (the client's
+    /// `session.frame + 1`).
+    pub async fn send_game_input(
+        &mut self,
+        match_token: &str,
+        frame: u32,
+        target: f64,
+    ) -> Result<(), ClientError> {
+        self.send(ClientMsg::GameInput {
+            match_token: match_token.to_string(),
+            frame,
+            target,
+        })
+    }
+
+    /// Report the local checksum for a confirmed frame (referee health check).
+    /// `checksum` is serialized as a decimal string (u64 exceeds JS precision).
+    pub async fn send_rollback_health(
+        &mut self,
+        match_token: &str,
+        frame: u32,
+        checksum: u64,
+    ) -> Result<(), ClientError> {
+        self.send(ClientMsg::RollbackHealth {
+            match_token: match_token.to_string(),
+            frame,
+            checksum: checksum.to_string(),
+        })
     }
 
     /// Submit a match result. `winner` is the victor's steam_id; `None` for a draw.

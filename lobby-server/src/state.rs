@@ -3,6 +3,7 @@
 //! (secrets stay in `SteamAuthService`); the rest are runtime-only structures.
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
+use parking_lot::Mutex as ParkMutex;
 use std::sync::Mutex as StdMutex;
 
 use lobby_core::traits::GameCallbacks;
@@ -63,7 +64,7 @@ pub struct AppState {
     /// Bumped per connection so a reconnecting client supersedes a stale one.
     pub next_generation: AtomicU64,
     /// Active pong matches: match_token -> input channel + task handle.
-    pub pong_games: StdMutex<std::collections::HashMap<String, crate::pong::ActivePong>>,
+    pub pong_games: ParkMutex<std::collections::HashMap<String, crate::pong::ActivePong>>,
 }
 
 pub struct OpenIdState {

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
-use crate::pong::PongInput;
+use crate::pong::{PongInput, RollbackHealth};
 use crate::state::{AppState, ConnectionEntry};
 
 #[derive(Debug, Deserialize)]
@@ -49,10 +49,23 @@ pub enum ClientMessage {
     P2pConnected {
         match_token: String,
     },
-    /// Pong paddle target (normalized paddle-center Y, 0..1).
+    /// Pong paddle target (normalized paddle-center Y, 0..1), frame-stamped.
+    /// `frame` is the sim frame this input applies to (the client's
+    /// `session.frame + 1`). No `#[serde(default)]` — clean cutover, the demo
+    /// is the only client; a stale tab fails to parse and gets the standard
+    /// invalid-message error.
     GameInput {
         match_token: String,
+        frame: u32,
         target: f64,
+    },
+    /// Client's per-frame checksum report (referee health check): the FNV-1a 64
+    /// checksum of the authoritative state it computed for `frame`, as a decimal
+    /// string (JS cannot hold u64 exactly). Parse failure → message ignored.
+    RollbackHealth {
+        match_token: String,
+        frame: u32,
+        checksum: String,
     },
     /// Submit a match report (`winner` None = draw).
     MatchReport {
@@ -131,8 +144,12 @@ pub enum ServerMessage {
     },
     /// Authoritative pong frame, broadcast ~30x/sec to both players.
     /// `player_a` is Left, `player_b` is Right (so each client renders itself).
+    /// `frame` is the sim frame this state is AFTER (inputs ≤ frame applied);
+    /// `checksum` is the FNV-1a 64 of the authoritative state as a decimal
+    /// string, for the clients' local desync check.
     GameState {
         match_token: String,
+        frame: u32,
         #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
         player_a: u64,
         #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
@@ -144,6 +161,31 @@ pub enum ServerMessage {
         left_score: u8,
         right_score: u8,
         speed: f64,
+        checksum: String,
+    },
+    /// The referee has advanced to `frame` — both players' inputs for it are
+    /// known and applied. Clients advance their confirmed frame on this.
+    InputAck {
+        match_token: String,
+        frame: u32,
+    },
+    /// One player's `GameInput`, relayed to the opponent so each client can
+    /// run the peer's inputs through its local rollback engine. The sender
+    /// never receives its own `PeerInput`.
+    PeerInput {
+        match_token: String,
+        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
+        from: u64,
+        frame: u32,
+        target: f64,
+    },
+    /// The client's reported checksum diverged from the referee's: here is the
+    /// authoritative 74-byte state at `frame`, hex-encoded. The client must
+    /// `restore` from it and replay its buffered inputs.
+    RollbackResync {
+        match_token: String,
+        frame: u32,
+        state: String,
     },
     /// The pong match ended (first to 3, or forfeit on disconnect).
     GameOver {
@@ -368,7 +410,7 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
         }
         // Mid-game disconnect: end the pong match and award it to the other player.
         let forfeit = {
-            let mut games = state.pong_games.lock().unwrap();
+            let mut games = state.pong_games.lock();
             let key = games
                 .iter()
                 .find(|(_, g)| g.player_a == steam_id || g.player_b == steam_id)
@@ -639,19 +681,43 @@ async fn handle_client_message(
                 }
             }
         }
-        ClientMessage::GameInput { match_token, target } => {
+        ClientMessage::GameInput { match_token, target, frame } => {
             let target = target.clamp(0.0, 1.0);
-            // Resolve the side BEFORE taking the std Mutex (a std guard is
-            // !Send and must not be held across an await).
-            let side = match state.store.get_match(&match_token).await {
-                Ok(Some(m)) if m.player_a == steam_id => Some(PongSide::Left),
-                Ok(Some(m)) if m.player_b == steam_id => Some(PongSide::Right),
+            // Resolve the side BEFORE taking the parking_lot Mutex (the guard
+            // is !Send and must not be held across an await).
+            let side_and_other = match state.store.get_match(&match_token).await {
+                Ok(Some(m)) if m.player_a == steam_id => Some((PongSide::Left, m.player_b)),
+                Ok(Some(m)) if m.player_b == steam_id => Some((PongSide::Right, m.player_a)),
                 _ => None,
             };
-            if let Some(side) = side {
-                let games = state.pong_games.lock().unwrap();
+            if let Some((side, other)) = side_and_other {
+                // Relay to the opponent: each client runs the peer's real
+                // inputs through its local rollback engine. The sender never
+                // receives its own PeerInput.
+                {
+                    let connections = state.connections.lock().await;
+                    if let Some(e) = connections.get(&other) {
+                        let _ = e.tx.send(ServerMessage::PeerInput {
+                            match_token: match_token.clone(),
+                            from: steam_id,
+                            frame,
+                            target,
+                        });
+                    }
+                }
+                let games = state.pong_games.lock();
                 if let Some(g) = games.get(&match_token) {
-                    let _ = g.input_tx.send(PongInput { side, target });
+                    let _ = g.input_tx.send(PongInput { side, target, frame });
+                }
+            }
+        }
+        ClientMessage::RollbackHealth { match_token, frame, checksum } => {
+            // Checksums travel as decimal strings (JS cannot hold u64 exactly);
+            // a malformed report is ignored.
+            if let Ok(checksum) = checksum.parse::<u64>() {
+                let games = state.pong_games.lock();
+                if let Some(g) = games.get(&match_token) {
+                    let _ = g.health_tx.send(RollbackHealth { from: steam_id, frame, checksum });
                 }
             }
         }

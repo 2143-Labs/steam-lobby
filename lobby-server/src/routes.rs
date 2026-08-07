@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,23 @@ pub async fn health() -> &'static str {
 /// so it works from any CWD and inside the Docker image.
 pub async fn index() -> Html<&'static str> {
     Html(include_str!("../../web/index.html"))
+}
+
+/// The rollback sim module (`web/pong-sim.mjs`), embedded and served as JS so
+/// the demo's `<script type="module">` can import it from the same origin.
+pub async fn pong_sim() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript")],
+        include_str!("../../web/pong-sim.mjs"),
+    )
+}
+
+/// The rollback session module (`web/pong-rollback.mjs`), same treatment.
+pub async fn pong_rollback() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript")],
+        include_str!("../../web/pong-rollback.mjs"),
+    )
 }
 
 #[derive(Deserialize)]
