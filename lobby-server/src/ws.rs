@@ -500,7 +500,7 @@ async fn authenticate(
     // ── Auth ──
     match cm {
         ClientMessage::Auth { session_token } => {
-            let (id, ver) = match state.steam_auth.validate_session_token(&session_token) {
+            let (_user_id, id, ver) = match state.steam_auth.validate_session_token(&session_token) {
                 Ok(v) => v,
                 Err(_) => {
                     tracing::warn!("auth failed (invalid session token) from {peer_ip}");

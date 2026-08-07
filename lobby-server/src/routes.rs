@@ -183,7 +183,18 @@ pub async fn steam_callback(
         .await
         .unwrap_or_else(|_| "Unknown".into());
 
-    let _ = state.store.upsert_player(steam_id, &display_name).await;
+    // Find or create the account; the Steam ID is genuinely verified here, so
+    // the ('steam', steam_id) identity row is attached. DB error fails closed.
+    let user_id = match state.store.find_or_create_user(steam_id, &display_name, true).await {
+        Ok(uid) => uid,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response();
+        }
+    };
 
     // Generate JWT bound to the current token_version (DB error fails closed).
     let version = match state.store.get_token_version(steam_id).await {
@@ -198,7 +209,7 @@ pub async fn steam_callback(
     };
     let token = match state
         .steam_auth
-        .generate_session_token(steam_id, version, state.config.jwt_ttl_secs)
+        .generate_session_token(user_id, steam_id, version, state.config.jwt_ttl_secs)
     {
         Ok(t) => t,
         Err(e) => {
@@ -249,6 +260,19 @@ pub async fn ticket_auth(
         }
     };
 
+    // Find or create the account; the ticket is genuinely verified, so the
+    // ('steam', steam_id) identity row is attached. DB error fails closed.
+    let user_id = match state.store.find_or_create_user(steam_id, "", true).await {
+        Ok(uid) => uid,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response();
+        }
+    };
+
     // DB error fails closed — never mint with version 0.
     let version = match state.store.get_token_version(steam_id).await {
         Ok(v) => v,
@@ -260,10 +284,9 @@ pub async fn ticket_auth(
                 .into_response();
         }
     };
-
     let token = match state
         .steam_auth
-        .generate_session_token(steam_id, version, state.config.jwt_ttl_secs)
+        .generate_session_token(user_id, steam_id, version, state.config.jwt_ttl_secs)
     {
         Ok(t) => t,
         Err(e) => {
@@ -299,6 +322,23 @@ pub async fn test_token(
             .into_response();
     }
 
+    // Find or create the account (dev test-token: NOT genuinely verified, so
+    // no identity row is attached). DB error fails closed.
+    let user_id = match state
+        .store
+        .find_or_create_user(body.steam_id, "", false)
+        .await
+    {
+        Ok(uid) => uid,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response();
+        }
+    };
+
     let version = match state.store.get_token_version(body.steam_id).await {
         Ok(v) => v,
         Err(_) => {
@@ -312,7 +352,7 @@ pub async fn test_token(
 
     let token = match state
         .steam_auth
-        .generate_session_token(body.steam_id, version, state.config.jwt_ttl_secs)
+        .generate_session_token(user_id, body.steam_id, version, state.config.jwt_ttl_secs)
     {
         Ok(t) => t,
         Err(e) => {
@@ -351,8 +391,8 @@ pub async fn logout(
         )
             .into_response();
     };
-    let (steam_id, _) = match state.steam_auth.validate_session_token(token) {
-        Ok(pair) => pair,
+    let (_user_id, steam_id, _) = match state.steam_auth.validate_session_token(token) {
+        Ok(triple) => triple,
         Err(_) => {
             return (
                 StatusCode::UNAUTHORIZED,

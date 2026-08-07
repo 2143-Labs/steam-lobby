@@ -22,7 +22,8 @@ pub struct SteamAuthService {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
-    sub: String,
+    sub: String, // abstract account id: users.id (UUID string)
+    sid: String, // SteamID64 decimal string — the gameplay identity
     iat: usize,
     exp: usize,
     iss: String,
@@ -201,6 +202,7 @@ impl SteamAuthService {
     /// Generate a JWT session token bound to the player's current token_version.
     pub fn generate_session_token(
         &self,
+        user_id: uuid::Uuid,
         steam_id: SteamId,
         token_version: u32,
         ttl_secs: u64,
@@ -210,7 +212,8 @@ impl SteamAuthService {
             .unwrap()
             .as_secs() as usize;
         let claims = Claims {
-            sub: steam_id.to_string(),
+            sub: user_id.to_string(),
+            sid: steam_id.to_string(),
             iat: now,
             exp: now + ttl_secs as usize,
             iss: "steam-lobby".into(),
@@ -225,8 +228,11 @@ impl SteamAuthService {
         .map_err(|e| LobbyError::SteamAuthFailed(e.to_string()))
     }
 
-    /// Validate a JWT session token; returns (steam_id, token_version).
-    pub fn validate_session_token(&self, token: &str) -> Result<(SteamId, u32)> {
+    /// Validate a JWT session token; returns (user_id, steam_id, token_version).
+    pub fn validate_session_token(
+        &self,
+        token: &str,
+    ) -> Result<(uuid::Uuid, SteamId, u32)> {
         let mut v = Validation::new(Algorithm::HS256);
         v.validate_exp = true;
         v.validate_aud = true;
@@ -238,11 +244,13 @@ impl SteamAuthService {
 
         let data = decode::<Claims>(token, &self.jwt_decoding_key, &v)
             .map_err(|e| LobbyError::SteamAuthFailed(e.to_string()))?;
+        let user_id = uuid::Uuid::parse_str(&data.claims.sub)
+            .map_err(|e| LobbyError::SteamAuthFailed(format!("invalid sub: {e}")))?;
         let steam_id = data
             .claims
-            .sub
+            .sid
             .parse::<u64>()
-            .map_err(|e| LobbyError::SteamAuthFailed(format!("invalid sub: {e}")))?;
-        Ok((steam_id, data.claims.token_version))
+            .map_err(|e| LobbyError::SteamAuthFailed(format!("invalid sid: {e}")))?;
+        Ok((user_id, steam_id, data.claims.token_version))
     }
 }

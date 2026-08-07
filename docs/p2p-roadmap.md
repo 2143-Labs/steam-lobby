@@ -62,16 +62,18 @@ Dependencies: `hmac` + `sha1` + `base64` crates in `lobby-server/Cargo.toml` (ch
 
 ## 4. Rollback networking
 
-The deterministic `PongGame` (fixed 33ms tick, velocity normalization on `sqrt` — keep the current implementation, never switch to `hypot`) is the rollback foundation.
+**Implemented (2026-08-07) — deterministic core + server-referee sync + full test gauntlet:**
 
-**Both peers run the full sim locally.** Each input carries `(seq, target)` on the data channel. Each peer:
-1. Predicts ahead with its own inputs immediately
-2. On receiving the opponent's input for an older tick, rolls back to the last common acknowledged state and replays queued inputs
-3. Every 64 ticks, sends a state checksum (FNV-1a of snapshot fields `[ball_x, ball_y, ball_vx, ball_vy, paddle_positions]`); both sides log/report desync
+- **Deterministic core, bit-exact in two languages:** `PongGame` in Rust (`lobby-core/src/pong.rs`) and `PongSim` in JS (`web/pong-sim.mjs`). Fixed `DT_SECS = 33/1000`, IEEE-exact ops only (`+ - * / sqrt abs min max clamp ceil` — never `hypot`), a canonical 74-byte `full_state()` (9 f64 LE + 2 u8 scores) with `restore()`, and a hand-written FNV-1a 64 checksum shared by both.
+- **Client rollback engine:** `web/pong-rollback.mjs` (`RollbackSession`) — per-player frame-stamped input rings, hold-last prediction, 128-frame snapshot ring, min-incorrect rollback, `restore()` resync.
+- **Server referee protocol:** the game task is now frame-gated (advances only when BOTH players' inputs for the next frame are known), broadcasts `GameState { frame, checksum }`, sends `InputAck`, relays `PeerInput`, compares client `RollbackHealth` reports against its own checksum ring, and sends `RollbackResync` (74-byte hex state) on divergence. The server's sim remains the reconciliation authority — a desync can never produce a wrong winner.
+- **Test gauntlet:** golden hashes (Rust + JS, identical literals), snapshot roundtrip, rollback equivalence, no-NaN/-0.0, arrival-order convergence, FNV vectors, GekkoNet-style rollback torture (`stress.mjs`), 3-replica convergence at delays 0/3/10 (`replica.mjs`), resync recovery, the all-10,000-frame Rust↔JS differential, and a true 3-way test against the real server (`lobby-server/tests/rollback_replica.rs`).
 
-**Server arbitration stays:** `MatchManager::resolve_pong` + disconnect forfeit are unchanged. The server's authoritative sim remains a reconciliation authority — if peers diverge, the server can force a full-state sync.
+**Remaining: the WebRTC data-channel migration.** Both peers run the full sim locally, inputs travel on the data channel instead of the ws relay, and the server becomes a pure referee (no per-frame broadcast) — the client engine and protocol messages already exist and are ready to be re-pointed.
 
-**CRC32 or FNV-1a:** FNV-1a is simple, no-alloc, and already possible with `std::hash::Hasher` on a u64. For the deterministic snapshot, hash each field as `f64::to_bits()` to avoid NaN/float-cmp issues.
+The design (deterministic core, input rings, min-incorrect rollback, confirmed frames, checksum health) mirrors GekkoNet — github.com/HeatXD/GekkoNet — the studied reference implementation.
+
+**Checksum format:** FNV-1a 64 over the 74-byte canonical state (each f64 serialized as `to_le_bytes()` — never via `std::hash`, which is SipHash with random keys).
 
 ## 5. Ping display
 

@@ -157,3 +157,42 @@ impl PlayerStore for PostgresStore {
         Ok(())
     }
 }
+
+impl PostgresStore {
+    /// Find or create the user row for a Steam ID, returning the abstract
+    /// account id (users.id). `verified` = the Steam ID came from genuine
+    /// Steam verification (OpenID callback or ticket): ensure the
+    /// ('steam', steam_id) identity row exists. Test-token minting passes
+    /// false and never creates identity rows.
+    pub async fn find_or_create_user(
+        &self,
+        steam_id: SteamId,
+        display_name: &str,
+        verified: bool,
+    ) -> Result<uuid::Uuid> {
+        let row = sqlx::query_as::<_, (uuid::Uuid,)>(
+            "INSERT INTO users (steam_id, display_name, last_login_at) \
+             VALUES ($1, $2, NOW()) \
+             ON CONFLICT (steam_id) DO UPDATE SET display_name = EXCLUDED.display_name, last_login_at = NOW() \
+             RETURNING id",
+        )
+        .bind(steam_id as i64)
+        .bind(display_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_db_error)?;
+        if verified {
+            sqlx::query(
+                "INSERT INTO user_identities (provider, provider_uid, user_id, last_login_at) \
+                 VALUES ('steam', $1, $2, NOW()) \
+                 ON CONFLICT (provider, provider_uid) DO UPDATE SET last_login_at = NOW()",
+            )
+            .bind(steam_id.to_string())
+            .bind(row.0)
+            .execute(&self.pool)
+            .await
+            .map_err(map_db_error)?;
+        }
+        Ok(row.0)
+    }
+}
