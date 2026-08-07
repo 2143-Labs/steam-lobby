@@ -100,8 +100,8 @@ import { RollbackSession } from "/pong-rollback.mjs";
 const $ = (id) => document.getElementById(id);
 const state = { ws: null, steamId: null, matchToken: null, opponentId: null, gameType: null,
   inputTarget: 0.5, gameMode: "off", game: null,
-  sim: null, session: null, stalled: false, lastPongAt: 0, pongAcc: 0,
-  practiceRaf: null, pongRaf: null, iAmPlayerA: undefined };
+  sim: null, session: null, stalled: false, lastPongAt: 0, pongAcc: 0, lastPracticeAt: 0,
+  practiceTimer: null, pongTimer: null, iAmPlayerA: undefined };
 // Consume an OpenID-issued fragment token (#token=…) if present, then strip it
 // from the URL so it isn't re-sent or stored in history.
 let fragmentToken = null;
@@ -417,7 +417,7 @@ function handleServer(raw) {
         state.lastPongAt = performance.now();
         state.pongAcc = 0;
         state.stalled = false;
-        if (!state.pongRaf) state.pongRaf = requestAnimationFrame(pongLoop);
+        if (!state.pongTimer) state.pongTimer = setInterval(pongLoop, 16);
       }
       state.session.setConfirmed(msg.frame);
       // Local desync check — meaningful only when no rollback is pending for
@@ -494,22 +494,28 @@ function startPractice() {
   state.gameMode = "practice";
   state.sim = new PongSim({ scoring: false });
   $("game-status").textContent = "Practice — waiting for opponent";
-  if (!state.practiceRaf) practiceLoop(performance.now());
+  if (!state.practiceTimer) {
+    state.lastPracticeAt = performance.now();
+    state.practiceTimer = setInterval(practiceLoop, 16);
+  }
 }
-function practiceLoop(last) {
-  if (state.gameMode !== "practice") { state.practiceRaf = null; return; }
+function practiceLoop() {
+  // setInterval (not rAF): a hidden tab fully pauses rAF, which would freeze
+  // the sim; interval-based loops degrade to ~1Hz hidden instead.
+  if (state.gameMode !== "practice") { clearInterval(state.practiceTimer); state.practiceTimer = null; return; }
   const t = performance.now();
-  const dt = Math.min(0.05, (t - last) / 1000);
+  const dt = Math.min(0.05, (t - state.lastPracticeAt) / 1000);
+  state.lastPracticeAt = t;
   const sim = state.sim;
   sim.setTarget(PongSide.Left, state.inputTarget);
   sim.setTarget(PongSide.Right, sim.snapshot().ball_y); // AI tracks the ball
   sim.step(dt);
   state.game = sim.snapshot();
   renderFrame();
-  state.practiceRaf = requestAnimationFrame(() => practiceLoop(t));
 }
 function pongLoop() {
-  if (state.gameMode !== "pong") { state.pongRaf = null; return; }
+  // setInterval (not rAF): see practiceLoop — hidden tabs must keep stepping.
+  if (state.gameMode !== "pong") { clearInterval(state.pongTimer); state.pongTimer = null; return; }
   const t = performance.now();
   state.pongAcc += Math.min(0.05, (t - state.lastPongAt) / 1000);
   state.lastPongAt = t;
@@ -528,7 +534,6 @@ function pongLoop() {
     if (result.rolledBack) log("sys", "rolled back to correct trajectory");
   }
   if (state.game) renderFrame();
-  state.pongRaf = requestAnimationFrame(pongLoop);
 }
 function renderFrame() {
   const g = state.game;
@@ -553,8 +558,10 @@ function stopGame() {
   state.sim = null;
   state.session = null;
   state.stalled = false;
-  state.practiceRaf = null;
-  state.pongRaf = null;
+  clearInterval(state.practiceTimer);
+  state.practiceTimer = null;
+  clearInterval(state.pongTimer);
+  state.pongTimer = null;
 }
 function hexToBytes(hex) {
   const out = new Uint8Array(hex.length / 2);
