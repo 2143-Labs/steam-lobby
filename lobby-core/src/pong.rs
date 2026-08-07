@@ -8,6 +8,10 @@
 
 pub const WIN_SCORE: u8 = 3;
 pub const TICK_MS: u64 = 33;
+/// The one and only sim timestep — fixed for determinism, never wall-clock.
+/// (33ms ≈ 30.3Hz; keep 33.0/1000.0 — an inexact-but-identical value in every
+/// caller, including the JS mirror and the tests.)
+pub const DT_SECS: f64 = 33.0 / 1000.0;
 
 const PADDLE_HALF_HEIGHT: f64 = 0.08;
 const PADDLE_X_LEFT: f64 = 0.03;
@@ -113,6 +117,62 @@ impl PongGame {
         }
     }
 
+    pub const STATE_BYTES: usize = 74; // 9×f64 LE + 2×u8
+
+    /// Canonical serialization of the whole game state: 9 f64 little-endian —
+    /// `left_y, right_y, ball_x, ball_y, ball_vx, ball_vy, speed, left_target,
+    /// right_target` — then 2 u8 — `left_score, right_score`. `left_target`/
+    /// `right_target` use the sentinel `-1.0` for `None` (targets are clamped
+    /// to 0..1, so `-1.0` is unreachable). No padding. Bit-identical to the JS
+    /// mirror's `fullState()` in `web/pong-sim.mjs`.
+    pub fn full_state(&self) -> [u8; Self::STATE_BYTES] {
+        let mut out = [0u8; Self::STATE_BYTES];
+        let mut i = 0;
+        for v in [
+            self.left_y,
+            self.right_y,
+            self.ball_x,
+            self.ball_y,
+            self.ball_vx,
+            self.ball_vy,
+            self.speed,
+            self.left_target.unwrap_or(-1.0),
+            self.right_target.unwrap_or(-1.0),
+        ] {
+            out[i..i + 8].copy_from_slice(&v.to_le_bytes());
+            i += 8;
+        }
+        out[72] = self.left_score;
+        out[73] = self.right_score;
+        out
+    }
+
+    /// Inverse of `full_state()`. Any byte array produced by `full_state()`
+    /// (from this sim or the JS mirror) restores an identical game.
+    pub fn restore(&mut self, bytes: &[u8; Self::STATE_BYTES]) {
+        let mut vals = [0.0f64; 9];
+        for (v, chunk) in vals.iter_mut().zip(bytes.chunks_exact(8)) {
+            *v = f64::from_le_bytes(chunk.try_into().unwrap());
+        }
+        self.left_y = vals[0];
+        self.right_y = vals[1];
+        self.ball_x = vals[2];
+        self.ball_y = vals[3];
+        self.ball_vx = vals[4];
+        self.ball_vy = vals[5];
+        self.speed = vals[6];
+        self.left_target = if vals[7] < 0.0 { None } else { Some(vals[7]) };
+        self.right_target = if vals[8] < 0.0 { None } else { Some(vals[8]) };
+        self.left_score = bytes[72];
+        self.right_score = bytes[73];
+    }
+
+    /// FNV-1a 64 over `full_state()` — the per-frame determinism checksum
+    /// shared with the JS mirror and the server referee protocol.
+    pub fn checksum(&self) -> u64 {
+        fnv1a64(&self.full_state())
+    }
+
     pub fn winner(&self) -> Option<PongSide> {
         if self.left_score >= WIN_SCORE {
             Some(PongSide::Left)
@@ -197,6 +257,19 @@ impl PongGame {
     }
 }
 
+/// FNV-1a 64 (offset basis `0xcbf29ce484222325`, prime `0x100000001b3`).
+/// Hand-written byte loop — `std::collections::hash_map::DefaultHasher` is
+/// SipHash with a random per-process key and MUST NOT be used for a checksum
+/// that must be reproducible across languages and runs.
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 impl Default for PongGame {
     fn default() -> Self {
         Self::new()
@@ -211,7 +284,7 @@ mod tests {
     fn ball_serves_toward_right_and_moves() {
         let mut g = PongGame::new();
         for _ in 0..10 {
-            g.step(1.0 / 30.0);
+            g.step(DT_SECS);
         }
         assert!(g.snapshot().ball_x > 0.5, "serve must move right");
     }
@@ -225,7 +298,7 @@ mod tests {
         g.set_target(PongSide::Right, 0.5);
         let mut steps = 0;
         while g.snapshot().speed < MAX_SPEED && steps < 200_000 {
-            g.step(1.0 / 30.0);
+            g.step(DT_SECS);
             steps += 1;
         }
         assert!(
@@ -243,7 +316,7 @@ mod tests {
         g.set_target(PongSide::Right, 0.05); // park Right at the top (clamps to 0.08)
         let mut steps = 0;
         while g.snapshot().left_score == 0 && steps < 100_000 {
-            g.step(1.0 / 30.0);
+            g.step(DT_SECS);
             steps += 1;
         }
         let s = g.snapshot();
@@ -260,7 +333,7 @@ mod tests {
         g.set_target(PongSide::Right, 0.05); // Right concedes every serve
         let mut steps = 0;
         while g.winner().is_none() && steps < 100_000 {
-            g.step(1.0 / 30.0);
+            g.step(DT_SECS);
             steps += 1;
         }
         assert_eq!(g.winner(), Some(PongSide::Left));
@@ -275,7 +348,7 @@ mod tests {
         g.set_target(PongSide::Left, 0.0);
         let mut min_y = 1.0f64;
         for _ in 0..30 {
-            g.step(1.0 / 30.0);
+            g.step(DT_SECS);
             min_y = min_y.min(g.snapshot().left_y);
         }
         assert!(

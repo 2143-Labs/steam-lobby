@@ -2,7 +2,7 @@
 //! shared `lobby_core::pong` logic and broadcasts frames to both players.
 use std::sync::Arc;
 
-use lobby_core::pong::{PongGame, PongSide, TICK_MS};
+use lobby_core::pong::{PongGame, PongSide, DT_SECS, TICK_MS};
 
 use lobby_core::traits::MatchStore;
 
@@ -47,7 +47,7 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                 game.set_target(i.side, i.target);
             }
             // 3. step physics
-            game.step(TICK_MS as f64 / 1000.0);
+            game.step(DT_SECS);
             // 4. broadcast the authoritative frame to both players' connections
             let snap = game.snapshot();
             {
