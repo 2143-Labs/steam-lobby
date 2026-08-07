@@ -69,6 +69,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pong_enabled: std::env::var("LOBBY_PONG")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(true),
+        turn_secret: std::env::var("LOBBY_TURN_SECRET").ok().filter(|s| !s.is_empty()),
+        turn_uris: std::env::var("LOBBY_TURN_URIS")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_else(|_| vec!["turn:turn.john2143.com:3478?transport=udp".into()]),
     };
 
     let (app, _state) = build_app(config).await;

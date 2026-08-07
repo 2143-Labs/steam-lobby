@@ -18,19 +18,19 @@ pub struct TestHarness {
 
 
 pub async fn setup() -> TestHarness {
-    setup_full(false, None).await
+    setup_full(false, None, None).await
 }
 
 /// Harness with the pong game enabled (LOBBY_PONG = true) for p2p matches.
 pub async fn setup_pong() -> TestHarness {
-    setup_full(true, None).await
+    setup_full(true, None, None).await
 }
 
 pub async fn setup_with_creator(creator_url: Option<&str>) -> TestHarness {
-    setup_full(false, creator_url).await
+    setup_full(false, creator_url, None).await
 }
 
-async fn setup_full(pong_enabled: bool, creator_url: Option<&str>) -> TestHarness {
+async fn setup_full(pong_enabled: bool, creator_url: Option<&str>, turn_secret: Option<String>) -> TestHarness {
     let _lock_guard = DB_LOCK.lock().await;
 
     let root_url = "postgres://lobby:lobby@localhost:5432/lobby";
@@ -88,6 +88,8 @@ async fn setup_full(pong_enabled: bool, creator_url: Option<&str>) -> TestHarnes
         gameserver_alloc_timeout_secs: 60,
         gameserver_result_timeout_secs: 300,
         pong_enabled,
+        turn_secret,
+        turn_uris: vec!["turn:turn.john2143.com:3478?transport=udp".into()],
     };
 
     let (app, state) = build_app(config).await; // runs migrations + spawns ticker
@@ -110,4 +112,8 @@ async fn setup_full(pong_enabled: bool, creator_url: Option<&str>) -> TestHarnes
         _server: server,
         _lock_guard,
     }
+}
+
+pub async fn setup_with_turn(turn_secret: Option<&str>) -> TestHarness {
+    setup_full(true, None, turn_secret.map(String::from)).await
 }

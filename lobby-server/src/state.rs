@@ -28,6 +28,10 @@ pub struct RuntimeConfig {
     pub cors_origins: Vec<String>,
     /// Pong: run p2p matches as server-authoritative pong games (LOBBY_PONG).
     pub pong_enabled: bool,
+    /// LOBBY_TURN_SECRET; None => /internal/turn-credentials returns 503.
+    pub turn_secret: Option<String>,
+    /// LOBBY_TURN_URIS; TURN server URIs returned to clients.
+    pub turn_uris: Vec<String>,
 }
 
 pub struct AppState {

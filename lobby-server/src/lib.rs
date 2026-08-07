@@ -17,6 +17,7 @@ mod routes;
 mod state;
 mod steam_auth;
 mod ticker;
+mod turn;
 mod ws;
 
 use db::PostgresStore;
@@ -48,6 +49,8 @@ pub struct AppConfig {
     pub gameserver_alloc_timeout_secs: u64,
     pub gameserver_result_timeout_secs: u64,
     pub pong_enabled: bool, // LOBBY_PONG; run p2p matches as server-authoritative pong
+    pub turn_secret: Option<String>, // LOBBY_TURN_SECRET; None => /internal/turn-credentials 503s
+    pub turn_uris: Vec<String>,      // LOBBY_TURN_URIS; TURN URIs returned to clients
 }
 
 /// Build the full axum Router + shared state.
@@ -155,6 +158,8 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
             jwt_ttl_secs: config.jwt_ttl_secs,
             cors_origins: config.cors_origins.clone(),
             pong_enabled: config.pong_enabled,
+            turn_secret: config.turn_secret.clone(),
+            turn_uris: config.turn_uris.clone(),
         },
         openid_states: std::sync::Mutex::new(std::collections::HashMap::new()),
         pong_games: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -179,6 +184,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         .route("/auth/steam/login", get(routes::steam_login))
         .route("/auth/steam/callback", get(routes::steam_callback))
         .route("/auth/ticket", axum::routing::post(routes::ticket_auth))
+        .route("/internal/turn-credentials", get(routes::turn_credentials))
         .route("/auth/logout", axum::routing::post(routes::logout))
         .route("/ws", get(ws::ws_route));
 

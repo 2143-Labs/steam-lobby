@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{Html, IntoResponse, Redirect};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -527,6 +527,16 @@ pub async fn auth_config(State(state): State<Arc<AppState>>) -> Json<serde_json:
         "steam_login": state.config.public_url.is_some(),
         "dev_mode": state.config.auth_dev_mode,
     }))
+}
+
+/// Return TURN REST-auth credentials for a WebRTC peer connection.
+/// 503 when LOBBY_TURN_SECRET is unset (host candidates only).
+pub async fn turn_credentials(State(state): State<Arc<AppState>>) -> Response {
+    let Some(secret) = &state.config.turn_secret else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "turn not configured"}))).into_response();
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    Json(crate::turn::mint_turn_credentials(secret, 3600, now, &state.config.turn_uris)).into_response()
 }
 
 /// Dev-only fake creator: returns a (simulated) server address and auto-reports

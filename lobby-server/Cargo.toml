@@ -22,6 +22,9 @@ dotenvy = "0.15"
 uuid = "1"
 url = "2"
 parking_lot = "0.12"
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
 
 [dev-dependencies]
 lobby-client = { path = "../lobby-client" }
