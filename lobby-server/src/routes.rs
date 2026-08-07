@@ -519,6 +519,16 @@ pub async fn modes(State(state): State<Arc<AppState>>) -> Json<serde_json::Value
     Json(serde_json::json!({ "modes": state.game_modes.iter().map(|(n, t)| ModeInfo { name: n.clone(), game_type: *t }).collect::<Vec<_>>() }))
 }
 
+/// Auth surface capabilities the demo uses to gate its login UI:
+/// `steam_login` is on when a public origin is configured (OpenID needs an
+/// absolute callback), `dev_mode` when the test-token endpoint is exposed.
+pub async fn auth_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "steam_login": state.config.public_url.is_some(),
+        "dev_mode": state.config.auth_dev_mode,
+    }))
+}
+
 /// Dev-only fake creator: returns a (simulated) server address and auto-reports
 /// player_a's win 3s after allocation, exercising the full webhook path.
 pub async fn mock_allocate(

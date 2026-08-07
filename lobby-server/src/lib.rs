@@ -171,6 +171,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         .route("/pong-rollback.mjs", get(routes::pong_rollback))
         .route("/health", get(routes::health))
         .route("/modes", get(routes::modes))
+        .route("/auth/config", get(routes::auth_config))
         .route(
             "/internal/game-result/{token}/{secret}",
             axum::routing::post(routes::game_result),

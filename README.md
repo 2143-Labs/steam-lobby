@@ -38,6 +38,13 @@ repo is the same file). Give each tab a distinct steam ID, connect both, and
 start matchmaking in each — the demo talks to the dev-only `/auth/test-token`
 endpoint, no real Steam API calls involved.
 
+For a **genuine** Steam login, click the "Sign in through Steam" button in the
+demo instead. It redirects to `steamcommunity.com/openid/login` and back with
+a `#token=` session — no Steam API key needed (display names then read
+"Unknown" unless `STEAM_API_KEY` is set). In dev, point `PUBLIC_URL` at a
+public origin that reaches your server (reverse proxy or tunnel) and browse
+the demo through that origin — Steam OpenID requires an absolute callback URL.
+
 ## Quickstart (non-NixOS)
 
 Works on any Linux, macOS, or WSL2 — and on Windows via WSL2 or Git Bash.
@@ -69,6 +76,7 @@ need a POSIX shell. Use WSL2 or Git Bash, or run the server directly:
 | POST | `/auth/test-token` | Dev-only: JWT for any steam_id (only when `AUTH_DEV_MODE=true`) |
 | POST | `/auth/logout` | Revoke the current session token (all earlier tokens die) |
 | GET | `/modes` | Configured matchmaking modes + their game types (the demo dropdown) |
+| GET | `/auth/config` | Auth surface capabilities `{ steam_login, dev_mode }` — the demo gates its login UI on this |
 | POST | `/internal/game-result/{token}/{secret}` | Gameserver result webhook; the URL itself is the auth |
 
 | Variable | Default | Description |
@@ -107,20 +115,30 @@ INFO lobby_server: auth mode: TEST  — /auth/test-token enabled
 INFO lobby_server: auth mode: STEAM — ticket + OpenID verification against Steam (appid 480)
 ```
 
-Or probe it: `POST /auth/test-token` returns a JWT when `AUTH_DEV_MODE=true` and
-`404` otherwise. The web demo (`web/index.html`) needs `AUTH_DEV_MODE=true` and
-your demo origin listed in `CORS_ORIGINS`; its Connect button uses the
-test-token endpoint (or a `#token=` fragment from a Steam login, if present).
+Or probe `GET /auth/config` — it returns `{ "steam_login": …, "dev_mode": … }`
+(`steam_login` = `PUBLIC_URL` is set, so the Steam button is offered; `dev_mode`
+= `/auth/test-token` is exposed). `POST /auth/test-token` returns a JWT when
+`AUTH_DEV_MODE=true` and `404` otherwise. The web demo (`web/index.html`) fetches
+`/auth/config` on load and shows only the login surfaces the server actually
+offers: the Steam button, the dev steam-ID field, or both. Offline (e.g. opened
+from `file://`) it shows both so the dev flow still works. Its Connect button
+uses the test-token endpoint (or a `#token=` fragment from a Steam login, if
+present); when dev mode is off and no fragment token exists, Connect shows an
+error — only genuine Steam logins work in production.
 
 ## WebSocket Quick Test
 
-With `AUTH_DEV_MODE=true`, the dev-only token endpoint is enabled. Get a JWT and connect:
+With `AUTH_DEV_MODE=true`, the dev-only token endpoint is enabled. Get a JWT, then
+send it in the **first WebSocket frame** — the server reads the session token
+from the opening `auth` message, not from an HTTP header:
 
 ```bash
 TOKEN=$(curl -s -X POST http://localhost:8080/auth/test-token \
   -H 'Content-Type: application/json' \
   -d '{"steam_id": 12345}' | jq -r '.token')
-wscat -c "ws://localhost:8080/ws" -H "Authorization: Bearer $TOKEN"
+wscat -c "ws://localhost:8080/ws"
+# first message, once connected:
+# {"type":"auth","session_token":"<paste TOKEN>"}
 ```
 
 The Rust reference client (`lobby-client`) has a helper for this flow:
@@ -156,10 +174,16 @@ docs, `GetAuthTicketForWebApi` → `AuthenticateUserTicket`:
    appid. The default `480` (Spacewar) only works for testing.
 OpenID browser login requires `PUBLIC_URL` set to the public origin (e.g.
 `https://lobby.example.com`) — the login endpoint answers `400` without it.
-Each login gets a one-time random `state`, bound to the exact `return_to`;
-replaying a callback, or presenting a `return_to` that does not match the
-issued state, is rejected. The session JWT is delivered as a URL **fragment**
-(`#token=…`), never as a query parameter.
+The demo's "Sign in through Steam" button (Valve's official asset, embedded as
+a data URI so the page stays CSP-clean and offline-capable) hits
+`GET /auth/steam/login?return_to=/`. Each login gets a one-time random `state`,
+bound to the exact `return_to`; replaying a callback, or presenting a
+`return_to` that does not match the issued state, is rejected. The session JWT
+is delivered as a URL **fragment** (`#token=…`), never as a query parameter.
+Development can exercise genuine logins too: set `PUBLIC_URL` to a public
+origin that reaches the dev server (reverse proxy/tunnel), keep
+`AUTH_DEV_MODE=true` if you also want the test-token field, and browse the demo
+via that origin.
 
 Transport note: the server is plain HTTP by design — terminate TLS at a reverse
 proxy (nginx/Caddy) in front of it. Without TLS the JWT and tickets travel in
@@ -193,18 +217,87 @@ Every pairing, accept, and decline is appended to the `match_events` audit table
 | lobby-core | `match_lifecycle.rs` / `match_expiry.rs` | MatchManager player actions / expiry |
 | lobby-core | `mmr.rs` | Weng-Lin rating math |
 | lobby-core | `error.rs` | `LobbyError` + `Result` |
-| lobby-server | `lib.rs` | App assembly (`build_app`) |
+| lobby-server | `steam_auth.rs` | Steam ticket/OpenID auth + JWT (claims: `sub` = account UUID, `sid` = SteamID64) |
+| lobby-server | `db/players.rs` | `PlayerStore` impl + `find_or_create_user` (find-or-create identity attach) |
+| lobby-server | `migrations/` | Schema; `users.id` (UUID) is the provider-agnostic account key, `user_identities` maps `(provider, provider_uid)` → account |
+| lobby-server | `db/` | Other `PostgresStore` impls (one file per store trait) |
 | lobby-server | `state.rs` | `AppState` composition root |
 | lobby-server | `ws.rs` | WebSocket protocol |
 | lobby-server | `ticker.rs` | 2s maintenance loop (7 phases) |
 | lobby-server | `routes.rs` | HTTP endpoints |
-| lobby-server | `steam_auth.rs` | Steam ticket/OpenID auth + JWT |
-| lobby-server | `db/` | `PostgresStore` impls (one file per store trait) |
 | lobby-server | `gameserver.rs` | Gameserver creator client |
 | lobby-server | `rate_limit.rs` | Rate limiter |
 | lobby-client | `lib.rs` | WS client + `ServerEvent` types (demo + integration tests) |
 | tests | `lobby-core/tests/` | Common mocks + lifecycle/player/rating suites |
 | tests | `lobby-server/tests/` | Integration suite + common harness |
+
+
+## Adding another login provider (Discord / au.2143.me — blueprint)
+
+Steam login is implemented directly (OpenID 2.0 against `steamcommunity.com`).
+Discord, au.2143.me (Pocket ID OIDC), and any future provider follow the
+registry pattern proven by john2143.com — a declarative provider registry plus
+generic login/callback dispatch, **not** per-provider route copies. Nothing in
+the schema or JWT changes when a second provider lands: the JWT `sub` is
+already the abstract `users.id`, and `user_identities` maps
+`(provider, provider_uid)` → account.
+
+**Provider config** (new `lobby-server/src/auth_providers.rs`; mirror
+`john2143.com/src/auth/providers.ts`):
+
+```rust
+struct Provider {
+    id: String,                                   // "discord", "au2143", …
+    kind: ProviderKind,                           // openid2 | oauth2 | oidc
+    authorization_endpoint: Option<String>,       // oauth2/oidc
+    issuer: Option<String>,                       // oidc: discovery well-known
+    token_endpoint: Option<String>,
+    userinfo_endpoint: Option<String>,
+    client_id: String,
+    client_secret: String,
+    scopes: Vec<String>,
+    id_field: String,                             // claim holding provider_uid
+    map_user: fn(userinfo) -> (String, String),   // (provider_uid, display_name)
+}
+```
+
+Steam is `kind: openid2` (no token endpoint or code; the existing
+`openid_redirect_url`/`verify_openid`). Discord is `oauth2`: `identify` scope,
+`state` for CSRF, token exchange at `discord.com/api/oauth2/token`
+(form-urlencoded, Basic auth), identity from `GET /users/@me`, `id_field: "id"`.
+Pocket ID is `oidc`: discovery at `https://au.2143.me/.well-known/openid-configuration`,
+scopes `openid profile email groups`, `id_field: "sub"`.
+
+**Generic routes:** `GET /auth/{provider}/login` issues a one-time `state` (and,
+for `oauth2`/`oidc`, a PKCE S256 `code_verifier` stored beside it);
+`GET /auth/{provider}/callback` consumes the state, exchanges/verifies, then
+calls `find_or_create_user` generalized to `(provider, provider_uid,
+display_name, verified)` and mints the same JWT. The `UNIQUE (user_id, provider)`
+constraint enforces one identity per provider per account.
+
+**State storage:** keep the in-memory `openid_states` map (600s TTL, 4096 cap)
+while the server is single-instance; move state to a DB table with a TTL index
+if multi-instance deployment ever happens.
+
+**Account linking:** a signed-in user clicks "Link \<provider>" →
+`GET /auth/link/{provider}`, which issues the same one-time state but stores
+`linking_user_id` (from the session JWT) in it. The callback verifies the
+provider identity, then runs
+`INSERT INTO user_identities (provider, provider_uid, user_id) VALUES ($1, $2, <linking_user_id>)
+ON CONFLICT (provider, provider_uid) DO NOTHING` — attaching instead of
+find-or-create. `UNIQUE (user_id, provider)` rejects linking a second identity
+of the same provider; the `(provider, provider_uid)` PK makes an identity
+already owned by another user an error (never silently re-attach).
+
+**Display names:** future providers supply one via `map_user` (Discord
+`global_name`/`username`, Pocket ID `preferred_username`/`name`); Steam keeps
+`GetPlayerSummaries`.
+
+**Out of scope by design:** Steam's partner-gated Web API OAuth
+(`ISteamUserOAuth` — Client ID granted only for Cloud/Workshop delegation) is
+not a login mechanism and is not planned; login stays OpenID 2.0. No IdP
+delegation for Steam either (Keycloak lacks native OpenID 2.0 support) —
+au.2143.me/Pocket ID is consumed only as a secondary `oidc` provider.
 
 ## Client Protocol
 
