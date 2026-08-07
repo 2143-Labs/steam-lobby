@@ -14,17 +14,28 @@ New `GET /internal/turn-credentials` endpoint. Returns:
 
 ```json
 {
-  "username": "1723000000:steam-lobby",
+  "username": "1786091000:steam-lobby",
   "password": "<base64(hmac-sha1(secret, username))>",
-  "ttl": 86400,
-  "uris": ["turn:192.168.5.68:3478?transport=udp"]
+  "ttl": 3600,
+  "uris": ["turn:192.168.6.14:3478?transport=udp"]
 }
 ```
 
-coturn `use-auth-secret` validates this scheme exactly. The HMAC key is the `turn_secret` from the k8s Secret `steam-lobby-turn`. Needs `LOBBY_TURN_SECRET` env var on the lobby-server process (read in `main.rs`, wired into `AppState`). If the env var is absent, the endpoint returns 503.
+**The exact REST scheme (verified against coturn 4.17.0, 2026-08-07):**
+- `username = "<unix-expiry-seconds>:<user>"` (or the timestamp alone)
+- `password = base64(HMAC-SHA1(shared-secret, username))` — the secret is the *literal* value, key = the full username string
+- The TURN client then does the 401 challenge dance: it receives `realm` (`turns-steam-lobby.john2143.com`) and `nonce`, and sends the authenticated Allocate with:
+  - `MESSAGE-INTEGRITY = HMAC-SHA1(key, message)` where `key = MD5(username:realm:password)` and the message is the STUN message **up to (excluding) the MI attribute**, with the header length field set to the final length
+  - All attributes padded to 4-byte boundaries (STUN wire format — unpadded attributes silently break parsing)
+- This is exactly what `lobby-server` must not reimplement: the `iceServers` config only needs `{ urls, username, credential }` — WebRTC's `RTCPeerConnection` handles the 401/realm/nonce/MI dance natively.
 
-Dependencies: `hmac` + `sha1` + `base64` crates in `lobby-server/Cargo.toml` (check if available; otherwise add `hmac = "0.12"` and `sha1 = "0.10"`; no existing HMAC dep in the workspace).
+Server-side gotchas (all fixed in the deployment):
+- coturn's `static-auth-secret` takes a **literal secret value, NOT a file path** — a path is used as the secret itself (this silently broke the original config, which pointed at the mounted Secret file). The deployment now renders the config via a `render-auth` init container that appends `static-auth-secret=<mounted secret content>`.
+- The deployment advertises the MetalLB IP via `external-ip=192.168.6.14` so relayed transports come back as `192.168.6.14:<port>` (reachable through the LB), never the pod IP.
 
+Needs `LOBBY_TURN_SECRET` env var on the lobby-server process (read in `main.rs`, wired into `AppState`). If unset, the endpoint returns 503. When the lobby moves in-cluster, mount the `steam-lobby-turn` Secret directly.
+
+Dependencies: `hmac` + `sha1` + `base64` crates in `lobby-server/Cargo.toml` (check if available; otherwise add `hmac = "0.12"` and `sha1 = "0.10"`).
 ## 3. WebRTC signaling + data channel
 
 **New message types** in `lobby-server/src/ws.rs` (`ClientMessage` / `ServerMessage` — use snake_case variants matching existing `lobby_match_*` / `game_input` style):
@@ -73,18 +84,11 @@ The deterministic `PongGame` (fixed 33ms tick, velocity normalization on `sqrt` 
 
 ## 6. Internet play
 
-**MikroTik dst-nat** (manual, outside repo):
-- WAN UDP 3478 → 192.168.5.68:3478 (STUN/TURN allocation)
-- WAN UDP 45000-49999 → 192.168.5.68:45000-49999 (TURN relay range)
-- Add matching Verizon Fios forward rows (existing table forwards 50000-60000 to LiveKit — DO NOT touch that range)
+**Current state (2026-08-07):** the MikroTik dst-nat for `3478` (rules 16/17) already targets `192.168.6.14`, and the relay range `45000-45063` UDP → `192.168.6.14` (rule 22) is in place. The LB path needs **no node firewall changes** (kube-proxy DNATs in PREROUTING; the `nixos-fw` INPUT chain on the nodes only filters host-destined traffic).
 
-**Optional TLS TURN (5349):** if the lobby server's `/internal/turn-credentials` returns `turns:` URIs, add `cert` + `pkey` paths to coturn config (remove `no-tls`) and provision a cert via cert-manager. DNS: `turns-steam-lobby.john2143.com` → MikroTik → 192.168.6.14 (or node IP).
+**Only remaining step — Verizon forward:** add `45000-45063 UDP → 192.168.0.2` (3478 Both is already forwarded). Existing table forwards 50000-60000 to LiveKit — DO NOT touch that range.
 
-**Node firewall:** the k3s node nftables on `big` currently blocks UDP traffic outside established/related + flannel VXLAN. The NodePort range (30000-32767) allows TCP only. Internet play needs one of:
-- Runtime `iptables -I nixos-fw -p udp --dport 3478 -j nixos-fw-accept` on each relevant node, OR
-- A NixOS `networking.firewall.allowedUDPPorts = [ 3478 45000 45100 ... 49999 ]` on the k3s nodes' NixOS config, OR
-- MetalLB with BGP properly routing to the workstation LAN so the LB IP reachable path bypasses node INPUT
-
+**Optional TLS TURN (5349):** if the lobby server's `/internal/turn-credentials` returns `turns:` URIs, add `cert` + `pkey` paths to coturn config (remove `no-tls`), provision a cert via cert-manager, and re-point MikroTik dst-nat rule 18 (`5349`, currently → dormant `.6.21`) at `192.168.6.14`. DNS: `turns-steam-lobby.john2143.com`.
 ## 7. Lobby server in-cluster (future)
 
 `Dockerfile` already exists in the steam-lobby repo. Deploy via `workloads/steam-lobby/`:
@@ -95,16 +99,17 @@ The deterministic `PongGame` (fixed 33ms tick, velocity normalization on `sqrt` 
 
 ---
 
-## Coturn deployment (2026-08-07)
+## Coturn deployment (2026-08-07, verified end-to-end)
 
 The TURN server is deployed in `argo/workloads/steam-lobby/`:
 - Image: `coturn/coturn:4.17.0-alpine3.24`
-- Namespace: `steam-lobby`
-- Service: LoadBalancer `192.168.6.14:3478` (STUN/TURN allocation)
-- Relay range: 45000-49999 (configured in coturn, but reachability depends on firewall — see section 6)
-- Auth: HMAC-SHA1 shared-secret (`steam-lobby-turn` Secret, key `turn_secret`)
+- Namespace: `steam-lobby`; Deployment is **unpinned** (no nodeSelector), 1 replica, `externalTrafficPolicy: Cluster` — any node forwards to the pod, so the MetalLB IP survives pod rescheduling
+- Service: LoadBalancer `192.168.6.14`, 66 declared ports: `3478` UDP+TCP and relay `45000-45063` UDP (each relay port must be a declared Service port — kube-proxy DNATs per declared port, there is no port-range concept)
+- Config: `realm=turns-steam-lobby.john2143.com`, `external-ip=192.168.6.14` (relayed transports advertise the LB IP), `use-auth-secret`, relay `min-port=45000 max-port=45063`, `no-tls`
+- Auth: `render-auth` init container appends `static-auth-secret=<content of mounted steam-lobby-turn Secret>` (the option takes a literal value, not a path)
+- Router: MikroTik dst-nat `3478` TCP+UDP → `192.168.6.14` (rules 16/17) and `45000-45063` UDP → `192.168.6.14` (rule 22); `5349` still points at the dormant matrix coturn (we are no-TLS)
 - The matrix coturn (namespace `matrix`, realm `turns.john2143.com`) remains at 0 replicas — untouched
 
-**Status (2026-08-07):** STUN binding verified working end-to-end. A raw STUN Binding Request (`00 01 00 00 21 12 A4 42` + 12-byte txid) sent to `192.168.6.14:3478/UDP` from the office LAN returns a Binding Success. The pod IP, LoadBalancer IP, and NodePort paths all respond. The earlier "no STUN response" failures were caused by a malformed test probe (an extra 4 zero bytes shifted the magic cookie), not by coturn or the network.
+**Verified (2026-08-07):** STUN Binding OK; TURN Allocate returns 401 challenge; **authenticated REST allocation succeeds through the LB** with relayed transport `192.168.6.14:<relay-port>` — server log shows `user <…:steam-lobby>: ALLOCATE processed, success`.
 
-**Note on the node firewall:** the k3s node nftables (`nixos-fw` on `big`) allows TCP NodePorts (30000-32767) but drops UDP NodePorts; a runtime rule `iptables -I nixos-fw 1 -p udp --dport 30000:32767 -j nixos-fw-accept` was added (2026-08-07) so the NodePort path works today. The LoadBalancer path bypasses `nixos-fw` entirely (DNAT in PREROUTING → FORWARD chain is ACCEPT) and needs no firewall change. If NodePort UDP reachability must survive a node reboot, add `networking.firewall.allowedUDPPorts = [ "30000:32767" ]` (or 3478 + the relay range) to the k3s nodes' NixOS config.
+**Remaining for internet play:** add a Verizon forward row `45000-45063 UDP → 192.168.0.2` (3478 Both is already forwarded). LAN play needs nothing — host candidates + this STUN suffice.
