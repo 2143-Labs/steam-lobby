@@ -35,22 +35,12 @@ Server-side gotchas (all fixed in the deployment):
 
 Needs `LOBBY_TURN_SECRET` env var on the lobby-server process (read in `main.rs`, wired into `AppState`). If unset, the endpoint returns 503. When the lobby moves in-cluster, mount the `steam-lobby-turn` Secret directly.
 
-Dependencies: `hmac` + `sha1` + `base64` crates in `lobby-server/Cargo.toml` (check if available; otherwise add `hmac = "0.12"` and `sha1 = "0.10"`).
-## 3. WebRTC signaling + data channel
+Dependencies: ✅ `hmac = "0.12"` + `sha1 = "0.10"` + `base64 = "0.22"` (added 2026-08-07 in lobby-server/Cargo.toml). ✅ `LOBBY_TURN_SECRET` env var wired via `AppConfig`. ✅ `/internal/turn-credentials` endpoint live in `routes.rs`.
+## 3. WebRTC signaling + data channel ✅ implemented (2026-08-07)
 
-**New message types** in `lobby-server/src/ws.rs` (`ClientMessage` / `ServerMessage` — use snake_case variants matching existing `lobby_match_*` / `game_input` style):
+Signaling messages (`WebrtcOffer/Answer/Ice`) are live in ws.rs (server ↔ client, participant-validated relay, no echo to sender). The demo creates an `RTCPeerConnection` per match via `WrtcLink` (`web/pong-wrtc.mjs`) and fetches TURN credentials at `/internal/turn-credentials`. Per-frame `game_input` flows over the `pong` data channel with the ws relay as automatic fallback (double-feeding is idempotent). Verified: offline handshake glue test (`web/test/wrtc.mjs`, 12/12), signaling relay itest (`webrtc_signaling.rs`, 2/2), all existing regression (js-test + rollback_replica) green.
 
-| Direction | Variant | Fields |
-|-----------|---------|--------|
-| client→server | `webrtc_offer` | `match_token: String`, `sdp: String` |
-| client→server | `webrtc_answer` | `match_token: String`, `sdp: String` |
-| client→server | `webrtc_ice` | `match_token: String`, `candidate: String` |
-| server→client | `webrtc_offer` | `match_token: String`, `from: String`, `sdp: String` |
-| server→client | `webrtc_answer` | `match_token: String`, `from: String`, `sdp: String` |
-| server→client | `webrtc_ice` | `match_token: String`, `from: String`, `candidate: String` |
-
-**Server behavior:** validate sender is a participant of a `Reporting`/`InProgress` p2p match, then relay to the opponent only. No SDP inspection. If the match is resolved, drop silently.
-
+## 4. Rollback networking
 **Demo client (`web/index.html`):** after both players P2P-connected:
 1. `fetch("/internal/turn-credentials")` → `RTCPeerConnection({iceServers: [{urls: turnUris, username, credential}]})`
 2. Create `pong` data channel (ordered, reliable)
