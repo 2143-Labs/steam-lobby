@@ -2,3 +2,5 @@
 .envrc
 .env
 .direnv/
+
+web/test/.js-hashes.json

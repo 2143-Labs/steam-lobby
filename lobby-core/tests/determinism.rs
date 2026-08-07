@@ -158,3 +158,30 @@ fn fnv1a_known_vectors() {
     assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
     assert_eq!(fnv1a64(b"a"), 0xaf63dc4c8601ec8c);
 }
+
+#[test]
+#[ignore = "requires `node web/test/diff.mjs` to have written web/test/.js-hashes.json — run via `just js-test`"]
+fn differential_js_matches_rust() {
+    // The crown jewel: recompute all 10,000 per-frame checksums with the Rust
+    // sim and assert every one equals the JS sim's hashes. Proves the core
+    // claim (Rust f64 == JS double for this exact op sequence) across the
+    // whole trajectory, not just the five golden checkpoints.
+    let raw = std::fs::read_to_string("../web/test/.js-hashes.json")
+        .expect("missing web/test/.js-hashes.json — run `node web/test/diff.mjs` first (or `just js-test`)");
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).expect("malformed web/test/.js-hashes.json");
+    let checkpoints = v["checkpoints"].as_object().expect("`checkpoints` object");
+
+    let mut g = PongGame::new();
+    assert_eq!(g.checksum(), checkpoints["0"].as_str().unwrap().parse::<u64>().unwrap());
+    for frame in 0..10_000 {
+        apply_frame(&mut g, frame);
+        let n = frame + 1;
+        let js_checksum = checkpoints[&n.to_string()]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing JS checkpoint for frame {n}"))
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!(g.checksum(), js_checksum, "Rust/JS divergence at frame {n}");
+    }
+}
