@@ -14,9 +14,9 @@ const PADDLE_X_LEFT: f64 = 0.03;
 const PADDLE_X_RIGHT: f64 = 0.97;
 const PADDLE_SPEED: f64 = 0.8; // units/sec toward the target
 const PADDLE_CLAMP: (f64, f64) = (0.08, 0.92); // center limits so edges stay on screen
-const BALL_SPEED: f64 = 0.3; // base serve speed, units/sec
+const BALL_SPEED: f64 = 0.9; // base serve speed, units/sec (3x the original 0.3)
 const SPEED_UP: f64 = 1.06; // per paddle hit — "gets faster and faster"
-const MAX_SPEED: f64 = 1.2; // 4x base, bounded so the game stays playable
+const MAX_SPEED: f64 = 6.0; 
 const HIT_RADIUS: f64 = 0.02; // |ball_x - paddle_x| < this counts as a hit
 // Physics sub-step cap so the ball can never tunnel through a paddle at max
 // speed (a 0.04-wide hit window needs steps well under 0.02 units).

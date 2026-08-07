@@ -56,7 +56,7 @@ async fn wait_for_status(pool: &PgPool, token: &str, expected: &str) -> bool {
 }
 
 /// Like `wait_for_status` but with a caller-supplied deadline (seconds).
-/// The pong tests need up to 30s: 3 points take ~5s at base speed plus tick
+/// The pong tests need up to 30s: 3 points take ~2s at base speed plus tick
 /// latency, far past `wait_for_status`'s 5s window.
 async fn wait_for_status_for(pool: &PgPool, token: &str, expected: &str, secs: u64) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(secs);

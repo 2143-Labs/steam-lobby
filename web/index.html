@@ -412,7 +412,7 @@ function handleServer(raw) {
       const myScore = iAmLeft ? msg.left_score : msg.right_score;
       const oppScore = iAmLeft ? msg.right_score : msg.left_score;
       $("game-status").textContent = "You " + myScore + " – " + oppScore
-        + " Opponent — ball speed ×" + (msg.speed / 0.3).toFixed(2);
+        + " Opponent — ball speed ×" + (msg.speed / BALL_SPEED0).toFixed(2);
       break;
     case "game_over":
       stopGame(); // stop both rAF loops; the canvas keeps the final frame
@@ -435,7 +435,7 @@ function handleServer(raw) {
 // ── Pong game ──
 const PONG_H = 400; // canvas height, px
 const PADDLE_H = 0.08, PADDLE_X_L = 0.03, PADDLE_X_R = 0.97;
-const PADDLE_SPEED = 0.8, BALL_SPEED0 = 0.3, SPEED_UP = 1.06, MAX_SPEED = 1.2;
+const PADDLE_SPEED = 0.8, BALL_SPEED0 = 0.9, SPEED_UP = 1.06, MAX_SPEED = 3.6;
 const pongCtx = $("pong").getContext("2d");
 
 function startPractice() {
