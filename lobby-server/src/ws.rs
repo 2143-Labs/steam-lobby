@@ -57,7 +57,11 @@ pub enum ClientMessage {
     GameInput {
         match_token: String,
         frame: u32,
-        target: f64,
+        /// Paddle target as its shortest round-trip decimal STRING: serde_json's
+        /// f64 parser is off by 1 ULP for some values, which would silently
+        /// diverge the referee's sim from the clients' (any desync is
+        /// unacceptable). Parsed with `str::parse::<f64>()` (correctly rounded).
+        target: String,
     },
     /// Client's per-frame checksum report (referee health check): the FNV-1a 64
     /// checksum of the authoritative state it computed for `frame`, as a decimal
@@ -171,13 +175,15 @@ pub enum ServerMessage {
     },
     /// One player's `GameInput`, relayed to the opponent so each client can
     /// run the peer's inputs through its local rollback engine. The sender
-    /// never receives its own `PeerInput`.
+    /// never receives its own `PeerInput`. `target` is a decimal STRING for
+    /// the same bit-exactness reason as `GameInput` (serde_json f64 parsing
+    /// is not correctly rounded).
     PeerInput {
         match_token: String,
         #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
         from: u64,
         frame: u32,
-        target: f64,
+        target: String,
     },
     /// The client's reported checksum diverged from the referee's: here is the
     /// authoritative 74-byte state at `frame`, hex-encoded. The client must
@@ -682,6 +688,9 @@ async fn handle_client_message(
             }
         }
         ClientMessage::GameInput { match_token, target, frame } => {
+            // `str::parse` is correctly rounded (serde_json's f64 parser is
+            // not — up to 1 ULP off, which would desync the sims).
+            let Ok(target) = target.parse::<f64>() else { return; };
             let target = target.clamp(0.0, 1.0);
             // Resolve the side BEFORE taking the parking_lot Mutex (the guard
             // is !Send and must not be held across an await).
@@ -701,7 +710,7 @@ async fn handle_client_message(
                             match_token: match_token.clone(),
                             from: steam_id,
                             frame,
-                            target,
+                            target: target.to_string(), // shortest round-trip decimal
                         });
                     }
                 }

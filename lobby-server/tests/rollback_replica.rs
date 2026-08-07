@@ -71,7 +71,11 @@ impl ReplicaDriver {
         }
     }
 
-    fn peer_input(&mut self, frame: u32, target: f64) {
+    fn peer_input(&mut self, frame: u32, target: &str) {
+        // The wire carries the target as its shortest round-trip decimal
+        // string; `str::parse` is correctly rounded (serde_json's f64 parser
+        // is off by 1 ULP for some values — a real determinism break).
+        let target: f64 = target.parse().expect("valid target string");
         self.peer.insert(frame, target);
         self.peer_last = Some(target);
     }
@@ -154,7 +158,7 @@ async fn drive_client(
             Ok(Some(Ok(ServerEvent::PeerInput { frame, target, .. }))) => {
                 // The opponent's real input for `frame` — feed the replica.
                 if let Some(d) = driver.as_mut() {
-                    d.peer_input(frame, target);
+                    d.peer_input(frame, &target);
                 }
             }
             Ok(Some(Ok(ServerEvent::InputAck { frame, .. }))) => {
@@ -202,7 +206,7 @@ async fn drive_client(
 #[tokio::test]
 async fn pong_three_replicas_converge() {
     let h = setup_pong().await;
-    let (mut p1, mut p2, token) = pair_up(&h, 911, 912, "ranked_1v1").await;
+    let (mut p1, mut p2, token) = pair_up(&h, 915, 916, "ranked_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
     // Both clients must drive CONCURRENTLY: the referee only advances when
@@ -210,8 +214,8 @@ async fn pong_three_replicas_converge() {
     // would leave one client silent and the game permanently stalled.
     let deadline = Instant::now() + Duration::from_secs(30);
     let ((w1, side1, _), (w2, side2, _)) = tokio::join!(
-        drive_client(&mut p1, &token, 911, None, deadline),
-        drive_client(&mut p2, &token, 912, None, deadline),
+        drive_client(&mut p1, &token, 915, None, deadline),
+        drive_client(&mut p2, &token, 916, None, deadline),
     );
     assert_ne!(side1, side2, "the two clients must be on opposite sides");
 
@@ -220,7 +224,7 @@ async fn pong_three_replicas_converge() {
     assert_eq!(w1, w2, "both clients must agree on the winner");
     // The schedule is deterministic: Left wins. The winner is whoever drew
     // the Left side (player_a), which is racy.
-    let left_player = if side1 == PongSide::Left { 911 } else { 912 };
+    let left_player = if side1 == PongSide::Left { 915 } else { 916 };
     assert_eq!(w1, left_player, "the Left player must win (schedule outcome)");
 
     drop(p1);
@@ -230,15 +234,15 @@ async fn pong_three_replicas_converge() {
 #[tokio::test]
 async fn pong_divergence_detected_and_resynced() {
     let h = setup_pong().await;
-    let (mut p1, mut p2, token) = pair_up(&h, 911, 912, "ranked_1v1").await;
+    let (mut p1, mut p2, token) = pair_up(&h, 913, 914, "ranked_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
     // p1 diverges at frame 25 (well before the winner at ~51); both drives
     // run concurrently (see pong_three_replicas_converge).
     let deadline = Instant::now() + Duration::from_secs(30);
     let ((w1, side1, resynced), (w2, side2, _)) = tokio::join!(
-        drive_client(&mut p1, &token, 911, Some(25), deadline),
-        drive_client(&mut p2, &token, 912, None, deadline),
+        drive_client(&mut p1, &token, 913, Some(25), deadline),
+        drive_client(&mut p2, &token, 914, None, deadline),
     );
     assert_ne!(side1, side2, "the two clients must be on opposite sides");
 
@@ -246,7 +250,7 @@ async fn pong_divergence_detected_and_resynced() {
     let w1 = w1.expect("p1 must receive GameOver");
     let w2 = w2.expect("p2 must receive GameOver");
     assert_eq!(w1, w2, "both clients must agree on the winner");
-    let left_player = if side1 == PongSide::Left { 911 } else { 912 };
+    let left_player = if side1 == PongSide::Left { 913 } else { 914 };
     assert_eq!(w1, left_player, "the divergence must not change the outcome");
 
     drop(p1);

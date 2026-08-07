@@ -42,7 +42,7 @@ enum ClientMsg {
     AcceptMatch { match_token: String },
     DeclineMatch { match_token: String },
     P2pConnected { match_token: String },
-    GameInput { match_token: String, frame: u32, target: f64 },
+    GameInput { match_token: String, frame: u32, target: String },
     RollbackHealth { match_token: String, frame: u32, checksum: String },
     MatchReport { match_token: String, winner: Option<u64>, demo_hash: Option<String> },
     Heartbeat,
@@ -147,7 +147,7 @@ pub enum ServerEvent {
         #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
         from: u64,
         frame: u32,
-        target: f64,
+        target: String,
     },
     #[serde(rename = "rollback_resync")]
     RollbackResync { match_token: String, frame: u32, state: String },
@@ -412,7 +412,9 @@ impl LobbyClient {
 
     /// Send a frame-stamped paddle target for the rollback protocol.
     /// `frame` is the sim frame the input applies to (the client's
-    /// `session.frame + 1`).
+    /// `session.frame + 1`). The target travels as its shortest round-trip
+    /// decimal string — serde_json's f64 parser is off by 1 ULP for some
+    /// values, which would silently desync the sims.
     pub async fn send_game_input(
         &mut self,
         match_token: &str,
@@ -422,7 +424,7 @@ impl LobbyClient {
         self.send(ClientMsg::GameInput {
             match_token: match_token.to_string(),
             frame,
-            target,
+            target: target.to_string(),
         })
     }
 
