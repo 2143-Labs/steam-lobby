@@ -724,6 +724,13 @@ $("btn-report-draw").addEventListener("click", () => {
   send({ type: "match_report", match_token: state.matchToken, winner: null, demo_hash: "web-demo" });
 });
 
+
+// A Steam login redirected back with a #token= fragment — complete the
+// sign-in automatically so the user lands signed in instead of having to
+// click Connect again. (All handlers above are registered by now.)
+if (fragmentToken) {
+  $("btn-connect").click();
+}
 </script>
 </body>
 </html>
