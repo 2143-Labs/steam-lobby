@@ -78,6 +78,35 @@ async fn wait_for_status_for(pool: &PgPool, token: &str, expected: &str, secs: u
     }
 }
 
+/// Poll `match_events` until every expected (event_type, count) lands, or 5s
+/// elapses. The server writes match status and event rows as separate
+/// statements (status first, events after), so a single-shot count read can
+/// race the accept/decline event inserts and see a partial set.
+async fn wait_for_event_counts(
+    pool: &PgPool,
+    token: &str,
+    expected: &[(&str, i64)],
+) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let counts: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT event_type, COUNT(*) FROM match_events WHERE match_token = $1 GROUP BY event_type",
+        )
+        .bind(token)
+        .fetch_all(pool)
+        .await
+        .expect("query match_events");
+        let map: std::collections::HashMap<String, i64> = counts.into_iter().collect();
+        if expected.iter().all(|(k, v)| map.get(*k) == Some(v)) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Connect two clients, auth with distinct test tokens, queue, and get a shared match.
 async fn pair_up(h: &common::TestHarness, p1_id: u64, p2_id: u64, mode: &str) -> (LobbyClient, LobbyClient, String) {
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
@@ -401,16 +430,10 @@ async fn match_events_logged() {
         wait_for_status(&h.pool, &token, "InProgress").await,
         "accepts must land"
     );
-    let counts: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT event_type, COUNT(*) FROM match_events WHERE match_token = $1 GROUP BY event_type",
-    )
-    .bind(&token)
-    .fetch_all(&h.pool)
-    .await
-    .unwrap();
-    let map: std::collections::HashMap<String, i64> = counts.into_iter().collect();
-    assert_eq!(map.get("paired"), Some(&1), "exactly one pairing event");
-    assert_eq!(map.get("accepted"), Some(&2), "one accept event per player");
+    assert!(
+        wait_for_event_counts(&h.pool, &token, &[("paired", 1), ("accepted", 2)]).await,
+        "pairing + both accept events must be logged"
+    );
     drop(p1);
     drop(p2);
 
@@ -421,16 +444,10 @@ async fn match_events_logged() {
         wait_for_status(&h.pool, &token2, "Disputed").await,
         "declined match must be Disputed immediately (no 30s linger)"
     );
-    let declined: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT event_type, COUNT(*) FROM match_events WHERE match_token = $1 GROUP BY event_type",
-    )
-    .bind(&token2)
-    .fetch_all(&h.pool)
-    .await
-    .unwrap();
-    let map2: std::collections::HashMap<String, i64> = declined.into_iter().collect();
-    assert_eq!(map2.get("paired"), Some(&1));
-    assert_eq!(map2.get("declined"), Some(&1), "decline event must be logged");
+    assert!(
+        wait_for_event_counts(&h.pool, &token2, &[("paired", 1), ("declined", 1)]).await,
+        "pairing + decline events must be logged"
+    );
     let actor: i64 = sqlx::query_scalar(
         "SELECT steam_id FROM match_events WHERE match_token = $1 AND event_type = 'declined'",
     )
