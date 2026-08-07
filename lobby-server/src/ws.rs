@@ -63,6 +63,21 @@ pub enum ClientMessage {
         /// unacceptable). Parsed with `str::parse::<f64>()` (correctly rounded).
         target: String,
     },
+    /// WebRTC signaling: offer SDP from the offerer (player_a).
+    WebrtcOffer {
+        match_token: String,
+        sdp: String,
+    },
+    /// WebRTC signaling: answer SDP from the answerer (player_b).
+    WebrtcAnswer {
+        match_token: String,
+        sdp: String,
+    },
+    /// WebRTC signaling: ICE candidate.
+    WebrtcIce {
+        match_token: String,
+        candidate: String,
+    },
     /// Client's per-frame checksum report (referee health check): the FNV-1a 64
     /// checksum of the authoritative state it computed for `frame`, as a decimal
     /// string (JS cannot hold u64 exactly). Parse failure → message ignored.
@@ -192,6 +207,27 @@ pub enum ServerMessage {
         match_token: String,
         frame: u32,
         state: String,
+    },
+    /// WebRTC signaling: offer SDP relayed from the offerer to the answerer.
+    WebrtcOffer {
+        match_token: String,
+        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
+        from: u64,
+        sdp: String,
+    },
+    /// WebRTC signaling: answer SDP relayed back to the offerer.
+    WebrtcAnswer {
+        match_token: String,
+        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
+        from: u64,
+        sdp: String,
+    },
+    /// WebRTC signaling: ICE candidate relayed to the peer.
+    WebrtcIce {
+        match_token: String,
+        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
+        from: u64,
+        candidate: String,
     },
     /// The pong match ended (first to 3, or forfeit on disconnect).
     GameOver {
@@ -684,6 +720,57 @@ async fn handle_client_message(
                 }
                 Err(e) => {
                     tracing::warn!("player {steam_id} p2p signal rejected for match {match_token}: {e}")
+                }
+            }
+        }
+        ClientMessage::WebrtcOffer { match_token, sdp } => {
+            let other = match state.store.get_match(&match_token).await {
+                Ok(Some(ref m)) if m.player_a == steam_id => Some(m.player_b),
+                Ok(Some(ref m)) if m.player_b == steam_id => Some(m.player_a),
+                _ => None,
+            };
+            if let Some(other) = other {
+                let connections = state.connections.lock().await;
+                if let Some(e) = connections.get(&other) {
+                    let _ = e.tx.send(ServerMessage::WebrtcOffer {
+                        match_token,
+                        from: steam_id,
+                        sdp,
+                    });
+                }
+            }
+        }
+        ClientMessage::WebrtcAnswer { match_token, sdp } => {
+            let other = match state.store.get_match(&match_token).await {
+                Ok(Some(ref m)) if m.player_a == steam_id => Some(m.player_b),
+                Ok(Some(ref m)) if m.player_b == steam_id => Some(m.player_a),
+                _ => None,
+            };
+            if let Some(other) = other {
+                let connections = state.connections.lock().await;
+                if let Some(e) = connections.get(&other) {
+                    let _ = e.tx.send(ServerMessage::WebrtcAnswer {
+                        match_token,
+                        from: steam_id,
+                        sdp,
+                    });
+                }
+            }
+        }
+        ClientMessage::WebrtcIce { match_token, candidate } => {
+            let other = match state.store.get_match(&match_token).await {
+                Ok(Some(ref m)) if m.player_a == steam_id => Some(m.player_b),
+                Ok(Some(ref m)) if m.player_b == steam_id => Some(m.player_a),
+                _ => None,
+            };
+            if let Some(other) = other {
+                let connections = state.connections.lock().await;
+                if let Some(e) = connections.get(&other) {
+                    let _ = e.tx.send(ServerMessage::WebrtcIce {
+                        match_token,
+                        from: steam_id,
+                        candidate,
+                    });
                 }
             }
         }

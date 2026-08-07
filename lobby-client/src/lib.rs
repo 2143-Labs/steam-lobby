@@ -46,6 +46,9 @@ enum ClientMsg {
     RollbackHealth { match_token: String, frame: u32, checksum: String },
     MatchReport { match_token: String, winner: Option<u64>, demo_hash: Option<String> },
     Heartbeat,
+    WebrtcOffer { match_token: String, sdp: String },
+    WebrtcAnswer { match_token: String, sdp: String },
+    WebrtcIce { match_token: String, candidate: String },
 }
 
 // Hand-written so session tokens never appear in logs: the JWT is a
@@ -93,6 +96,21 @@ impl std::fmt::Debug for ClientMsg {
                 .field("demo_hash", demo_hash)
                 .finish(),
             ClientMsg::Heartbeat => f.write_str("Heartbeat"),
+            ClientMsg::WebrtcOffer { match_token, sdp: _ } => f
+                .debug_struct("WebrtcOffer")
+                .field("match_token", match_token)
+                .field("sdp", &"<sdp>")
+                .finish(),
+            ClientMsg::WebrtcAnswer { match_token, sdp: _ } => f
+                .debug_struct("WebrtcAnswer")
+                .field("match_token", match_token)
+                .field("sdp", &"<sdp>")
+                .finish(),
+            ClientMsg::WebrtcIce { match_token, candidate: _ } => f
+                .debug_struct("WebrtcIce")
+                .field("match_token", match_token)
+                .field("candidate", &"<candidate>")
+                .finish(),
         }
     }
 }
@@ -186,6 +204,27 @@ pub enum ServerEvent {
     #[serde(rename = "queue_expired")]
     QueueExpired,
     Error { message: String },
+    #[serde(rename = "webrtc_offer")]
+    WebrtcOffer {
+        match_token: String,
+        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
+        from: u64,
+        sdp: String,
+    },
+    #[serde(rename = "webrtc_answer")]
+    WebrtcAnswer {
+        match_token: String,
+        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
+        from: u64,
+        sdp: String,
+    },
+    #[serde(rename = "webrtc_ice")]
+    WebrtcIce {
+        match_token: String,
+        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
+        from: u64,
+        candidate: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -387,6 +426,42 @@ impl LobbyClient {
     /// Leave the queue (no server response expected).
     pub async fn cancel_matchmaking(&mut self) -> Result<(), ClientError> {
         self.send(ClientMsg::CancelMatchmaking)
+    }
+
+    /// Send a WebRTC offer SDP to the opponent via the signaling relay.
+    pub async fn send_webrtc_offer(
+        &mut self,
+        match_token: &str,
+        sdp: String,
+    ) -> Result<(), ClientError> {
+        self.send(ClientMsg::WebrtcOffer {
+            match_token: match_token.to_string(),
+            sdp,
+        })
+    }
+
+    /// Send a WebRTC answer SDP to the opponent via the signaling relay.
+    pub async fn send_webrtc_answer(
+        &mut self,
+        match_token: &str,
+        sdp: String,
+    ) -> Result<(), ClientError> {
+        self.send(ClientMsg::WebrtcAnswer {
+            match_token: match_token.to_string(),
+            sdp,
+        })
+    }
+
+    /// Send a WebRTC ICE candidate to the opponent via the signaling relay.
+    pub async fn send_webrtc_ice(
+        &mut self,
+        match_token: &str,
+        candidate: String,
+    ) -> Result<(), ClientError> {
+        self.send(ClientMsg::WebrtcIce {
+            match_token: match_token.to_string(),
+            candidate,
+        })
     }
 
     /// Tell the server the client is still alive. While queueing, refresh
