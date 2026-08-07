@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline'; connect-src http: https: ws: wss:; img-src data:">
+<link rel="icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==">
 <title>Steam Lobby — Protocol Demo</title>
 <style>
   :root { color-scheme: dark; }
@@ -614,7 +615,7 @@ function pongLoop() {
     // The target travels as its shortest round-trip decimal string — JS
     // Number and Rust str::parse round-trip exactly; serde_json's f64 parser
     // is not (off by 1 ULP for some values).
-    send({ type: "game_input", match_token: state.matchToken, frame, target: state.inputTarget.toString() });
+    send({ type: "game_input", match_token: state.matchToken, frame: session.frame + 1, target: state.inputTarget.toString() });
     const result = session.step();
     state.stalled = result.stalled;
     if (result.snapshot) state.game = result.snapshot;
