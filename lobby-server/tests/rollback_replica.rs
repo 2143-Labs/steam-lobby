@@ -6,8 +6,10 @@
 //!   checksum frame-by-frame (asserted on every InputAck), and both clients
 //!   must agree on the GameOver winner.
 //! - `pong_divergence_detected_and_resynced`: client A deliberately applies a
-//!   wrong target for one frame; its health reports diverge, the referee sends
-//!   RollbackResync, and after restore + replay of its buffered inputs A
+//!   wrong target for every frame from 25 on (persistent — a one-frame
+//!   wrongness is erased when the paddles settle at the same clamped position,
+//!   so it would never be observable); its health reports diverge, the referee
+//!   sends RollbackResync, and after restore + replay of its buffered inputs A
 //!   re-converges — the eventual winner is unchanged.
 //!
 //! Requires Postgres (run `just db-up` first), like the rest of the itest
@@ -81,13 +83,20 @@ impl ReplicaDriver {
     }
 
     /// Step the replica through `frame` (inclusive) using the schedule for my
-    /// side (with one wrong target at `diverge_at` if configured) and the
-    /// peer's real inputs (hold-last between).
+    /// side and the peer's real inputs (hold-last between).
+    ///
+    /// With `diverge_at` set, EVERY frame from there on applies a wrong target
+    /// (`0.99` instead of the schedule): a one-frame wrongness is NOT reliably
+    /// observable — the next frame's correct target overwrites it, and both
+    /// paddles settle at the same clamped position within a couple of frames,
+    /// erasing the divergence before the referee's resync can land. A
+    /// persistent wrong target keeps the target field itself differing from
+    /// the referee's state, so the checksums provably diverge until the
+    /// referee detects the mismatch and resyncs us.
     fn step_to(&mut self, frame: u32) {
         while self.stepped < frame as i64 {
             let next = (self.stepped + 1) as u32;
-            let mine = if self.diverge_at == Some(next) {
-                self.diverge_at = None; // one wrong frame only
+            let mine = if self.diverged || self.diverge_at == Some(next) {
                 self.diverged = true;
                 0.99 // obviously differs from schedule(next, side)
             } else {
