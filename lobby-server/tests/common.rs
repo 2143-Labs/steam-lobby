@@ -1,73 +1,69 @@
 use std::sync::Arc;
 
 use lobby_server::{build_app, AppConfig};
+use sqlx::ConnectOptions;
 use sqlx::PgPool;
 
-/// Serializes test runs so the shared DB is truncated/used by one test at a time.
-static DB_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+/// Each #[sqlx::test] provides its own fresh, pre-migrated database and hands
+/// the injected pool to the test fn (the `fn(Pool)` signature — sqlx closes
+/// that pool with a `close().await` after the test, which yields the runtime
+/// so the aborted server + ticker unwind BEFORE the post-test DROP DATABASE).
 pub struct TestHarness {
     pub base_url: String, // "http://127.0.0.1:PORT"
     pub ws_url: String,   // "ws://127.0.0.1:PORT/ws"
-    pub pool: PgPool,     // connected to lobby_test
+    pub pool: PgPool,     // the injected test pool (≤5 conns, parented to sqlx's master pool)
     _state: Arc<lobby_server::AppState>, // keep alive so ticker keeps running
     _server: tokio::task::JoinHandle<()>,
-    /// Holds the DB lock for the whole test; dropped (released) when the harness drops.
-    _lock_guard: tokio::sync::MutexGuard<'static, ()>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
+/// Stop the ticker and abort the axum server. The actual unwind happens when
+/// the runtime next polls the tasks — guaranteed to happen BEFORE the DROP
+/// DATABASE, because sqlx's `fn(Pool)` wrapper awaits `pool.close()` between
+/// the test fn returning and running cleanup.
+impl Drop for TestHarness {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+        self._server.abort();
+    }
+}
 
-pub async fn setup() -> TestHarness {
-    setup_full(false, None, None).await
+pub async fn setup(pool: PgPool) -> TestHarness {
+    setup_full(pool, false, None, None).await
 }
 
 /// Harness with the pong game enabled (LOBBY_PONG = true) for p2p matches.
-pub async fn setup_pong() -> TestHarness {
-    setup_full(true, None, None).await
+pub async fn setup_pong(pool: PgPool) -> TestHarness {
+    setup_full(pool, true, None, None).await
 }
 
-pub async fn setup_with_creator(creator_url: Option<&str>) -> TestHarness {
-    setup_full(false, creator_url, None).await
+pub async fn setup_with_creator(pool: PgPool, creator_url: Option<&str>) -> TestHarness {
+    setup_full(pool, false, creator_url, None).await
 }
 
-async fn setup_full(pong_enabled: bool, creator_url: Option<&str>, turn_secret: Option<String>) -> TestHarness {
-    let _lock_guard = DB_LOCK.lock().await;
+pub async fn setup_with_turn(pool: PgPool, turn_secret: Option<&str>) -> TestHarness {
+    setup_full(pool, true, None, turn_secret.map(String::from)).await
+}
 
-    let root_url = "postgres://lobby:lobby@localhost:5432/lobby";
+async fn setup_full(
+    pool: PgPool,
+    pong_enabled: bool,
+    creator_url: Option<&str>,
+    turn_secret: Option<String>,
+) -> TestHarness {
+    // sqlx::test has already created + migrated the per-test database; the
+    // URL is the one piece of info the test binary does not otherwise know.
+    let db_url = pool.connect_options().to_url_lossy().to_string();
+    // The server uses the injected pool itself so that sqlx's post-test
+    // pool.close() (in the fn(Pool) wrapper) closes the server's connections
+    // before the per-test database is dropped.
+    let pool_clone = pool.clone();
 
-    // Create lobby_test if it doesn't exist.
-    let root_pool = PgPool::connect(root_url).await.expect("connect root DB — run `just db-up` first");
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'lobby_test')",
-    )
-    .fetch_one(&root_pool)
-    .await
-    .expect("query pg_database");
-    if !exists {
-        sqlx::query("CREATE DATABASE lobby_test")
-            .execute(&root_pool)
-            .await
-            .expect("create lobby_test");
-    }
-
-    let test_url = "postgres://lobby:lobby@localhost:5432/lobby_test";
-    let pool = PgPool::connect(test_url).await.expect("connect lobby_test");
-
-    // Fresh DB has no tables — apply migrations (idempotent; build_app's own
-    // migrate!() later sees them as already applied and is a no-op).
-    sqlx::migrate!().run(&pool).await.expect("migrate lobby_test");
-
-    // Clean slate: truncate all tables (RESTART IDENTITY resets serials; CASCADE handles FKs).
-    sqlx::query(
-        "TRUNCATE users, player_state, ratings, matchmaking_queue, matches, \
-         match_reports, match_results, match_events RESTART IDENTITY CASCADE",
-    )
-    .execute(&pool)
-    .await
-    .expect("truncate tables");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut held_rx = shutdown_rx.clone(); // teardown-gate receiver (see below)
 
     let config = AppConfig {
-        db_url: test_url.to_string(),
+        db_url,
         steam_api_key: "test".into(),
         app_id: 480,
         jwt_secret: "integration-test-secret-0123456789abcdef".into(),
@@ -90,9 +86,11 @@ async fn setup_full(pong_enabled: bool, creator_url: Option<&str>, turn_secret: 
         pong_enabled,
         turn_secret,
         turn_uris: vec!["turn:turn.john2143.com:3478?transport=udp".into()],
+        ticker_shutdown: Some(shutdown_rx),
+        pool: Some(pool_clone),
     };
 
-    let (app, state) = build_app(config).await; // runs migrations + spawns ticker
+    let (app, state) = build_app(config).await; // runs migrations (no-op; already applied) + spawns ticker
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind port 0");
     let addr = listener.local_addr().expect("local addr");
     let server = tokio::spawn(async move {
@@ -104,16 +102,25 @@ async fn setup_full(pong_enabled: bool, creator_url: Option<&str>, turn_secret: 
         .expect("server");
     });
 
+    // Teardown gate: hold one checked-out connection and release it only
+    // AFTER the test fn returns (signalled by the harness drop). sqlx's
+    // post-test pool.close() waits on this permit, giving the runtime a
+    // guaranteed window to unwind the aborted server + stopped ticker before
+    // the DROP DATABASE — without it, the DROP can land while the ticker's
+    // connection is still closing (intermittent "accessed by other users").
+    let held = pool.acquire().await.expect("acquire held connection");
+    tokio::spawn(async move {
+        let _ = held_rx.changed().await; // fires when the harness drops
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(held);
+    });
+
     TestHarness {
         base_url: format!("http://{addr}"),
         ws_url: format!("ws://{addr}/ws"),
         pool,
         _state: state,
         _server: server,
-        _lock_guard,
+        shutdown_tx,
     }
-}
-
-pub async fn setup_with_turn(turn_secret: Option<&str>) -> TestHarness {
-    setup_full(true, None, turn_secret.map(String::from)).await
 }

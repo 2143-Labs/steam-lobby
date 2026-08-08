@@ -154,9 +154,9 @@ async fn accept_and_connect(
         "both connections must transition the match to Reporting");
 }
 
-#[tokio::test]
-async fn full_match_lifecycle() {
-    let h = setup().await;
+#[sqlx::test]
+async fn full_match_lifecycle(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
     let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
     let a1 = 100u64;
 
@@ -195,9 +195,9 @@ async fn full_match_lifecycle() {
     drop(p2);
 }
 
-#[tokio::test]
-async fn dispute_on_winner_mismatch() {
-    let h = setup().await;
+#[sqlx::test]
+async fn dispute_on_winner_mismatch(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
 
     let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
 
@@ -223,9 +223,9 @@ async fn dispute_on_winner_mismatch() {
     drop(p2);
 }
 
-#[tokio::test]
-async fn queue_cancel() {
-    let h = setup().await;
+#[sqlx::test]
+async fn queue_cancel(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
 
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
     p1.authenticate_test_token(300, &h.base_url).await.unwrap();
@@ -254,9 +254,9 @@ async fn queue_cancel() {
     drop(p1);
 }
 
-#[tokio::test]
-async fn queue_stats_received() {
-    let h = setup().await;
+#[sqlx::test]
+async fn queue_stats_received(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
 
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
     p1.authenticate_test_token(901, &h.base_url).await.unwrap();
@@ -297,9 +297,9 @@ async fn queue_stats_received() {
     drop(p1);
 }
 
-#[tokio::test]
-async fn p2p_and_report_visibility() {
-    let h = setup().await;
+#[sqlx::test]
+async fn p2p_and_report_visibility(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
 
     let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
@@ -371,9 +371,9 @@ async fn p2p_and_report_visibility() {
     drop(p2);
 }
 
-#[tokio::test]
-async fn decline_notifies_opponent() {
-    let h = setup().await;
+#[sqlx::test]
+async fn decline_notifies_opponent(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
 
     let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
 
@@ -418,9 +418,9 @@ async fn decline_notifies_opponent() {
     drop(p2);
 }
 
-#[tokio::test]
-async fn match_events_logged() {
-    let h = setup().await;
+#[sqlx::test]
+async fn match_events_logged(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
 
     // Scenario 1: pairing + both accepts are logged.
     let (mut p1, mut p2, token) = pair_up(&h, 400, 401, "ranked_1v1").await;
@@ -459,11 +459,11 @@ async fn match_events_logged() {
     drop(q1);
 }
 
-#[tokio::test]
-async fn auth_ok_reports_state() {
+#[sqlx::test]
+async fn auth_ok_reports_state(pool: sqlx::PgPool) {
     use lobby_core::types::PlayerState;
 
-    let h = setup().await;
+    let h = setup(pool).await;
 
     let mut c1 = LobbyClient::connect(&h.ws_url).await.unwrap();
     let auth = c1.authenticate_test_token(601, &h.base_url).await.unwrap();
@@ -484,11 +484,11 @@ async fn auth_ok_reports_state() {
     drop(c2);
 }
 
-#[tokio::test]
-async fn reconnect_reports_queueing() {
+#[sqlx::test]
+async fn reconnect_reports_queueing(pool: sqlx::PgPool) {
     use lobby_core::types::PlayerState;
 
-    let h = setup().await;
+    let h = setup(pool).await;
 
     let mut c1 = LobbyClient::connect(&h.ws_url).await.unwrap();
     c1.authenticate_test_token(602, &h.base_url).await.unwrap();
@@ -529,9 +529,9 @@ async fn reconnect_reports_queueing() {
     drop(c2);
 }
 
-#[tokio::test]
-async fn match_expired_notifies_players() {
-    let h = setup().await;
+#[sqlx::test]
+async fn match_expired_notifies_players(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
 
     let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
 
@@ -586,9 +586,9 @@ async fn match_expired_notifies_players() {
     drop(p2);
 }
 
-#[tokio::test]
-async fn report_timeout_resolves_and_notifies() {
-    let h = setup().await;
+#[sqlx::test]
+async fn report_timeout_resolves_and_notifies(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
 
     let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
@@ -632,9 +632,9 @@ async fn report_timeout_resolves_and_notifies() {
     drop(p2);
 }
 
-#[tokio::test]
-async fn duplicate_report_rejected() {
-    let h = setup().await;
+#[sqlx::test]
+async fn duplicate_report_rejected(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
 
     let (mut p1, mut p2, token) = pair_up(&h, 110, 210, "ranked_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
@@ -714,9 +714,9 @@ async fn duplicate_report_rejected() {
     drop(p2);
 }
 
-#[tokio::test]
-async fn queue_expired_notifies_player() {
-    let h = setup().await;
+#[sqlx::test]
+async fn queue_expired_notifies_player(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
 
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
     p1.authenticate_test_token(701, &h.base_url).await.unwrap();
@@ -767,9 +767,9 @@ async fn queue_expired_notifies_player() {
     drop(p1);
 }
 
-#[tokio::test]
-async fn stale_entry_resets_player_state() {
-    let h = setup().await;
+#[sqlx::test]
+async fn stale_entry_resets_player_state(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
 
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
     p1.authenticate_test_token(703, &h.base_url).await.unwrap();
@@ -822,9 +822,9 @@ async fn stale_entry_resets_player_state() {
     drop(p1);
 }
 
-#[tokio::test]
-async fn heartbeat_keeps_queued_alive() {
-    let h = setup().await;
+#[sqlx::test]
+async fn heartbeat_keeps_queued_alive(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
 
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
     p1.authenticate_test_token(702, &h.base_url).await.unwrap();
@@ -892,9 +892,9 @@ async fn heartbeat_keeps_queued_alive() {
     drop(p1);
 }
 
-#[tokio::test]
-async fn openid_return_to_validation() {
-    let h = setup().await;
+#[sqlx::test]
+async fn openid_return_to_validation(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
 
     // No-redirect client so the redirect (307) isn't followed away by reqwest.
     let client = reqwest::Client::builder()
@@ -924,9 +924,9 @@ async fn openid_return_to_validation() {
     }
 }
 
-#[tokio::test]
-async fn rate_limited_test_token() {
-    let h = setup().await;
+#[sqlx::test]
+async fn rate_limited_test_token(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
     let client = reqwest::Client::new();
     let (mut ok, mut limited) = (0, 0);
     for i in 0..25u64 {
@@ -947,9 +947,9 @@ async fn rate_limited_test_token() {
     assert_eq!(limited, 5, "the rest are rate-limited");
 }
 
-#[tokio::test]
-async fn logout_revokes_token() {
-    let h = setup().await;
+#[sqlx::test]
+async fn logout_revokes_token(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
     let client = reqwest::Client::new();
 
     // Mint a raw token so we can present it to both /auth/logout and the WS.
@@ -985,12 +985,12 @@ async fn logout_revokes_token() {
     );
 }
 
-#[tokio::test]
-async fn ws_frame_size_limit() {
+#[sqlx::test]
+async fn ws_frame_size_limit(pool: sqlx::PgPool) {
     use futures_util::SinkExt;
     use futures_util::StreamExt;
 
-    let h = setup().await;
+    let h = setup(pool).await;
     let (mut ws, _) = tokio_tungstenite::connect_async(&h.ws_url).await.unwrap();
 
     // First message: a ~2 MiB text frame — the 64 KiB cap must reject it.
@@ -1028,9 +1028,9 @@ async fn ws_frame_size_limit() {
     );
 }
 
-#[tokio::test]
-async fn replaced_connection_keeps_new() {
-    let h = setup().await;
+#[sqlx::test]
+async fn replaced_connection_keeps_new(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
 
     let mut first = LobbyClient::connect(&h.ws_url).await.unwrap();
     first.authenticate_test_token(500, &h.base_url).await.unwrap();
@@ -1066,9 +1066,9 @@ async fn replaced_connection_keeps_new() {
     drop(second);
 }
 
-#[tokio::test]
-async fn ws_origin_restriction() {
-    let h = setup().await;
+#[sqlx::test]
+async fn ws_origin_restriction(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -1229,10 +1229,10 @@ async fn wait_for_event<E>(
     panic!("{label}: event not received within deadline; saw: {seen:?}");
 }
 
-#[tokio::test]
-async fn server_game_full_lifecycle() {
+#[sqlx::test]
+async fn server_game_full_lifecycle(pool: sqlx::PgPool) {
     let (mock_url, recorded, base_slot) = spawn_mock_creator(true).await;
-    let h = setup_with_creator(Some(&mock_url)).await;
+    let h = setup_with_creator(pool, Some(&mock_url)).await;
     *base_slot.lock().await = Some(h.base_url.clone());
     let (mut p1, mut p2, token) = pair_up(&h, 300, 301, "server_arena").await;
 
@@ -1302,10 +1302,10 @@ async fn server_game_full_lifecycle() {
     drop(p2);
 }
 
-#[tokio::test]
-async fn server_game_alloc_timeout() {
+#[sqlx::test]
+async fn server_game_alloc_timeout(pool: sqlx::PgPool) {
     let mock_url = spawn_failing_mock_creator().await;
-    let h = setup_with_creator(Some(&mock_url)).await;
+    let h = setup_with_creator(pool, Some(&mock_url)).await;
     let (mut p1, mut p2, token) = pair_up(&h, 300, 301, "server_arena").await;
 
     p1.accept_match(&token).await.unwrap();
@@ -1345,10 +1345,10 @@ async fn server_game_alloc_timeout() {
     drop(p2);
 }
 
-#[tokio::test]
-async fn server_game_result_timeout() {
+#[sqlx::test]
+async fn server_game_result_timeout(pool: sqlx::PgPool) {
     let (mock_url, _recorded, _base_slot) = spawn_mock_creator(false).await;
-    let h = setup_with_creator(Some(&mock_url)).await;
+    let h = setup_with_creator(pool, Some(&mock_url)).await;
     let (mut p1, mut p2, token) = pair_up(&h, 300, 301, "server_arena").await;
 
     p1.accept_match(&token).await.unwrap();
@@ -1389,10 +1389,10 @@ async fn server_game_result_timeout() {
     drop(p2);
 }
 
-#[tokio::test]
-async fn game_result_callback_security() {
+#[sqlx::test]
+async fn game_result_callback_security(pool: sqlx::PgPool) {
     let (mock_url, _recorded, base_slot) = spawn_mock_creator(true).await;
-    let h = setup_with_creator(Some(&mock_url)).await;
+    let h = setup_with_creator(pool, Some(&mock_url)).await;
     *base_slot.lock().await = Some(h.base_url.clone());
     let (mut p1, mut p2, token) = pair_up(&h, 300, 301, "server_arena").await;
 
@@ -1446,9 +1446,9 @@ async fn game_result_callback_security() {
 }
 
 
-#[tokio::test]
-async fn pong_auto_resolves_on_three_points() {
-    let h = setup_pong().await;
+#[sqlx::test]
+async fn pong_auto_resolves_on_three_points(pool: sqlx::PgPool) {
+    let h = setup_pong(pool).await;
     let (mut p1, mut p2, token) = pair_up(&h, 110, 210, "ranked_1v1").await;
 
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
@@ -1520,9 +1520,9 @@ async fn pong_auto_resolves_on_three_points() {
     drop(p2);
 }
 
-#[tokio::test]
-async fn pong_disconnect_forfeits_to_other() {
-    let h = setup_pong().await;
+#[sqlx::test]
+async fn pong_disconnect_forfeits_to_other(pool: sqlx::PgPool) {
+    let h = setup_pong(pool).await;
     let (mut p1, mut p2, token) = pair_up(&h, 110, 210, "ranked_1v1").await;
 
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
@@ -1562,12 +1562,12 @@ async fn pong_disconnect_forfeits_to_other() {
     drop(p2);
 }
 
-#[tokio::test]
-async fn queueing_survives_stale_sweep_after_reconnect() {
+#[sqlx::test]
+async fn queueing_survives_stale_sweep_after_reconnect(pool: sqlx::PgPool) {
     // A reconnect whose last heartbeat predates the 30s stale window must not
     // be evicted the moment they queue: queueing itself refreshes liveness,
     // so the entry gets the full grace period from the queue click.
-    let h = setup().await;
+    let h = setup(pool).await;
 
     let mut c1 = LobbyClient::connect(&h.ws_url).await.unwrap();
     c1.authenticate_test_token(702, &h.base_url).await.unwrap();

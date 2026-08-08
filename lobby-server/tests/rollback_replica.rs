@@ -212,9 +212,9 @@ async fn drive_client(
     (winner, d.side, resynced)
 }
 
-#[tokio::test]
-async fn pong_three_replicas_converge() {
-    let h = setup_pong().await;
+#[sqlx::test]
+async fn pong_three_replicas_converge(pool: sqlx::PgPool) {
+    let h = setup_pong(pool).await;
     let (mut p1, mut p2, token) = pair_up(&h, 915, 916, "ranked_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
@@ -240,9 +240,9 @@ async fn pong_three_replicas_converge() {
     drop(p2);
 }
 
-#[tokio::test]
-async fn pong_divergence_detected_and_resynced() {
-    let h = setup_pong().await;
+#[sqlx::test]
+async fn pong_divergence_detected_and_resynced(pool: sqlx::PgPool) {
+    let h = setup_pong(pool).await;
     let (mut p1, mut p2, token) = pair_up(&h, 913, 914, "ranked_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
