@@ -11,18 +11,24 @@ build:
   {{nix}}"cargo build --workspace"
 
 test:
-  {{nix}}"DATABASE_URL=postgres://lobby:lobby@localhost:5432/lobby cargo test --workspace -- --test-threads 4"
+  {{nix}}"DATABASE_URL=postgres://lobby:lobby@localhost:5432/lobby cargo test --workspace -- --test-threads 4 && just db-sweep"
 
 test-verbose:
-  {{nix}}"DATABASE_URL=postgres://lobby:lobby@localhost:5432/lobby cargo test --workspace -- --test-threads 4 --nocapture"
+  {{nix}}"DATABASE_URL=postgres://lobby:lobby@localhost:5432/lobby cargo test --workspace -- --test-threads 4 --nocapture && just db-sweep"
 
 itest:
-  {{nix}}"DATABASE_URL=postgres://lobby:lobby@localhost:5432/lobby cargo test -p lobby-server --test integration -- --test-threads 4 --nocapture"
+  {{nix}}"DATABASE_URL=postgres://lobby:lobby@localhost:5432/lobby cargo test -p lobby-server --test integration -- --test-threads 4 --nocapture && just db-sweep"
 
 # Parallel integration suite via cargo-nextest (per-test DBs from sqlx::test).
 # The binary is a cargo subcommand: `cargo nextest` finds cargo-nextest on PATH.
 test-fast:
-  {{nix}}"DATABASE_URL=postgres://lobby:lobby@localhost:5432/lobby cargo nextest run --workspace"
+  {{nix}}"DATABASE_URL=postgres://lobby:lobby@localhost:5432/lobby cargo nextest run --workspace && just db-sweep"
+
+# Drop leftover sqlx::test databases from previous runs (skips any still in use).
+# Fed via stdin (docker exec -i): psql's -c mode cannot mix SQL with the
+# \gexec meta-command, but stdin processes meta-commands normally.
+db-sweep:
+  printf '%s\n' "SELECT format('DROP DATABASE IF EXISTS %I', datname) FROM pg_database WHERE datname LIKE '_sqlx_test%' \gexec" | docker exec -i lobby-db psql -U lobby -d lobby -q
 
 # JS-side determinism gauntlet + the Rust<->JS differential (needs node)
 js-test:
