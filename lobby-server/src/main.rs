@@ -69,6 +69,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pong_enabled: std::env::var("LOBBY_PONG")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(true),
+        start_timeout_secs: std::env::var("LOBBY_START_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15),
+        pong_countdown_ticks: std::env::var("LOBBY_PONG_COUNTDOWN_TICKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90),
         turn_secret: std::env::var("LOBBY_TURN_SECRET").ok().filter(|s| !s.is_empty()),
         turn_uris: std::env::var("LOBBY_TURN_URIS")
             .map(|v| {

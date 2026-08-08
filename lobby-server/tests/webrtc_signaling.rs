@@ -74,8 +74,8 @@ async fn signaling_relay(pool: sqlx::PgPool) {
 
     p1.accept_match(&token).await.unwrap();
     p2.accept_match(&token).await.unwrap();
-    p1.p2p_connected(&token).await.unwrap();
-    p2.p2p_connected(&token).await.unwrap();
+    p1.start_match(&token).await.unwrap();
+    p2.start_match(&token).await.unwrap();
 
     // Offer/answer/ice round-trip
     p1.send_webrtc_offer(&token, "sdp-offer-a".into()).await.unwrap();

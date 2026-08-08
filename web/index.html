@@ -761,7 +761,7 @@ $("btn-decline").addEventListener("click", () => {
   $("server-info").style.display = "none";
 });
 $("btn-p2p").addEventListener("click", () => {
-  send({ type: "p2p_connected", match_token: state.matchToken });
+  send({ type: "start_match", match_token: state.matchToken });
   $("btn-p2p").style.display = "none";
   // No report buttons for p2p: the server-authoritative pong game decides the
   // winner and auto-resolves the match. (They stay hidden in the HTML and

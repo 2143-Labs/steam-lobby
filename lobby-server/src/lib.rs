@@ -49,6 +49,8 @@ pub struct AppConfig {
     pub gameserver_alloc_timeout_secs: u64,
     pub gameserver_result_timeout_secs: u64,
     pub pong_enabled: bool, // LOBBY_PONG; run p2p matches as server-authoritative pong
+    pub start_timeout_secs: u64, // LOBBY_START_TIMEOUT_SECS; START window after both accept (forfeit)
+    pub pong_countdown_ticks: u32, // LOBBY_PONG_COUNTDOWN_TICKS; 3-2-1 hold in 33ms ticks; 0 = disabled
     pub turn_secret: Option<String>, // LOBBY_TURN_SECRET; None => /internal/turn-credentials 503s
     pub turn_uris: Vec<String>,      // LOBBY_TURN_URIS; TURN URIs returned to clients
     pub ticker_shutdown: Option<tokio::sync::watch::Receiver<bool>>, // test-only: stop the maintenance loop
@@ -165,6 +167,8 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
             jwt_ttl_secs: config.jwt_ttl_secs,
             cors_origins: config.cors_origins.clone(),
             pong_enabled: config.pong_enabled,
+            start_timeout_secs: config.start_timeout_secs,
+            pong_countdown_ticks: config.pong_countdown_ticks,
             turn_secret: config.turn_secret.clone(),
             turn_uris: config.turn_uris.clone(),
         },

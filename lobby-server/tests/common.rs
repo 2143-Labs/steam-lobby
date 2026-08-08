@@ -84,6 +84,8 @@ async fn setup_full(
         gameserver_alloc_timeout_secs: 60,
         gameserver_result_timeout_secs: 300,
         pong_enabled,
+        start_timeout_secs: 15,
+        pong_countdown_ticks: 0, // Step 5 makes this a param; 0 = countdown off (rollback tests)
         turn_secret,
         turn_uris: vec!["turn:turn.john2143.com:3478?transport=udp".into()],
         ticker_shutdown: Some(shutdown_rx),

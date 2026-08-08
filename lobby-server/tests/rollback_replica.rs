@@ -308,8 +308,8 @@ async fn accept_and_connect(
         "both accepts must transition the match to InProgress"
     );
 
-    p1.p2p_connected(token).await.unwrap();
-    p2.p2p_connected(token).await.unwrap();
+    p1.start_match(token).await.unwrap();
+    p2.start_match(token).await.unwrap();
     assert!(
         wait_for_status(&h.pool, token, "Reporting").await,
         "both connections must transition the match to Reporting"

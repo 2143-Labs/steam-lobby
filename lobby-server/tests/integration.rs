@@ -132,8 +132,8 @@ async fn pair_up(h: &common::TestHarness, p1_id: u64, p2_id: u64, mode: &str) ->
     (p1, p2, m1.match_token)
 }
 
-/// Both clients accept, then both report P2P connected, synchronizing on server
-/// state between stages. The client messages are fire-and-forget: a p2p_connected
+/// Both clients accept, then both signal START, synchronizing on server
+/// state between stages. The client messages are fire-and-forget: a start_match
 /// arriving before the match is InProgress is rejected by the server (state
 /// mismatch), so we poll the DB before each stage like real clients would wait
 /// for their own coordination.
@@ -148,8 +148,8 @@ async fn accept_and_connect(
     assert!(wait_for_status(&h.pool, token, "InProgress").await,
         "both accepts must transition the match to InProgress");
 
-    p1.p2p_connected(token).await.unwrap();
-    p2.p2p_connected(token).await.unwrap();
+    p1.start_match(token).await.unwrap();
+    p2.start_match(token).await.unwrap();
     assert!(wait_for_status(&h.pool, token, "Reporting").await,
         "both connections must transition the match to Reporting");
 }
@@ -304,8 +304,8 @@ async fn p2p_and_report_visibility(pool: sqlx::PgPool) {
     let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
-    // accept_and_connect sends both p2p_connected signals; p1 must learn that
-    // the opponent connected once p2's signal is processed.
+    // accept_and_connect sends both start_match signals; p1 must learn that
+    // the opponent started once p2's signal is processed.
     let mut saw_opponent = false;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {

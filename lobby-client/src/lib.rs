@@ -17,7 +17,7 @@
 //! if let Some(m) = client.wait_for_match().await? {
 //!     println!("Match found: {}", m.match_token);
 //!     client.accept_match(&m.match_token).await?;
-//!     client.p2p_connected(&m.match_token).await?;
+//!     client.start_match(&m.match_token).await?;
 //!     // ... play the game ...
 //!     client.submit_report(&m.match_token, Some(auth.steam_id), None).await?;
 //! }
@@ -41,7 +41,7 @@ enum ClientMsg {
     CancelMatchmaking,
     AcceptMatch { match_token: String },
     DeclineMatch { match_token: String },
-    P2pConnected { match_token: String },
+    StartMatch { match_token: String },
     GameInput { match_token: String, frame: u32, target: String },
     RollbackHealth { match_token: String, frame: u32, checksum: String },
     MatchReport { match_token: String, winner: Option<u64>, demo_hash: Option<String> },
@@ -73,8 +73,8 @@ impl std::fmt::Debug for ClientMsg {
                 .debug_struct("DeclineMatch")
                 .field("match_token", match_token)
                 .finish(),
-            ClientMsg::P2pConnected { match_token } => f
-                .debug_struct("P2pConnected")
+            ClientMsg::StartMatch { match_token } => f
+                .debug_struct("StartMatch")
                 .field("match_token", match_token)
                 .finish(),
             ClientMsg::GameInput { match_token, frame, target } => f
@@ -160,6 +160,18 @@ pub enum ServerEvent {
     },
     #[serde(rename = "input_ack")]
     InputAck { match_token: String, frame: u32 },
+    #[serde(rename = "match_started")]
+    MatchStarted {
+        match_token: String,
+        start_timeout_secs: u64,
+    },
+    #[serde(rename = "round_start")]
+    RoundStart {
+        match_token: String,
+        frame: u32,
+        round: u32,
+        countdown_ticks: u32,
+    },
     #[serde(rename = "peer_input")]
     PeerInput {
         match_token: String,
@@ -484,9 +496,9 @@ impl LobbyClient {
         self.send(ClientMsg::DeclineMatch { match_token: match_token.to_string() })
     }
 
-    /// Notify the server that the P2P connection to the opponent is established.
-    pub async fn p2p_connected(&mut self, match_token: &str) -> Result<(), ClientError> {
-        self.send(ClientMsg::P2pConnected { match_token: match_token.to_string() })
+    /// Notify the server that the P2P connection is established; begin the match.
+    pub async fn start_match(&mut self, match_token: &str) -> Result<(), ClientError> {
+        self.send(ClientMsg::StartMatch { match_token: match_token.to_string() })
     }
 
     /// Send a frame-stamped paddle target for the rollback protocol.

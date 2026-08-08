@@ -242,7 +242,7 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
         // always remove the registry entry on exit
         task_state.pong_games.lock().remove(&task_token);
     });
-    // Register the game; if the two p2p_connected messages raced, the first
+    // Register the game; if the two start_match messages raced, the first
     // spawn wins and this one is aborted.
     let mut games = state.pong_games.lock();
     if games.contains_key(&token) {

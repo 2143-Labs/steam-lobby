@@ -45,8 +45,8 @@ pub enum ClientMessage {
     DeclineMatch {
         match_token: String,
     },
-    /// Signal that both peers connected (P2P game start).
-    P2pConnected {
+    /// Click START = my P2P connection is established; begin the match.
+    StartMatch {
         match_token: String,
     },
     /// Pong paddle target (normalized paddle-center Y, 0..1), frame-stamped.
@@ -100,7 +100,7 @@ pub enum ClientMessage {
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 /// Outbound messages sent over WebSocket connections.
-#[allow(dead_code)] // QueueStatus, MatchAccepted, MatchStarted reserved for future use
+#[allow(dead_code)] // QueueStatus, MatchAccepted reserved for future use
 pub enum ServerMessage {
     /// Authentication succeeded; carries the abstract account id (users.id,
     /// what the UI shows as "player id") plus the Steam ID and state.
@@ -148,9 +148,10 @@ pub enum ServerMessage {
         match_token: String,
         opponent_steam_id: u64,
     },
-    /// Reserved: match started.
+    /// Both players accepted — the START window of `start_timeout_secs` is open.
     MatchStarted {
         match_token: String,
+        start_timeout_secs: u64,
     },
     /// A gameserver was provisioned for a server-authoritative match.
     GameServerReady {
@@ -189,6 +190,16 @@ pub enum ServerMessage {
     InputAck {
         match_token: String,
         frame: u32,
+    },
+    /// A round has begun: the referee holds the sim frozen for `countdown_ticks`
+    /// 33ms ticks (3-2-1). `frame` is the first frame of the hold (the ball
+    /// launches at `frame + countdown_ticks`); `round` is the 0-based round
+    /// number (0 at game start, then `left_score + right_score`).
+    RoundStart {
+        match_token: String,
+        frame: u32,
+        round: u32,
+        countdown_ticks: u32,
     },
     /// One player's `GameInput`, relayed to the opponent so each client can
     /// run the peer's inputs through its local rollback engine. The sender
@@ -709,14 +720,14 @@ async fn handle_client_message(
                 .record_match_event(&match_token, MatchEvent::Declined, Some(steam_id))
                 .await;
         }
-        ClientMessage::P2pConnected { match_token } => {
+        ClientMessage::StartMatch { match_token } => {
             match state
                 .match_manager
                 .mark_connected(&match_token, steam_id, &state.store)
                 .await
             {
                 Ok(()) => {
-                    tracing::info!("player {steam_id} p2p connected for match {match_token}");
+                    tracing::info!("player {steam_id} started match {match_token}");
                     if let Ok(Some(m)) = state.store.get_match(&match_token).await {
                         let other = if steam_id == m.player_a { m.player_b } else { m.player_a };
                         let connections = state.connections.lock().await;
