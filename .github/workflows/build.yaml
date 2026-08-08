@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  registry: ghcr.io/john2143
+  registry: ghcr.io/2143-labs
   repo: steam-lobby
 
 jobs:
@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: write
     outputs:
       image_tag: ${{ steps.meta.outputs.version }}
     steps:
@@ -23,7 +24,7 @@ jobs:
 
     - name: Docker login
       run: |
-        echo "${{ secrets.PAT_PACKAGES }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+        echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -56,7 +57,7 @@ jobs:
 
     - name: Update image tag in deployment YAML
       run: |
-        sed -i "s|\(ghcr\.io/john2143/steam-lobby:\)[0-9]*|\1${{ env.NEW_TAG }}|g" workloads/steam-lobby/deployment.yaml
+        sed -i "s|\(ghcr\.io/2143-labs/steam-lobby:\)[0-9]*|\1${{ env.NEW_TAG }}|g" workloads/steam-lobby/deployment.yaml
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
         git diff --quiet && echo "No changes" || (git commit -am "bump steam-lobby image to ${{ env.NEW_TAG }}" && git push)
