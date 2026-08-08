@@ -78,6 +78,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .collect()
             })
             .unwrap_or_else(|_| vec!["turn:turn.john2143.com:3478?transport=udp".into()]),
+        ticker_shutdown: None,
+        pool: None,
     };
 
     let (app, _state) = build_app(config).await;

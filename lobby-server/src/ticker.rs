@@ -10,10 +10,23 @@ use lobby_core::types::LeaderboardEntry;
 use crate::state::AppState;
 use crate::ws::{notify_match_players, OpponentInfo, ServerMessage};
 
-pub async fn tick_loop(state: Arc<AppState>) {
+pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     let mut interval = tokio::time::interval(Duration::from_secs(2));
+    let mut shutdown = shutdown;
     loop {
-        interval.tick().await;
+        // Either the 2s tick (run the maintenance body below) or a shutdown
+        // signal from the test harness (exit the loop, dropping AppState).
+        let stop = async {
+            if let Some(rx) = shutdown.as_mut() {
+                let _ = rx.changed().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = stop => break,
+        }
         for (mode, game_type) in &state.game_modes {
             match state
                 .matchmaking_queue
@@ -40,11 +53,20 @@ pub async fn tick_loop(state: Arc<AppState>) {
                             .get_player_summary(info_a.player_b)
                             .await
                             .unwrap_or_else(|_| "Unknown".into());
+                        let opponent_player_id = state_a
+                            .store
+                            .get_user_id(info_a.player_b)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|u| u.to_string())
+                            .unwrap_or_default();
                         let connections = state_a.connections.lock().await;
                         if let Some(tx_a) = connections.get(&info_a.player_a).map(|e| &e.tx) {
                             let _ = tx_a.send(ServerMessage::MatchFound {
                                 match_token: info_a.match_token.clone(),
                                 opponent: OpponentInfo {
+                                    player_id: opponent_player_id,
                                     steam_id: info_a.player_b,
                                     display_name: opponent_name,
                                 },
@@ -62,11 +84,20 @@ pub async fn tick_loop(state: Arc<AppState>) {
                             .get_player_summary(info_b.player_a)
                             .await
                             .unwrap_or_else(|_| "Unknown".into());
+                        let opponent_player_id = state_b
+                            .store
+                            .get_user_id(info_b.player_a)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|u| u.to_string())
+                            .unwrap_or_default();
                         let connections = state_b.connections.lock().await;
                         if let Some(tx_b) = connections.get(&info_b.player_b).map(|e| &e.tx) {
                             let _ = tx_b.send(ServerMessage::MatchFound {
                                 match_token: info_b.match_token.clone(),
                                 opponent: OpponentInfo {
+                                    player_id: opponent_player_id,
                                     steam_id: info_b.player_a,
                                     display_name: opponent_name,
                                 },
@@ -85,19 +116,25 @@ pub async fn tick_loop(state: Arc<AppState>) {
         // Leaderboard and stats are per-mode now.
         for (mode, _game_type) in &state.game_modes {
             if let Ok(queue) = state.store.get_queue(mode).await {
-                let leaderboard: Vec<LeaderboardEntry> = state
-                    .store
-                    .list_ratings(mode)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(id, r)| LeaderboardEntry {
+                let ratings = state.store.list_ratings(mode).await.unwrap_or_default();
+                let mut leaderboard: Vec<LeaderboardEntry> = Vec::with_capacity(ratings.len());
+                for (id, r) in ratings {
+                    let player_id = state
+                        .store
+                        .get_user_id(id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|u| u.to_string())
+                        .unwrap_or_default();
+                    leaderboard.push(LeaderboardEntry {
+                        player_id,
                         steam_id: id,
                         mu: r.mu,
                         sigma: r.sigma,
                         rating: r.mu - 3.0 * r.sigma,
-                    })
-                    .collect();
+                    });
+                }
                 let now = chrono::Utc::now();
                 let mut sends: Vec<(u64, ServerMessage)> = Vec::new();
                 for entry in &queue {

@@ -51,6 +51,8 @@ pub struct AppConfig {
     pub pong_enabled: bool, // LOBBY_PONG; run p2p matches as server-authoritative pong
     pub turn_secret: Option<String>, // LOBBY_TURN_SECRET; None => /internal/turn-credentials 503s
     pub turn_uris: Vec<String>,      // LOBBY_TURN_URIS; TURN URIs returned to clients
+    pub ticker_shutdown: Option<tokio::sync::watch::Receiver<bool>>, // test-only: stop the maintenance loop
+    pub pool: Option<sqlx::PgPool>, // test-only: inject the per-test pool so sqlx's post-test close() tears down the server's connections
 }
 
 /// Build the full axum Router + shared state.
@@ -77,12 +79,17 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         }
     }
 
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(10)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&config.db_url)
-        .await
-        .expect("database connection failed — check DATABASE_URL");
+    let pool = match config.pool.clone() {
+        Some(p) => p,
+        None => {
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(10)
+                .acquire_timeout(std::time::Duration::from_secs(5))
+                .connect(&config.db_url)
+                .await
+                .expect("database connection failed — check DATABASE_URL")
+        }
+    };
     sqlx::migrate!().run(&pool).await.expect("database migrations failed");
 
     let store = PostgresStore::new(pool);
@@ -168,7 +175,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         next_generation: std::sync::atomic::AtomicU64::new(0),
     });
 
-    tokio::spawn(ticker::tick_loop(state.clone()));
+    tokio::spawn(ticker::tick_loop(state.clone(), config.ticker_shutdown));
 
     let mut router = Router::new()
         .route("/pong-wrtc.mjs", get(routes::pong_wrtc))
