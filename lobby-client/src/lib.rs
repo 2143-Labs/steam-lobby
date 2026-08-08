@@ -120,6 +120,7 @@ impl std::fmt::Debug for ClientMsg {
 pub enum ServerEvent {
     #[serde(rename = "auth_ok")]
     AuthOk {
+        player_id: String,
         // The server serializes 17-digit Steam IDs as strings (JS-safe).
         #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
         steam_id: u64,
@@ -226,9 +227,9 @@ pub enum ServerEvent {
         candidate: String,
     },
 }
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct OpponentInfo {
+    pub player_id: String,
     #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
     pub steam_id: u64,
     pub display_name: String,
@@ -236,6 +237,7 @@ pub struct OpponentInfo {
 
 #[derive(Debug, Clone)]
 pub struct AuthOk {
+    pub player_id: String,
     pub steam_id: u64,
     pub display_name: String,
     pub state: lobby_core::types::PlayerState,
@@ -373,10 +375,12 @@ impl LobbyClient {
         self.send(ClientMsg::Auth { session_token: token.to_string() })?;
         match self.rx.recv().await.ok_or(ClientError::NoResponse)? {
             Ok(ServerEvent::AuthOk {
+                player_id,
                 steam_id,
                 display_name,
                 state,
             }) => Ok(AuthOk {
+                player_id,
                 steam_id,
                 display_name,
                 state,
