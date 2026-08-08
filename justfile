@@ -11,13 +11,18 @@ build:
   {{nix}}"cargo build --workspace"
 
 test:
-  {{nix}}"cargo test --workspace"
+  {{nix}}"DATABASE_URL=postgres://lobby:lobby@localhost:5432/lobby cargo test --workspace -- --test-threads 4"
 
 test-verbose:
-  {{nix}}"cargo test --workspace -- --nocapture"
+  {{nix}}"DATABASE_URL=postgres://lobby:lobby@localhost:5432/lobby cargo test --workspace -- --test-threads 4 --nocapture"
 
 itest:
-  {{nix}}"cargo test -p lobby-server --test integration -- --nocapture"
+  {{nix}}"DATABASE_URL=postgres://lobby:lobby@localhost:5432/lobby cargo test -p lobby-server --test integration -- --test-threads 4 --nocapture"
+
+# Parallel integration suite via cargo-nextest (per-test DBs from sqlx::test).
+# The binary is a cargo subcommand: `cargo nextest` finds cargo-nextest on PATH.
+test-fast:
+  {{nix}}"DATABASE_URL=postgres://lobby:lobby@localhost:5432/lobby cargo nextest run --workspace"
 
 # JS-side determinism gauntlet + the Rust<->JS differential (needs node)
 js-test:
