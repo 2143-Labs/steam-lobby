@@ -94,9 +94,9 @@ then start matchmaking in each.</p>
   </div>
   <div id="ctrl-inmatch" style="display:none">
     <p id="server-info" style="display:none"></p>
-    <p>P2P: <span id="opp-p2p">Waiting for opponent P2P…</span></p>
+    <p>P2P: <span id="opp-p2p">Waiting for opponent to start…</span></p>
     <p>Result: <span id="report-status">—</span></p>
-    <button id="btn-p2p" class="primary">P2P Connected (simulated)</button>
+    <button id="btn-start" class="primary" style="display:none" disabled>START Match</button>
     <button id="btn-report-win" style="display:none">Report Win</button>
     <button id="btn-report-loss" style="display:none">Report Loss</button>
     <button id="btn-report-draw" style="display:none">Report Draw</button>
@@ -139,7 +139,8 @@ function playerLabel(p) {
 const state = { ws: null, steamId: null, matchToken: null, opponentId: null, gameType: null,
   inputTarget: 0.5, gameMode: "off", game: null,
   sim: null, session: null, stalled: false, lastPongAt: 0, pongAcc: 0, lastPracticeAt: 0,
-  practiceTimer: null, pongTimer: null, iAmPlayerA: undefined };
+  practiceTimer: null, pongTimer: null, iAmPlayerA: undefined,
+  holdUntilMs: null }; // round hold: freeze the sim + draw 3-2-1 until this time
 // Consume an OpenID-issued fragment token (#token=…) if present, then strip it
 // from the URL so it isn't re-sent or stored in history.
 let fragmentToken = null;
@@ -194,6 +195,28 @@ function showControls(name) {
   $("ctrl-match").style.display = name === "match" ? "" : "none";
   $("ctrl-inmatch").style.display = name === "inmatch" ? "" : "none";
   $("game-area").style.display = (name === "queueing" || name === "inmatch") ? "" : "none";
+}
+let startCountdownTimer = null;
+// match_started → reveal the START button with the server's actual window
+// length (msg.start_timeout_secs, NOT a hardcoded 15) and count it down.
+function beginStartCountdown(timeoutSecs) {
+  $("btn-start").style.display = ""; // REVEAL only now — match_started means both accepted
+  $("btn-start").disabled = false;
+  let n = timeoutSecs; // seconds — the server's LOBBY_START_TIMEOUT_SECS
+  $("btn-start").textContent = "START Match (" + n + "s)";
+  startCountdownTimer = setInterval(() => {
+    n -= 1;
+    if (n <= 0) {
+      clearStartCountdown();
+      $("btn-start").disabled = true;
+      $("btn-start").textContent = "Didn't start in time — awaiting result";
+      return;
+    }
+    $("btn-start").textContent = "START Match (" + n + "s)";
+  }, 1000);
+}
+function clearStartCountdown() {
+  if (startCountdownTimer) { clearInterval(startCountdownTimer); startCountdownTimer = null; }
 }
 let hbTimer = null;
 function startHeartbeat(intervalMs) {
@@ -373,18 +396,20 @@ async function handleServer(raw) {
       state.gameType = msg.game_type;
       $("opponent").textContent = playerLabel(msg.opponent);
       $("match-token").textContent = msg.match_token;
-      $("opp-p2p").textContent = "Waiting for opponent P2P…";
+      $("opp-p2p").textContent = "Waiting for opponent to start…";
       $("report-status").textContent = "—";
       if (msg.game_type === "server") {
         $("server-info").style.display = "";
         $("server-info").textContent = "Waiting for server allocation…";
-        $("btn-p2p").style.display = "none";
+        $("btn-start").style.display = "none";
+        $("btn-start").disabled = true;
         $("btn-report-win").style.display = "none";
         $("btn-report-loss").style.display = "none";
         $("btn-report-draw").style.display = "none";
       } else {
         $("server-info").style.display = "none";
-        $("btn-p2p").style.display = "";
+        $("btn-start").style.display = "none";
+        $("btn-start").disabled = true;
         $("btn-report-win").style.display = "none";
         $("btn-report-loss").style.display = "none";
         $("btn-report-draw").style.display = "none";
@@ -416,8 +441,8 @@ async function handleServer(raw) {
       }
       break;
     case "opponent_connected":
-      $("opp-p2p").textContent = "Opponent P2P connected ✓";
-      log("sys", "opponent P2P connected");
+      $("opp-p2p").textContent = "Opponent ready ✓";
+      log("sys", "opponent started");
       break;
     case "report_received":
       const who = msg.reporting_player === state.steamId ? "You" : "Opponent";
@@ -484,6 +509,8 @@ async function handleServer(raw) {
       break;
     case "match_result":
       const o = msg.outcome;
+      clearStartCountdown();
+      state.holdUntilMs = null;
       // The server stores and broadcasts ONE outcome, keyed to player_a's
       // perspective (Win = player_a won, Loss = player_b won). The pong
       // frames told us our side, so render OUR verdict — the two players must
@@ -492,7 +519,10 @@ async function handleServer(raw) {
       if (o && typeof o === "object" && !o.Disputed) {
         const kind = Object.keys(o)[0];
         const muChange = o[kind] && o[kind].mu_change;
-        if (state.iAmPlayerA === undefined) {
+        if (kind === "Forfeit") {
+          // Neither player started — double loss; both players see this.
+          txt = "Match forfeited" + (muChange !== undefined ? " (mu change " + muChange.toFixed(2) + ")" : "");
+        } else if (state.iAmPlayerA === undefined) {
           // Manual-report flow: sides unknown, fall back to the raw outcome.
           txt = kind + (muChange !== undefined ? " (mu change " + muChange.toFixed(2) + ")" : "");
         } else if (kind === "Draw") {
@@ -511,6 +541,15 @@ async function handleServer(raw) {
       state.matchToken = null;
       state.gameType = null;
       $("server-info").style.display = "none";
+      break;
+    case "match_started":
+      beginStartCountdown(msg.start_timeout_secs);
+      $("opp-p2p").textContent = "Waiting for opponent to start…";
+      break;
+    case "round_start":
+      // Referee froze the sim for the 3-2-1: hold rendering at the current
+      // frame (no stepping, no input send) until the hold expires.
+      state.holdUntilMs = performance.now() + msg.countdown_ticks * 33;
       break;
     case "game_state":
       // The referee's authoritative frame (~30Hz). The CANVAS renders the
@@ -654,6 +693,16 @@ function practiceLoop() {
 function pongLoop() {
   // setInterval (not rAF): see practiceLoop — hidden tabs must keep stepping.
   if (state.gameMode !== "pong") { clearInterval(state.pongTimer); state.pongTimer = null; return; }
+  // Round hold (3-2-1): freeze stepping AND input sends until the server's
+  // hold expires — the referee is broadcasting unchanged frames; advancing
+  // locally would desync the sims.
+  if (state.session && state.holdUntilMs !== null) {
+    if (performance.now() < state.holdUntilMs) {
+      if (state.game) renderFrame(); // countdown overlay only
+      return;
+    }
+    state.holdUntilMs = null;
+  }
   const t = performance.now();
   state.pongAcc += Math.min(0.05, (t - state.lastPongAt) / 1000);
   state.lastPongAt = t;
@@ -691,6 +740,17 @@ function renderFrame() {
   pongCtx.beginPath();
   pongCtx.arc(g.ball_x * w, g.ball_y * h, 6, 0, Math.PI * 2);
   pongCtx.fill();
+  // 3-2-1 countdown overlay (server round hold).
+  if (state.holdUntilMs !== null) {
+    const remaining = state.holdUntilMs - performance.now();
+    const n = Math.ceil(remaining / 1000);
+    if (n > 0 && n <= 3) {
+      pongCtx.fillStyle = "#fff";
+      pongCtx.font = "bold 64px ui-monospace, monospace";
+      pongCtx.textAlign = "center"; pongCtx.textBaseline = "middle";
+      pongCtx.fillText(String(n), w / 2, h / 2);
+    }
+  }
 }
 function stopGame() {
   state.gameMode = "off";
@@ -698,6 +758,8 @@ function stopGame() {
   state.sim = null;
   state.session = null;
   state.stalled = false;
+  state.holdUntilMs = null;
+  clearStartCountdown();
   clearInterval(state.practiceTimer);
   state.practiceTimer = null;
   clearInterval(state.pongTimer);
@@ -740,15 +802,18 @@ $("btn-cancel").addEventListener("click", () => {
 });
 $("btn-accept").addEventListener("click", () => {
   send({ type: "accept_match", match_token: state.matchToken });
-  log("sys", "match accepted — send P2P Connected when your transport is up");
+  log("sys", "match accepted — START when your transport is up");
   showControls("inmatch");
   // Reset the in-match panel so a previous game's state never leaks in.
-  $("btn-p2p").style.display = "";
+  // btn-start stays HIDDEN + disabled here: match_started reveals it only
+  // once BOTH players accepted (an early click could never form the game).
+  $("btn-start").style.display = "none";
+  $("btn-start").disabled = true;
   $("server-info").style.display = "none";
   $("btn-report-win").style.display = "none";
   $("btn-report-loss").style.display = "none";
   $("btn-report-draw").style.display = "none";
-  $("opp-p2p").textContent = "Waiting for opponent P2P…";
+  $("opp-p2p").textContent = "Waiting for opponent to start…";
   $("report-status").textContent = "—";
 });
 $("btn-decline").addEventListener("click", () => {
@@ -760,9 +825,11 @@ $("btn-decline").addEventListener("click", () => {
   state.gameType = null;
   $("server-info").style.display = "none";
 });
-$("btn-p2p").addEventListener("click", () => {
+$("btn-start").addEventListener("click", () => {
+  clearStartCountdown();
   send({ type: "start_match", match_token: state.matchToken });
-  $("btn-p2p").style.display = "none";
+  $("btn-start").style.display = "none";
+  $("opp-p2p").textContent = "Waiting for opponent to start…";
   // No report buttons for p2p: the server-authoritative pong game decides the
   // winner and auto-resolves the match. (They stay hidden in the HTML and
   // remain the fallback if the server runs with LOBBY_PONG=false.)
