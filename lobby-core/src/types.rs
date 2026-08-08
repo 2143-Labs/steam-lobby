@@ -186,6 +186,8 @@ pub enum MatchOutcome {
     Draw { mu_change: f64 },
     Disputed,
     UnreviewableDispute,
+    /// Neither player started within the START window — double loss.
+    Forfeit { mu_change: f64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

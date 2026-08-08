@@ -685,7 +685,28 @@ async fn handle_client_message(
                 .accept_match(&match_token, steam_id, &state.store)
                 .await
             {
-                Ok(()) => tracing::info!("player {steam_id} accepted match {match_token}"),
+                Ok(()) => {
+                    tracing::info!("player {steam_id} accepted match {match_token}");
+                    // Both accepted → the match is InProgress: open the START
+                    // window and tell both clients the countdown is running.
+                    if let Ok(Some(m)) = state.store.get_match(&match_token).await {
+                        if m.status == MatchStatus::InProgress
+                            && state.config.pong_enabled
+                            && m.game_type == lobby_core::types::GameType::P2p
+                        {
+                            crate::pong::spawn_start_window(state, &m);
+                            let connections = state.connections.lock().await;
+                            for pid in [m.player_a, m.player_b] {
+                                if let Some(e) = connections.get(&pid) {
+                                    let _ = e.tx.send(ServerMessage::MatchStarted {
+                                        match_token: match_token.clone(),
+                                        start_timeout_secs: state.config.start_timeout_secs,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 Err(e) => {
                     tracing::warn!("player {steam_id} accept rejected for match {match_token}: {e}")
                 }
@@ -728,6 +749,12 @@ async fn handle_client_message(
             {
                 Ok(()) => {
                     tracing::info!("player {steam_id} started match {match_token}");
+                    // Route into the START window (best-effort): if a window is
+                    // still open for this match, record the start. When both
+                    // have started, the handler below spawns the game.
+                    if let Some(w) = state.start_windows.lock().get(&match_token) {
+                        let _ = w.tx.send(steam_id);
+                    }
                     if let Ok(Some(m)) = state.store.get_match(&match_token).await {
                         let other = if steam_id == m.player_a { m.player_b } else { m.player_a };
                         let connections = state.connections.lock().await;

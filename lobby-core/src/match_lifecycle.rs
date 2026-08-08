@@ -9,7 +9,7 @@ use skillratings::Outcomes;
 use crate::error::{LobbyError, Result};
 use crate::mmr;
 use crate::traits::{GameCallbacks, MatchStore, PlayerStore, RatingStore};
-use crate::types::{MatchEvent, MatchOutcome, MatchReport, MatchStatus, PlayerState, SteamId};
+use crate::types::{MatchEvent, MatchOutcome, MatchReport, MatchStatus, OpenSkillRating, PlayerState, SteamId};
 
 pub struct MatchManager<CB: GameCallbacks> {
     callbacks: CB,
@@ -283,6 +283,52 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         }
         self.resolve_agreed(&m, Some(winner), match_store, rating_store, player_store)
             .await
+    }
+
+    /// Resolve a match where neither player started within the START window —
+    /// a double loss: both forfeit and lose rating symmetrically. Requires
+    /// Reporting (same validation as `resolve_pong`); writes outcome "Forfeit".
+    pub async fn resolve_forfeit(
+        &self,
+        token: &str,
+        match_store: &dyn MatchStore,
+        rating_store: &dyn RatingStore,
+        player_store: &dyn PlayerStore,
+    ) -> Result<MatchOutcome> {
+        let m = match_store
+            .get_match(token)
+            .await?
+            .ok_or_else(|| LobbyError::MatchNotFound(token.to_string()))?;
+        if m.status != MatchStatus::Reporting {
+            return Err(LobbyError::MatchStateMismatch(token.to_string()));
+        }
+        // Symmetric penalty: compute one player's loss delta and apply it to
+        // both, so neither player is treated as the winner.
+        let rating_a = rating_store.get_rating(m.player_a, &m.game_mode).await?;
+        let rating_b = rating_store.get_rating(m.player_b, &m.game_mode).await?;
+        let (loser_new, _) = mmr::update_ratings(&rating_a, &rating_b, Outcomes::LOSS);
+        let delta = loser_new.mu - rating_a.mu;
+        let new_a = OpenSkillRating { mu: rating_a.mu + delta, ..rating_a };
+        let new_b = OpenSkillRating { mu: rating_b.mu + delta, ..rating_b };
+        match_store
+            .resolve_match(
+                &m.match_token,
+                &m.game_mode,
+                m.player_a,
+                m.player_b,
+                "Forfeit",
+                Some(delta),
+                Some(delta),
+                &new_a,
+                &new_b,
+            )
+            .await?;
+        let outcome = MatchOutcome::Forfeit { mu_change: delta };
+        self.callbacks.on_match_ended(&m, &outcome).await?;
+        // Terminal: both players are free to queue again.
+        player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
+        player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
+        Ok(outcome)
     }
 
 }

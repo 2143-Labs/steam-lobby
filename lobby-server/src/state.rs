@@ -69,6 +69,8 @@ pub struct AppState {
     pub ticket_limiter: RateLimiter,
     /// Rate limiter for /auth/test-token.
     pub test_token_limiter: RateLimiter,
+    /// START-window tasks: match_token -> pending window (forfeit timer).
+    pub start_windows: ParkMutex<std::collections::HashMap<String, crate::pong::PendingStart>>,
     /// Bumped per connection so a reconnecting client supersedes a stale one.
     pub next_generation: AtomicU64,
     /// Active pong matches: match_token -> input channel + task handle.

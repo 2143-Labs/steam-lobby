@@ -41,6 +41,119 @@ pub struct ActivePong {
 /// health comparison (clients only ever lag a few frames behind).
 const HEALTH_RING: usize = 128;
 
+/// Registry entry for a pending START window: the 15s forfeit timer that
+/// begins once BOTH players accepted a p2p match (InProgress). Each player's
+/// `start_match` message routes its steam_id into `tx`; if both start before
+/// the timeout the handler's `spawn_game` (triggered by the Reporting flip)
+/// takes over and this window exits on the first branch. If the timeout fires
+/// first, any player who did not start forfeits (or both, for a double loss).
+pub struct PendingStart {
+    pub player_a: u64,
+    pub player_b: u64,
+    /// steam_id of a player who clicked START.
+    pub tx: tokio::sync::mpsc::UnboundedSender<u64>,
+    pub abort: tokio::task::AbortHandle,
+}
+
+/// Spawn the START-window task for a p2p match that just reached InProgress.
+/// Idempotent via the registry, exactly like `spawn_game`: the first spawn
+/// wins and a racing duplicate is aborted.
+pub fn spawn_start_window(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    let task_state = state.clone();
+    let token = m.match_token.clone();
+    let task_token = token.clone();
+    let player_a = m.player_a;
+    let player_b = m.player_b;
+    let handle = tokio::spawn(async move {
+        // Pinned deadline: the 15s window is created once, not re-armed per
+        // START — the countdown the client sees maps 1:1 to this sleep.
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(
+            task_state.config.start_timeout_secs,
+        ));
+        tokio::pin!(deadline);
+        let mut started: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        loop {
+            tokio::select! {
+                Some(pid) = rx.recv() => {
+                    started.insert(pid);
+                    if started.contains(&player_a) && started.contains(&player_b) {
+                        break; // both started — the StartMatch handler spawned the game
+                    }
+                }
+                _ = &mut deadline => {
+                    // Timeout: forfeit any player who didn't start.
+                    if let Ok(Some(match_info)) = task_state.store.get_match(&task_token).await {
+                        if match_info.status == lobby_core::types::MatchStatus::Reporting {
+                            break; // game already running — race, do nothing
+                        }
+                        if match_info.status == lobby_core::types::MatchStatus::InProgress {
+                            let winner = if started.contains(&player_a) { Some(player_a) }
+                                else if started.contains(&player_b) { Some(player_b) } else { None };
+                            let outcome = if let Some(w) = winner {
+                                // resolve_pong requires Reporting (match_lifecycle.rs).
+                                task_state.store
+                                    .update_match(&task_token, lobby_core::types::MatchStatus::Reporting, chrono::Utc::now())
+                                    .await
+                                    .ok();
+                                task_state
+                                    .match_manager
+                                    .resolve_pong(&task_token, w, &task_state.store, &task_state.store, &task_state.store)
+                                    .await
+                            } else {
+                                // Neither started → DOUBLE LOSS (user decision).
+                                task_state.store
+                                    .update_match(&task_token, lobby_core::types::MatchStatus::Reporting, chrono::Utc::now())
+                                    .await
+                                    .ok();
+                                task_state
+                                    .match_manager
+                                    .resolve_forfeit(&task_token, &task_state.store, &task_state.store, &task_state.store)
+                                    .await
+                            };
+                            // Broadcast to both (mirror the disconnect-forfeit block, ws.rs).
+                            let connections = task_state.connections.lock().await;
+                            for pid in [player_a, player_b] {
+                                if let Some(e) = connections.get(&pid) {
+                                    if let Some(w) = winner {
+                                        let _ = e.tx.send(crate::ws::ServerMessage::GameOver {
+                                            match_token: task_token.clone(),
+                                            winner: w,
+                                        });
+                                    }
+                                    if let Ok(o) = &outcome {
+                                        let _ = e.tx.send(crate::ws::ServerMessage::MatchResult {
+                                            match_token: task_token.clone(),
+                                            outcome: serde_json::to_value(o).unwrap(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        task_state.start_windows.lock().remove(&task_token);
+    });
+    // Register; a racing duplicate is aborted like `spawn_game`.
+    let mut windows = state.start_windows.lock();
+    if windows.contains_key(&token) {
+        handle.abort();
+        return;
+    }
+    windows.insert(
+        token,
+        PendingStart {
+            player_a,
+            player_b,
+            tx,
+            abort: handle.abort_handle(),
+        },
+    );
+}
+
 /// Pop every queued input with `frame <= next`, applying the last as the
 /// paddle target (inputs for older frames are superseded; between changes the
 /// sim holds its goal — hold-last).
@@ -77,6 +190,10 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
         let mut checksums: VecDeque<(u32, u64)> = VecDeque::new();
         // Last frame advanced to; -1 = the initial state.
         let mut frame: i64 = -1;
+        // Round hold: 3-2-1 countdown between points (0 = disabled). While > 0,
+        // the sim is frozen and only the unchanged snapshot is broadcast.
+        let countdown_ticks = task_state.config.pong_countdown_ticks;
+        let mut hold_remaining: u32 = 0;
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(TICK_MS));
         // Bootstrap: broadcast the initial state once (frame 0). Each client
         // needs a frame to learn which side it is (player_a = Left) and create
@@ -105,6 +222,22 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                 }
             }
         }
+        // Round 0 begins with the 3-2-1 hold (if enabled): the initial state
+        // is the frozen frame 0; the ball launches at frame 0 + countdown_ticks.
+        if countdown_ticks > 0 {
+            hold_remaining = countdown_ticks;
+            let connections = task_state.connections.lock().await;
+            for pid in players {
+                if let Some(e) = connections.get(&pid) {
+                    let _ = e.tx.send(crate::ws::ServerMessage::RoundStart {
+                        match_token: task_token.clone(),
+                        frame: 0,
+                        round: 0,
+                        countdown_ticks,
+                    });
+                }
+            }
+        }
         loop {
             interval.tick().await;
             // 1. stop if the match left Reporting (report/expiry raced us)
@@ -126,29 +259,20 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                 pending_health.push(h);
             }
 
-            let next = (frame + 1) as u32;
-            let left_ready = left_inputs.back().is_some_and(|(f, _)| *f >= next);
-            let right_ready = right_inputs.back().is_some_and(|(f, _)| *f >= next);
-            if left_ready && right_ready {
+            if hold_remaining > 0 {
+                // Frozen frame: no input gate, no step. Broadcast the CURRENT
+                // (unchanged) snapshot + ack so clients' confirmed frames
+                // advance in lockstep during the 3-2-1.
                 frame += 1;
-                apply_side(&mut left_inputs, PongSide::Left, next, &mut game);
-                apply_side(&mut right_inputs, PongSide::Right, next, &mut game);
-                // 4. advance physics + record the authoritative checksum
-                game.step(DT_SECS);
-                let cksum = game.checksum();
-                checksums.push_back((next, cksum));
-                if checksums.len() > HEALTH_RING {
-                    checksums.pop_front();
-                }
-                // 5. broadcast the authoritative frame to both players
-                let snap = game.snapshot();
+                let snap = game.snapshot();   // unchanged during hold
+                let cksum = game.checksum();  // constant
                 {
                     let connections = task_state.connections.lock().await;
                     for pid in players {
                         if let Some(e) = connections.get(&pid) {
                             let _ = e.tx.send(crate::ws::ServerMessage::GameState {
                                 match_token: task_token.clone(),
-                                frame: next,
+                                frame: frame as u32,
                                 player_a: players[0],
                                 player_b: players[1],
                                 left_y: snap.left_y,
@@ -163,52 +287,123 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                         }
                     }
                 }
-                // 6. ack the confirmed frame to both players
                 {
                     let connections = task_state.connections.lock().await;
                     for pid in players {
                         if let Some(e) = connections.get(&pid) {
                             let _ = e.tx.send(crate::ws::ServerMessage::InputAck {
                                 match_token: task_token.clone(),
-                                frame: next,
+                                frame: frame as u32,
                             });
                         }
                     }
                 }
-                // 7. first to 3 -> declare winner, auto-resolve, notify, exit
-                if let Some(winner_side) = game.winner() {
-                    let winner = match winner_side {
-                        PongSide::Left => players[0],
-                        PongSide::Right => players[1],
-                    };
-                    let outcome = task_state
-                        .match_manager
-                        .resolve_pong(
-                            &task_token,
-                            winner,
-                            &task_state.store,
-                            &task_state.store,
-                            &task_state.store,
-                        )
-                        .await;
-                    tracing::info!("match {task_token} pong ended, winner {winner}: {outcome:?}");
-                    // GameOver to both (best-effort), then match_result like the report path does
-                    let connections = task_state.connections.lock().await;
-                    for pid in players {
-                        if let Some(e) = connections.get(&pid) {
-                            let _ = e.tx.send(crate::ws::ServerMessage::GameOver {
-                                match_token: task_token.clone(),
-                                winner,
-                            });
-                            if let Ok(o) = &outcome {
-                                let _ = e.tx.send(crate::ws::ServerMessage::MatchResult {
+                hold_remaining -= 1;
+            } else {
+                let next = (frame + 1) as u32;
+                let left_ready = left_inputs.back().is_some_and(|(f, _)| *f >= next);
+                let right_ready = right_inputs.back().is_some_and(|(f, _)| *f >= next);
+                if left_ready && right_ready {
+                    frame += 1;
+                    apply_side(&mut left_inputs, PongSide::Left, next, &mut game);
+                    apply_side(&mut right_inputs, PongSide::Right, next, &mut game);
+                    // 4. advance physics + record the authoritative checksum
+                    let before = game.snapshot(); // scores before step
+                    game.step(DT_SECS);
+                    let cksum = game.checksum();
+                    checksums.push_back((next, cksum));
+                    if checksums.len() > HEALTH_RING {
+                        checksums.pop_front();
+                    }
+                    // 5. broadcast the authoritative frame to both players
+                    let snap = game.snapshot();
+                    {
+                        let connections = task_state.connections.lock().await;
+                        for pid in players {
+                            if let Some(e) = connections.get(&pid) {
+                                let _ = e.tx.send(crate::ws::ServerMessage::GameState {
                                     match_token: task_token.clone(),
-                                    outcome: serde_json::to_value(o).unwrap(),
+                                    frame: next,
+                                    player_a: players[0],
+                                    player_b: players[1],
+                                    left_y: snap.left_y,
+                                    right_y: snap.right_y,
+                                    ball_x: snap.ball_x,
+                                    ball_y: snap.ball_y,
+                                    left_score: snap.left_score,
+                                    right_score: snap.right_score,
+                                    speed: snap.speed,
+                                    checksum: cksum.to_string(),
                                 });
                             }
                         }
                     }
-                    break;
+                    // 6. ack the confirmed frame to both players
+                    {
+                        let connections = task_state.connections.lock().await;
+                        for pid in players {
+                            if let Some(e) = connections.get(&pid) {
+                                let _ = e.tx.send(crate::ws::ServerMessage::InputAck {
+                                    match_token: task_token.clone(),
+                                    frame: next,
+                                });
+                            }
+                        }
+                    }
+                    // 7. point scored? (replaces the plain winner() check)
+                    let scored = snap.left_score != before.left_score
+                        || snap.right_score != before.right_score;
+                    if scored {
+                        if let Some(winner_side) = game.winner() {
+                            let winner = match winner_side {
+                                PongSide::Left => players[0],
+                                PongSide::Right => players[1],
+                            };
+                            let outcome = task_state
+                                .match_manager
+                                .resolve_pong(
+                                    &task_token,
+                                    winner,
+                                    &task_state.store,
+                                    &task_state.store,
+                                    &task_state.store,
+                                )
+                                .await;
+                            tracing::info!("match {task_token} pong ended, winner {winner}: {outcome:?}");
+                            // GameOver to both (best-effort), then match_result like the report path does
+                            let connections = task_state.connections.lock().await;
+                            for pid in players {
+                                if let Some(e) = connections.get(&pid) {
+                                    let _ = e.tx.send(crate::ws::ServerMessage::GameOver {
+                                        match_token: task_token.clone(),
+                                        winner,
+                                    });
+                                    if let Ok(o) = &outcome {
+                                        let _ = e.tx.send(crate::ws::ServerMessage::MatchResult {
+                                            match_token: task_token.clone(),
+                                            outcome: serde_json::to_value(o).unwrap(),
+                                        });
+                                    }
+                                }
+                            }
+                            break;
+                        } else if countdown_ticks > 0 {
+                            // Point scored, game not over: hold the sim frozen
+                            // for the 3-2-1 countdown before the next round.
+                            hold_remaining = countdown_ticks;
+                            let connections = task_state.connections.lock().await;
+                            for pid in players {
+                                if let Some(e) = connections.get(&pid) {
+                                    let _ = e.tx.send(crate::ws::ServerMessage::RoundStart {
+                                        match_token: task_token.clone(),
+                                        frame: next,
+                                        round: (snap.left_score + snap.right_score) as u32,
+                                        countdown_ticks,
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

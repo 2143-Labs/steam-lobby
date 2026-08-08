@@ -172,6 +172,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
             turn_secret: config.turn_secret.clone(),
             turn_uris: config.turn_uris.clone(),
         },
+        start_windows: parking_lot::Mutex::new(std::collections::HashMap::new()),
         openid_states: std::sync::Mutex::new(std::collections::HashMap::new()),
         pong_games: parking_lot::Mutex::new(std::collections::HashMap::new()),
         ticket_limiter: RateLimiter::new(10, std::time::Duration::from_secs(60)),
