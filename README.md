@@ -313,7 +313,7 @@ All communication happens over a single WebSocket connection at `/ws`. Messages 
 | `cancel_matchmaking` | — | Leave queue |
 | `accept_match` | `match_token: String` | Accept a found match |
 | `decline_match` | `match_token: String` | Decline a found match (rare — acceptance is the default) |
-| `p2p_connected` | `match_token: String` | Notify server that P2P connection to opponent is established |
+| `start_match` | `match_token: String` | Click START = the P2P connection to the opponent is established; begin the match. Sent within the START window opened once both players accept (`match_started`); if a player doesn't start in time they forfeit (or both do — double loss — if neither does) |
 | `match_report` | `match_token: String`, `winner: u64?`, `demo_hash: String?` | Submit match result (winner is the victor's steam_id; `null` for draw) |
 | `heartbeat` | — | Client liveness signal. Send every ~10s for as long as you're connected — the server drops the connection 30s after the last heartbeat, and while queueing the queue entry is dropped 30s after the last heartbeat too (so a 10s cadence keeps both alive indefinitely) |
 
@@ -324,7 +324,9 @@ All communication happens over a single WebSocket connection at `/ws`. Messages 
 | `auth_ok` | `steam_id: u64`, `display_name: String`, `state: string` | Authentication succeeded; `state` is the player's persisted status (`in_menus`/`queueing`/`match_accepted`/`in_match`/`reporting`) so a reconnect knows where it left off |
 | `match_found` | `match_token: String`, `opponent: { steam_id, display_name }`, `timeout_ms: u64`, `game_type: "p2p" \| "server"` | A match is ready — accept or it expires; `game_type` tells the client which lifecycle to run |
 | `queue_status` | `elapsed_ms`, `band_lo/hi`, `candidates`, `queue_size`, `my_mu/sigma/rating`, `leaderboard: [{steam_id, mu, sigma, rating}]` | Live queue stats pushed every ~2s while queueing (wait time, expanding MMR band, opponents available, your rating, full MMR leaderboard) |
-| `opponent_connected` | `match_token` | The opponent's `p2p_connected` signal was accepted |
+| `opponent_connected` | `match_token` | The opponent's `start_match` signal was accepted — the opponent is ready to begin |
+| `match_started` | `match_token: String`, `start_timeout_secs: u64` | Both players accepted — the START window is open; each must send `start_match` within `start_timeout_secs` or forfeit (double loss if neither does) |
+| `round_start` | `match_token: String`, `frame: u32`, `round: u32`, `countdown_ticks: u32` | A pong round begins: the referee holds the sim frozen for `countdown_ticks` 33ms ticks (3-2-1); the ball launches at `frame + countdown_ticks` |
 | `report_received` | `match_token`, `reporting_player`, `winner: Option<steam_id>`, `demo_hash` | A player submitted a match report — sent to both players before resolution |
 | `error` | `message: String` | An error occurred processing a message |
 | `match_result` | `match_token: String`, `outcome: Value` | The reports agreed and the match resolved (`Win`/`Loss`/`Draw`/`Disputed` with mu change) — sent to **both** players |
@@ -345,7 +347,7 @@ Client                           Server
   |<--- match_found { token } ----|
   |                                |
   |--- accept_match { token } --->|
-  |--- p2p_connected { token } -->|
+  |--- start_match { token } --->|
   |        (match in progress)    |
   |                                |
   |--- match_report { ... } ----->|
@@ -449,10 +451,13 @@ in two browser tabs. To test multiple users locally:
    `GAME_MODES` is in force). Click **Start Matchmaking** in both — the
    queueing panel shows live wait time, the expanding MMR band and opponents in
    it, your own μ/σ/rating, and a leaderboard of every player's rating.
-5. **Accept** on both. For a p2p mode, click **P2P Connected (simulated)** —
-   this demo has no real P2P transport; the button only sends the game's
-   `p2p_connected` signal, and each tab shows the other's signal
-   (`Opponent P2P connected ✓`). For a server mode the panel shows
+5. **Accept** on both. Once both have accepted, the server opens a **START
+   window** (`match_started`, default 15s): click **START Match** in each tab
+   — the button simulates the P2P connection being established (the real
+   WebRTC data channel is created on the first game frame). Each tab shows
+   the other's signal as `Opponent ready ✓`; a player who doesn't start in
+   time forfeits (or both do — a double loss — if neither starts). For a
+   server mode the panel shows
    "Waiting for server allocation…", then the (simulated) server address; the
    built-in mock creator auto-reports player_a's win ~3s later, and both tabs
    show the resolved result.
@@ -462,6 +467,11 @@ in two browser tabs. To test multiple users locally:
 
 The event log shows every JSON message sent and received — a live protocol
 reference. No Steam account or API key is involved.
+
+The match lifecycle is being migrated to activity-based Temporal workflows
+(session → queue → match, with the START window, connect handshake and report
+timeouts as workflow timers) — see the plan's Part B design before touching
+the in-process lifecycle code.
 
 ## Contributing
 

@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 mod common; // lobby-server/tests/common.rs — TestHarness + setup()
-use common::{setup, setup_pong, setup_with_creator};
+use common::{setup, setup_pong, setup_pong_countdown, setup_pong_start_timeout, setup_with_creator};
 
 /// Poll `query` (a fresh sqlx query for `token`) until it returns a row or 5s elapses.
 /// The server processes WS reports asynchronously, so a straight fetch could race.
@@ -1607,4 +1607,201 @@ async fn queueing_survives_stale_sweep_after_reconnect(pool: sqlx::PgPool) {
     assert_eq!(state, "Queueing", "queue state must be intact");
 
     drop(c1);
+}
+
+#[sqlx::test]
+async fn start_timeout_forfeits_non_starter(pool: sqlx::PgPool) {
+    // Both players accept; only p1 (110) clicks START. After the 2s window,
+    // the server must forfeit p2 and award the match to p1.
+    let h = setup_pong_start_timeout(pool, 2).await;
+    let (mut p1, mut p2, token) = pair_up(&h, 110, 210, "ranked_1v1").await;
+
+    p1.accept_match(&token).await.unwrap();
+    p2.accept_match(&token).await.unwrap();
+    assert!(
+        wait_for_status(&h.pool, &token, "InProgress").await,
+        "both accepts must transition the match to InProgress"
+    );
+
+    // Only the starter signals START; p2 never does.
+    p1.start_match(&token).await.unwrap();
+
+    assert!(
+        wait_for_status_for(&h.pool, &token, "Resolved", 15).await,
+        "the 2s START window must forfeit-resolve the match"
+    );
+    // outcome is player_a-perspective; pairing order is racy, so compute the
+    // expected value from the starter's side.
+    let player_a: i64 = sqlx::query_scalar("SELECT player_a FROM matches WHERE match_token = $1")
+        .bind(&token)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    let expected = if player_a as u64 == 110 { "Win" } else { "Loss" };
+    let outcome: String = sqlx::query_scalar("SELECT outcome FROM match_results WHERE match_token = $1")
+        .bind(&token)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(outcome, expected, "the starter must be recorded as the winner");
+
+    // The starter's rating rises; the non-starter's falls.
+    let mu110: f64 = sqlx::query_scalar(
+        "SELECT mu FROM ratings WHERE steam_id = $1 AND game_mode = 'ranked_1v1'",
+    )
+    .bind(110i64)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let mu210: f64 = sqlx::query_scalar(
+        "SELECT mu FROM ratings WHERE steam_id = $1 AND game_mode = 'ranked_1v1'",
+    )
+    .bind(210i64)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert!(mu110 > 25.0, "starter's mu should increase, got {mu110}");
+    assert!(mu210 < 25.0, "non-starter's mu should decrease, got {mu210}");
+
+    drop(p1);
+    drop(p2);
+}
+
+#[sqlx::test]
+async fn start_timeout_forfeits_neither(pool: sqlx::PgPool) {
+    // Both players accept but NEITHER clicks START → double loss (user
+    // decision): outcome "Forfeit", both mu changes negative, both freed.
+    let h = setup_pong_start_timeout(pool, 2).await;
+    let (mut p1, mut p2, token) = pair_up(&h, 110, 210, "ranked_1v1").await;
+
+    p1.accept_match(&token).await.unwrap();
+    p2.accept_match(&token).await.unwrap();
+    assert!(
+        wait_for_status(&h.pool, &token, "InProgress").await,
+        "both accepts must transition the match to InProgress"
+    );
+
+    assert!(
+        wait_for_status_for(&h.pool, &token, "Resolved", 15).await,
+        "the 2s START window must resolve the match when nobody starts"
+    );
+    let outcome: String = sqlx::query_scalar("SELECT outcome FROM match_results WHERE match_token = $1")
+        .bind(&token)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(outcome, "Forfeit", "neither-started must record a double-loss Forfeit");
+
+    let (mu_change_a, mu_change_b): (f64, f64) = sqlx::query_as(
+        "SELECT mu_change_a, mu_change_b FROM match_results WHERE match_token = $1",
+    )
+    .bind(&token)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert!(mu_change_a < 0.0, "player_a must lose rating, got {mu_change_a}");
+    assert!(mu_change_b < 0.0, "player_b must lose rating, got {mu_change_b}");
+
+    // Terminal: both players return to the menus.
+    let s110: String = sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = $1")
+        .bind(110i64)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    let s210: String = sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = $1")
+        .bind(210i64)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(s110, "InMenus", "player 110 must be free to queue again");
+    assert_eq!(s210, "InMenus", "player 210 must be free to queue again");
+
+    // BOTH clients get a MatchResult whose outcome serializes with a Forfeit key.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut check = |ev: ServerEvent| match ev {
+        ServerEvent::MatchResult { outcome, .. } => Some(outcome.get("Forfeit").is_some()),
+        _ => None,
+    };
+    let r1 = wait_for_event("forfeit match_result p1", &mut p1, deadline, &mut check).await;
+    let r2 = wait_for_event("forfeit match_result p2", &mut p2, deadline, &mut check).await;
+    assert!(r1, "p1's match_result must carry a Forfeit outcome");
+    assert!(r2, "p2's match_result must carry a Forfeit outcome");
+
+    drop(p1);
+    drop(p2);
+}
+
+#[sqlx::test]
+async fn pong_broadcasts_round_start_and_holds(pool: sqlx::PgPool) {
+    // With the countdown enabled (90 ticks), the referee must broadcast a
+    // RoundStart and then hold the sim frozen (constant checksum) for exactly
+    // 90 frames before any checksum changes.
+    let h = setup_pong_countdown(pool).await;
+    let (mut p1, mut p2, token) = pair_up(&h, 110, 210, "ranked_1v1").await;
+
+    p1.accept_match(&token).await.unwrap();
+    p2.accept_match(&token).await.unwrap();
+    assert!(
+        wait_for_status(&h.pool, &token, "InProgress").await,
+        "both accepts must transition the match to InProgress"
+    );
+    p1.start_match(&token).await.unwrap();
+    p2.start_match(&token).await.unwrap();
+    assert!(
+        wait_for_status(&h.pool, &token, "Reporting").await,
+        "both starts must transition the match to Reporting"
+    );
+
+    // p1 must receive RoundStart { frame: 0, round: 0, countdown_ticks: 90 }.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let rs = wait_for_event("round_start", &mut p1, deadline, |ev| match ev {
+        ServerEvent::RoundStart { frame, round, countdown_ticks, .. } => {
+            Some((frame, round, countdown_ticks))
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(rs, (0, 0, 90), "round 0 must open with a 90-tick hold");
+
+    // Feed inputs so the sim can advance past the hold; the hold itself is
+    // broadcast regardless (frozen snapshot + constant checksum).
+    let mut frame = 0u32;
+    let feed_deadline = std::time::Instant::now() + Duration::from_secs(7);
+    while std::time::Instant::now() < feed_deadline {
+        p1.send_game_input(&token, frame, 0.5).await.unwrap();
+        p2.send_game_input(&token, frame, 0.05).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(33)).await;
+        frame += 1;
+    }
+
+    // Collect GameState checksums; the first ~90 frames must be IDENTICAL
+    // (frozen ball), then the checksum changes once the ball launches.
+    let mut checksums: Vec<(u32, String)> = Vec::new();
+    let collect_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while checksums.len() < 120 && std::time::Instant::now() < collect_deadline {
+        match timeout(Duration::from_secs(2), p1.next_event()).await {
+            Ok(Some(Ok(ServerEvent::GameState { frame, checksum, .. }))) => {
+                if !checksums.iter().any(|(f, _)| *f == frame) {
+                    checksums.push((frame, checksum));
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(e))) => panic!("client error: {e}"),
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    checksums.sort_by_key(|(f, _)| *f);
+    assert!(checksums.len() >= 91, "need frames 0..90+, got {}", checksums.len());
+    let first = &checksums[0].1;
+    for (f, c) in checksums.iter().take(90) {
+        assert_eq!(c, first, "frame {f} must be frozen (constant checksum)");
+    }
+    assert_ne!(
+        &checksums[90].1, first,
+        "frame 90 must have a different checksum — the ball launches after the hold"
+    );
+
+    drop(p1);
+    drop(p2);
 }

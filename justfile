@@ -50,16 +50,25 @@ run:
   {{nix}}"cargo run -p lobby-server"
 
 
-# start database container (uses `docker compose` when available,
-# otherwise falls back to a plain `docker run` — both produce the same
-# postgres://lobby:lobby@localhost:5432/lobby that .env.example expects)
+# start database container (uses `docker compose` when available, otherwise
+# podman (this machine: no docker binaries), otherwise a plain `docker run`
+# — all three produce the same postgres://lobby:lobby@localhost:5432/lobby
+# that .env.example expects)
 db-up:
   #!/usr/bin/env bash
   set -e
   if docker compose version &>/dev/null; then
     docker compose up -d db
+  elif podman ps -q -f name=lobby-db | grep -q .; then
+    echo "lobby-db already running"
   elif docker ps -q -f name=lobby-db | grep -q .; then
     echo "lobby-db already running"
+  elif command -v podman >/dev/null 2>&1; then
+    podman run -d --name lobby-db \
+      -e POSTGRES_USER=lobby -e POSTGRES_PASSWORD=lobby \
+      -e POSTGRES_DB=lobby -p 5432:5432 \
+      -v lobby-pgdata:/var/lib/postgresql/data \
+      postgres:16-alpine
   else
     docker run -d --name lobby-db \
       -e POSTGRES_USER=lobby -e POSTGRES_PASSWORD=lobby \
@@ -68,10 +77,15 @@ db-up:
       postgres:16-alpine
   fi
   # Wait until Postgres accepts connections on :5432 (check inside the
-  # container, so this works on any host where `docker` does).
+  # container, so this works on any host where the container tool does).
   if docker compose version &>/dev/null; then
     for _ in $(seq 1 30); do
       docker compose exec -T db pg_isready -U lobby &>/dev/null && break
+      sleep 1
+    done
+  elif command -v podman >/dev/null 2>&1; then
+    for _ in $(seq 1 30); do
+      podman exec lobby-db pg_isready -U lobby &>/dev/null && break
       sleep 1
     done
   else
@@ -88,14 +102,14 @@ db-down:
   set -e
   if docker compose version &>/dev/null; then
     docker compose down
+  elif podman ps -q -f name=lobby-db | grep -q .; then
+    podman rm -f lobby-db
   elif docker ps -q -f name=lobby-db | grep -q .; then
     docker rm -f lobby-db
   else
     echo "no lobby-db container to stop"
   fi
   echo "DB stopped"
-
-# full local stack (Docker Compose reads .env automatically)
 up:
   docker compose up -d
 

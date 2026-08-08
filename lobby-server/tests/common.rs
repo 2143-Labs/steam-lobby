@@ -1,3 +1,5 @@
+#![allow(dead_code)] // shared harness: each test binary uses only the setup_* it needs
+
 use std::sync::Arc;
 
 use lobby_server::{build_app, AppConfig};
@@ -29,27 +31,40 @@ impl Drop for TestHarness {
 }
 
 pub async fn setup(pool: PgPool) -> TestHarness {
-    setup_full(pool, false, None, None).await
+    setup_full(pool, false, None, None, 15, 0).await
 }
 
 /// Harness with the pong game enabled (LOBBY_PONG = true) for p2p matches.
 pub async fn setup_pong(pool: PgPool) -> TestHarness {
-    setup_full(pool, true, None, None).await
+    setup_full(pool, true, None, None, 15, 0).await
+}
+
+/// Pong harness with the round 3-2-1 countdown enabled (90 ticks = 3s).
+pub async fn setup_pong_countdown(pool: PgPool) -> TestHarness {
+    setup_full(pool, true, None, None, 15, 90).await
+}
+
+/// Pong harness with a short START window (forfeit after `secs`).
+pub async fn setup_pong_start_timeout(pool: PgPool, secs: u64) -> TestHarness {
+    setup_full(pool, true, None, None, secs, 0).await
 }
 
 pub async fn setup_with_creator(pool: PgPool, creator_url: Option<&str>) -> TestHarness {
-    setup_full(pool, false, creator_url, None).await
+    setup_full(pool, false, creator_url, None, 15, 0).await
 }
 
 pub async fn setup_with_turn(pool: PgPool, turn_secret: Option<&str>) -> TestHarness {
-    setup_full(pool, true, None, turn_secret.map(String::from)).await
+    setup_full(pool, true, None, turn_secret.map(String::from), 15, 0).await
 }
+
 
 async fn setup_full(
     pool: PgPool,
     pong_enabled: bool,
     creator_url: Option<&str>,
     turn_secret: Option<String>,
+    start_timeout_secs: u64,
+    countdown_ticks: u32,
 ) -> TestHarness {
     // sqlx::test has already created + migrated the per-test database; the
     // URL is the one piece of info the test binary does not otherwise know.
@@ -84,8 +99,8 @@ async fn setup_full(
         gameserver_alloc_timeout_secs: 60,
         gameserver_result_timeout_secs: 300,
         pong_enabled,
-        start_timeout_secs: 15,
-        pong_countdown_ticks: 0, // Step 5 makes this a param; 0 = countdown off (rollback tests)
+        start_timeout_secs,
+        pong_countdown_ticks: countdown_ticks,
         turn_secret,
         turn_uris: vec!["turn:turn.john2143.com:3478?transport=udp".into()],
         ticker_shutdown: Some(shutdown_rx),

@@ -95,9 +95,10 @@ async fn signaling_relay(pool: sqlx::PgPool) {
     let end = tokio::time::Instant::now() + Duration::from_millis(500);
     let mut p3_ok = true;
     while tokio::time::Instant::now() < end {
-        match timeout(Duration::from_millis(100), p3.next_event()).await {
-            Ok(Some(Ok(ev))) if matches!(ev, ServerEvent::WebrtcOffer { .. } | ServerEvent::WebrtcAnswer { .. } | ServerEvent::WebrtcIce { .. }) => { p3_ok = false; }
-            _ => {}
+        if let Ok(Some(Ok(ServerEvent::WebrtcOffer { .. } | ServerEvent::WebrtcAnswer { .. } | ServerEvent::WebrtcIce { .. }))) =
+            timeout(Duration::from_millis(100), p3.next_event()).await
+        {
+            p3_ok = false;
         }
     }
     assert!(p3_ok, "non-participant must not receive WebRTC signaling");
@@ -106,7 +107,7 @@ async fn signaling_relay(pool: sqlx::PgPool) {
     let mut p1_ok = true;
     while tokio::time::Instant::now() < end {
         match timeout(Duration::from_millis(100), p1.next_event()).await {
-            Ok(Some(Ok(ServerEvent::WebrtcOffer { from, .. }))) if from == 9992 => { p1_ok = false; }
+            Ok(Some(Ok(ServerEvent::WebrtcOffer { from: 9992, .. }))) => { p1_ok = false; }
             Ok(Some(Ok(_))) => {}
             _ => {}
         }
