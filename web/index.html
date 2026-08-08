@@ -83,7 +83,7 @@ then start matchmaking in each.</p>
       <p>My MMR: μ <span id="q-mu">—</span> σ <span id="q-sigma">—</span>
          rating <span id="q-rating">—</span></p>
     </div>
-    <table id="leaderboard"><thead><tr><th>Steam ID</th><th>μ</th><th>σ</th><th>Rating</th></tr></thead>
+    <table id="leaderboard"><thead><tr><th>Player ID</th><th>μ</th><th>σ</th><th>Rating</th></tr></thead>
       <tbody></tbody></table>
   </div>
   <div id="ctrl-match" style="display:none">
@@ -125,6 +125,16 @@ function jwtSub(token) {
     const pad = b64.length % 4 ? "=".repeat(4 - b64.length % 4) : "";
     return JSON.parse(atob(b64 + pad)).sub || null;
   } catch { return null; }
+}
+
+// Short display form of a player id (first 8 chars of the account UUID).
+function shortId(id) { return id && id.length >= 8 ? id.slice(0, 8) : (id || "—"); }
+// A player's display label: name when known, always with the short player id.
+function playerLabel(p) {
+  const id = shortId(p.player_id);
+  return p.display_name && p.display_name !== "Unknown"
+    ? p.display_name + " · " + id
+    : "Player " + id;
 }
 const state = { ws: null, steamId: null, matchToken: null, opponentId: null, gameType: null,
   inputTarget: 0.5, gameMode: "off", game: null,
@@ -171,7 +181,10 @@ function log(kind, text) {
   const el = $("log");
   const line = document.createElement("div");
   line.className = kind;
-  line.textContent = new Date().toISOString().slice(11, 23) + "  " + text;
+  // Mask raw Steam IDs (17 digits) in the protocol dump — the UI is
+  // player-id-only; the wire still carries steam_id for gameplay.
+  const masked = text.replace(/\b7\d{16}\b/g, "…");
+  line.textContent = new Date().toISOString().slice(11, 23) + "  " + masked;
   el.appendChild(line);
   el.scrollTop = el.scrollHeight;
 }
@@ -344,7 +357,7 @@ async function handleServer(raw) {
       // Player ID box: the abstract account id (users.id, the JWT `sub`) that
       // every provider's session will share — never the per-provider steam_id.
       // Shown after any successful login (Steam button or dev Connect).
-      const sub = jwtSub(state.token);
+      const sub = msg.player_id || jwtSub(state.token);
       if (sub) {
         $("player-id").value = sub;
         $("player-id-box").style.display = "";
@@ -358,7 +371,7 @@ async function handleServer(raw) {
       state.matchToken = msg.match_token;
       state.opponentId = msg.opponent.steam_id;
       state.gameType = msg.game_type;
-      $("opponent").textContent = msg.opponent.steam_id + " (" + msg.opponent.display_name + ")";
+      $("opponent").textContent = playerLabel(msg.opponent);
       $("match-token").textContent = msg.match_token;
       $("opp-p2p").textContent = "Waiting for opponent P2P…";
       $("report-status").textContent = "—";
@@ -395,7 +408,7 @@ async function handleServer(raw) {
           cell.textContent = txt;
           return cell;
         };
-        tr.appendChild(td(e.steam_id));
+        tr.appendChild(td(shortId(e.player_id)));
         tr.appendChild(td(e.mu.toFixed(1)));
         tr.appendChild(td(e.sigma.toFixed(1)));
         tr.appendChild(td(e.rating.toFixed(1)));

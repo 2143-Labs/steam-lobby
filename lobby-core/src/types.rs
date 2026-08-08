@@ -68,6 +68,8 @@ where
 /// One row of the MMR leaderboard pushed to queueing players.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderboardEntry {
+    /// The abstract account id (users.id) — what the UI shows as "player id".
+    pub player_id: String,
     #[serde(serialize_with = "serialize_steam_id", deserialize_with = "deserialize_steam_id")]
     pub steam_id: SteamId,
     pub mu: f64,
@@ -282,6 +284,7 @@ mod tests {
     #[test]
     fn leaderboard_entry_round_trips() {
         let entry = LeaderboardEntry {
+            player_id: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d".into(),
             steam_id: 76_561_198_000_000_000,
             mu: 27.0,
             sigma: 8.3,
@@ -291,6 +294,7 @@ mod tests {
         assert_eq!(v["steam_id"], json!("76561198000000000"), "leaderboard IDs are strings");
         let back: LeaderboardEntry = serde_json::from_value(v).unwrap();
         assert_eq!(back.steam_id, entry.steam_id);
+        assert_eq!(back.player_id, entry.player_id);
     }
 
     #[test]

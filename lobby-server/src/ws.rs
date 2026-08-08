@@ -102,8 +102,10 @@ pub enum ClientMessage {
 /// Outbound messages sent over WebSocket connections.
 #[allow(dead_code)] // QueueStatus, MatchAccepted, MatchStarted reserved for future use
 pub enum ServerMessage {
-    /// Authentication succeeded; carries the player's Steam ID and state.
+    /// Authentication succeeded; carries the abstract account id (users.id,
+    /// what the UI shows as "player id") plus the Steam ID and state.
     AuthOk {
+        player_id: String,
         #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
         steam_id: u64,
         display_name: String,
@@ -259,6 +261,7 @@ pub enum ServerMessage {
 
 #[derive(Debug, Serialize, Clone)]
 pub struct OpponentInfo {
+    pub player_id: String,
     #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
     pub steam_id: u64,
     pub display_name: String,
@@ -302,8 +305,8 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
     // Auth phase
-    let steam_id = match authenticate(&mut receiver, &mut sender, &state, peer_ip).await {
-        Ok(id) => id,
+    let (user_id, steam_id) = match authenticate(&mut receiver, &mut sender, &state, peer_ip).await {
+        Ok(pair) => pair,
         Err(_) => return,
     };
 
@@ -325,6 +328,7 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
     let _ = sender
         .send(Message::Text(
             serde_json::to_string(&ServerMessage::AuthOk {
+                player_id: user_id.to_string(),
                 steam_id,
                 display_name: display_name.clone(),
                 state: player_state,
@@ -501,7 +505,7 @@ async fn authenticate(
     sender: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
     state: &Arc<AppState>,
     peer_ip: std::net::SocketAddr,
-) -> Result<SteamId, ()> {
+) -> Result<(uuid::Uuid, SteamId), ()> {
     let first_msg = timeout(Duration::from_secs(10), receiver.next()).await;
     let text = match first_msg {
         Ok(Some(Ok(Message::Text(t)))) => t.to_string(),
@@ -561,7 +565,7 @@ async fn authenticate(
                 tracing::warn!("auth failed (revoked or outdated token) from {peer_ip}");
                 return Err(());
             }
-            Ok(id)
+            Ok((_user_id, id))
         }
         ClientMessage::AuthTicket { ticket } => {
             if !state.ticket_limiter.check(peer_ip.ip()) {
@@ -579,7 +583,18 @@ async fn authenticate(
                 return Err(());
             }
             match state.steam_auth.verify_ticket(&ticket).await {
-                Ok(id) => Ok(id),
+                Ok(steam_id) => {
+                    // Same semantics as the HTTP ticket path: a verified
+                    // ticket is a genuine login, so the account + identity
+                    // row are attached and the player_id comes from it.
+                    match state.store.find_or_create_user(steam_id, "", true).await {
+                        Ok(user_id) => Ok((user_id, steam_id)),
+                        Err(_) => {
+                            tracing::warn!("auth failed (user lookup error) from {peer_ip}");
+                            Err(())
+                        }
+                    }
+                }
                 Err(_) => {
                     tracing::warn!("auth failed (invalid ticket) from {peer_ip}");
                     Err(())
