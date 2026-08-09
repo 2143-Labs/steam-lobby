@@ -19,7 +19,7 @@ use lobby_core::types::{MatchDifficulty, MatchInfo, PlayerState, SteamId};
 
 use crate::state::AppState;
 use crate::temporal::activities::{
-    self, FinishMatchArgs, MatchStateArgs, PairResult, QueueArgs, ResolveArgs,
+    self, FinishMatchArgs, MatchStateArgs, QueueArgs,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -109,6 +109,7 @@ impl UserSessionWorkflow {
     pub async fn run(ctx: &mut WorkflowContext<Self>, args: SessionArgs) -> WorkflowResult<()> {
         ctx.state_mut(|s| s.steam_id = args.steam_id);
         // Ends when the disconnect signal arrives.
+        ctx.wait_condition(|s| s.disconnected).await;
         // On disconnect, cancel a still-pending queue child (best-effort).
         if let Some(queued) = ctx.state(|s| s.queued.clone()) {
             let _ = ctx
@@ -260,22 +261,16 @@ impl MatchmakerWorkflow {
     pub async fn run(ctx: &mut WorkflowContext<Self>, args: MatchmakerArgs) -> WorkflowResult<()> {
         loop {
             ctx.timer(Duration::from_secs(2)).await;
-            let result: PairResult = ctx
-                .execute_activity(
-                    activities::LobbyActivities::pair_matches,
-                    args.mode.clone(),
-                    short_activity(),
-                )
-                .await?;
-            if let Some(m) = result.match_info {
-                ctx.start_child_workflow(
-                    crate::temporal::workflows::P2PMatchWorkflow::run,
-                    match_args_from(&m, &args),
-                    ChildWorkflowOptions::workflow_id(format!("match-{}", m.match_token)),
-                )
-                .await?;
-                // Child runs independently; we don't await its result.
-            }
+            // pair_matches: scan queue, pair by MMR band, create_match + record
+            // the event, START the P2PMatchWorkflow, then broadcast MatchFound
+            // and signal both sessions. The activity owns the P2P-workflow
+            // start so clients can never accept before the workflow exists.
+            ctx.execute_activity(
+                activities::LobbyActivities::pair_matches,
+                args.mode.clone(),
+                short_activity(),
+            )
+            .await?;
         }
     }
 }
@@ -377,30 +372,24 @@ impl P2PMatchWorkflow {
         // Phase 3: the start window — race the start timer against "both started".
         select! {
             _ = ctx.timer(Duration::from_secs(args.start_timeout_secs)) => {
-                // Forfeit: one started → resolve_pong (starter wins); neither →
-                // resolve_forfeit (double loss, Part A).
+                // Forfeit: one started → the starter wins; neither → double
+                // loss (Part A). resolve_start_forfeit flips InProgress →
+                // Reporting first (resolve_pong/forfeit validate on Reporting).
                 let started = ctx.state(|s| s.started.clone());
-                if started.len() == 1 {
-                    let winner = started[0];
-                    ctx.execute_activity(
-                        activities::LobbyActivities::resolve_pong,
-                        ResolveArgs {
-                            match_token: args.match_token.clone(),
-                            winner,
-                        },
-                        short_activity(),
-                    )
-                    .await?;
+                let winner = if started.len() == 1 {
+                    Some(started[0])
                 } else {
-                    ctx.execute_activity(
-                        activities::LobbyActivities::resolve_forfeit,
-                        MatchStateArgs {
-                            match_token: args.match_token.clone(),
-                        },
-                        short_activity(),
-                    )
-                    .await?;
-                }
+                    None
+                };
+                ctx.execute_activity(
+                    activities::LobbyActivities::resolve_start_forfeit,
+                    activities::StartForfeitArgs {
+                        match_token: args.match_token.clone(),
+                        winner,
+                    },
+                    short_activity(),
+                )
+                .await?;
                 return Ok(());
             }
             _ = ctx.wait_condition(|s| {
@@ -501,16 +490,41 @@ impl P2PMatchWorkflow {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn match_args_from(m: &MatchInfo, mk: &MatchmakerArgs) -> MatchArgs {
-    MatchArgs {
-        match_token: m.match_token.clone(),
-        player_a: m.player_a,
-        player_b: m.player_b,
-        mode: m.game_mode.clone(),
-        difficulty: m.player_a_difficulty,
-        accept_timeout_secs: mk.accept_timeout_secs,
-        start_timeout_secs: mk.start_timeout_secs,
-        report_timeout_secs: mk.report_timeout_secs,
+/// Start the P2PMatchWorkflow for a formed match (called by the pair_matches
+/// activity BEFORE signaling match_found, so clients can never accept before
+/// the workflow exists). Best-effort; a failed start logs.
+pub(crate) async fn start_p2p_match(
+    state: &Arc<AppState>,
+    m: &MatchInfo,
+    accept_timeout_secs: u64,
+    start_timeout_secs: u64,
+    report_timeout_secs: u64,
+) {
+    let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
+        return;
+    };
+    if let Err(e) = client
+        .start_workflow(
+            P2PMatchWorkflow::run,
+            MatchArgs {
+                match_token: m.match_token.clone(),
+                player_a: m.player_a,
+                player_b: m.player_b,
+                mode: m.game_mode.clone(),
+                difficulty: m.player_a_difficulty,
+                accept_timeout_secs,
+                start_timeout_secs,
+                report_timeout_secs,
+            },
+            temporalio_client::WorkflowStartOptions::new(
+                &state.config.temporal_task_queue,
+                format!("match-{}", m.match_token),
+            )
+            .build(),
+        )
+        .await
+    {
+        tracing::warn!("failed to start P2PMatchWorkflow for {}: {e}", m.match_token);
     }
 }
 
@@ -521,8 +535,10 @@ pub(crate) async fn notify_match_found(state: &Arc<AppState>, m: &MatchInfo) {
         return;
     };
     for pid in [m.player_a, m.player_b] {
-        let handle =
-            client.get_workflow_handle::<UserSessionWorkflow>(format!("user-session-{pid}"));
+        let handle = client.get_workflow_handle::<UserSessionWorkflow>(format!(
+            "user-session-{pid}-{}",
+            state.config.temporal_task_queue
+        ));
         let _ = handle
             .signal(
                 UserSessionWorkflow::match_found,
@@ -540,8 +556,10 @@ pub(crate) async fn signal_session_complete(state: &Arc<AppState>, steam_id: Ste
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
     };
-    let handle =
-        client.get_workflow_handle::<UserSessionWorkflow>(format!("user-session-{steam_id}"));
+    let handle = client.get_workflow_handle::<UserSessionWorkflow>(format!(
+        "user-session-{steam_id}-{}",
+        state.config.temporal_task_queue
+    ));
     let _ = handle
         .signal(
             UserSessionWorkflow::match_complete,

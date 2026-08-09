@@ -9,7 +9,7 @@ use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use lobby_core::traits::{MatchStore, PlayerStore, QueueStore};
 use lobby_core::pong::PongSide;
-use lobby_core::types::{MatchDifficulty, MatchEvent, MatchReport, MatchStatus, SteamId};
+use lobby_core::types::{MatchDifficulty, SteamId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
@@ -100,7 +100,7 @@ pub enum ClientMessage {
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 /// Outbound messages sent over WebSocket connections.
-#[allow(dead_code)] // QueueStatus, MatchAccepted reserved for future use
+#[allow(dead_code)] // reserved variants: none sent yet
 pub enum ServerMessage {
     /// Authentication succeeded; carries the abstract account id (users.id,
     /// what the UI shows as "player id") plus the Steam ID and state.
@@ -142,11 +142,6 @@ pub enum ServerMessage {
         opponent: OpponentInfo,
         timeout_ms: u64,
         game_type: lobby_core::types::GameType,
-    },
-    /// Reserved: match accepted by the opponent.
-    MatchAccepted {
-        match_token: String,
-        opponent_steam_id: u64,
     },
     /// Both players accepted — the START window of `start_timeout_secs` is open.
     MatchStarted {
@@ -357,6 +352,11 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
         .enter_menus(steam_id, &state.store)
         .await;
 
+    // Temporal path: start the player's UserSessionWorkflow (idempotent —
+    // same workflow_id restarts the session). Best-effort; None while
+    // Temporal is down.
+    crate::temporal::signals::start_user_session(&state, steam_id).await;
+
     // Spawn the outbound message forwarder FIRST so the map entry can hold an
     // abort handle and kill a ghosted connection.
     let mut outbound_task = tokio::spawn(async move {
@@ -454,6 +454,12 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
             .unwrap_or(false)
     };
     if is_current {
+        // Temporal path: tell the session workflow the player left; its
+        // match-level timers (start window / report window) handle a silent
+        // player. Best-effort; None while Temporal is down.
+        crate::temporal::signals::signal_disconnect(&state, steam_id).await;
+    }
+    if is_current {
         // A brief drop keeps the player queued: the queue entry lives until
         // the stale sweep evicts it (30s without heartbeat), so a reconnect
         // within that window must still report "queueing". Only a disconnect
@@ -464,44 +470,6 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
                 .player_manager
                 .handle_disconnect(steam_id, &state.store)
                 .await;
-        }
-        // Mid-game disconnect: end the pong match and award it to the other player.
-        let forfeit = {
-            let mut games = state.pong_games.lock();
-            let key = games
-                .iter()
-                .find(|(_, g)| g.player_a == steam_id || g.player_b == steam_id)
-                .map(|(k, _)| k.clone());
-            key.map(|k| {
-                let game = games.remove(&k).unwrap();
-                (k, game)
-            })
-        };
-        if let Some((token, game)) = forfeit {
-            game.abort.abort();
-            let other = if game.player_a == steam_id {
-                game.player_b
-            } else {
-                game.player_a
-            };
-            let outcome = state
-                .match_manager
-                .resolve_pong(&token, other, &state.store, &state.store, &state.store)
-                .await;
-            if let Some(e) = state.connections.lock().await.get(&other) {
-                let _ = e.tx.send(ServerMessage::GameOver {
-                    match_token: token.clone(),
-                    winner: other,
-                });
-                // Mirror the game task: the survivor's demo needs match_result
-                // to leave the in-match panel.
-                if let Ok(o) = &outcome {
-                    let _ = e.tx.send(ServerMessage::MatchResult {
-                        match_token: token.clone(),
-                        outcome: serde_json::to_value(o).unwrap(),
-                    });
-                }
-            }
         }
         state.connections.lock().await.remove(&steam_id);
     } else {
@@ -634,7 +602,7 @@ async fn handle_client_message(
     cm: ClientMessage,
     steam_id: SteamId,
     state: &Arc<AppState>,
-    tx: &mpsc::UnboundedSender<ServerMessage>,
+    _tx: &mpsc::UnboundedSender<ServerMessage>,
 ) {
     match cm {
         // ── Matchmaking ──
@@ -644,137 +612,59 @@ async fn handle_client_message(
                 "hard" => MatchDifficulty::Hard,
                 _ => MatchDifficulty::Normal,
             };
-            let _ = state
-                .player_manager
-                .begin_matchmaking(steam_id, diff, &state.store)
-                .await;
-
-            // Create queue entry
-            let rating = <dyn lobby_core::traits::RatingStore>::get_rating(&state.store, steam_id, &mode)
-                .await
-                .unwrap_or(
-                    lobby_core::types::OpenSkillRating {
-                        mu: 25.0,
-                        sigma: 25.0 / 3.0,
-                        last_updated: chrono::Utc::now(),
-                    },
-                );
-
             tracing::info!("player {steam_id} entered queue ({mode}, {difficulty})");
-            let entry = lobby_core::types::QueueEntry {
-                steam_id,
-                game_mode: mode,
-                difficulty: diff,
-                mu: rating.mu,
-                queued_at: chrono::Utc::now(),
-            };
-            let _ = state.store.enqueue(&entry).await;
+            // The UserSessionWorkflow's queue signal runs the enter_queue
+            // activity (player state + queue entry); the MatchmakerWorkflow
+            // pairs from there. Cutover: no in-process fallback — if Temporal
+            // is down, the signal helper no-ops and the client is told nothing
+            // (the server is considered unavailable for matchmaking).
+            crate::temporal::signals::signal_queue(state, steam_id, mode, diff).await;
         }
         ClientMessage::CancelMatchmaking => {
-            let _ = state
-                .player_manager
-                .cancel_matchmaking(steam_id, &state.store)
-                .await;
-            let _ = state.store.dequeue(steam_id, "ranked_1v1").await;
+            crate::temporal::signals::signal_unqueue(state, steam_id).await;
             tracing::info!("player {steam_id} left queue (cancelled)");
         }
         // ── Match lifecycle ──
         ClientMessage::AcceptMatch { match_token } => {
-            match state
-                .match_manager
-                .accept_match(&match_token, steam_id, &state.store)
-                .await
-            {
-                Ok(()) => {
-                    tracing::info!("player {steam_id} accepted match {match_token}");
-                    // Both accepted → the match is InProgress: open the START
-                    // window and tell both clients the countdown is running.
-                    if let Ok(Some(m)) = state.store.get_match(&match_token).await {
-                        if m.status == MatchStatus::InProgress
-                            && state.config.pong_enabled
-                            && m.game_type == lobby_core::types::GameType::P2p
-                        {
-                            crate::pong::spawn_start_window(state, &m);
-                            let connections = state.connections.lock().await;
-                            for pid in [m.player_a, m.player_b] {
-                                if let Some(e) = connections.get(&pid) {
-                                    let _ = e.tx.send(ServerMessage::MatchStarted {
-                                        match_token: match_token.clone(),
-                                        start_timeout_secs: state.config.start_timeout_secs,
-                                    });
-                                }
-                            }
-                        }
-                    }
+            tracing::info!("player {steam_id} accepted match {match_token}");
+            // P2p matches are owned by the P2PMatchWorkflow (match_choice
+            // signal). Server matches stay in-process — the Temporal migration
+            // is p2p-only; they have no START phase and resolve via the
+            // gameserver webhook (out of scope).
+            let is_server = match state.store.get_match(&match_token).await {
+                Ok(Some(m)) => m.game_type == lobby_core::types::GameType::Server,
+                _ => false,
+            };
+            if is_server {
+                match state
+                    .match_manager
+                    .accept_match(&match_token, steam_id, &state.store)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(e) => tracing::warn!(
+                        "player {steam_id} accept rejected for match {match_token}: {e}"
+                    ),
                 }
-                Err(e) => {
-                    tracing::warn!("player {steam_id} accept rejected for match {match_token}: {e}")
-                }
+            } else {
+                crate::temporal::signals::signal_match_choice(state, &match_token, steam_id, true)
+                    .await;
             }
         }
         ClientMessage::DeclineMatch { match_token } => {
             tracing::info!("player {steam_id} declined match {match_token}");
-            let _ = tx.send(ServerMessage::MatchDeclined {
-                match_token: match_token.clone(),
-            });
-            if let Ok(Some(m)) = state.store.get_match(&match_token).await {
-                let other = if steam_id == m.player_a { m.player_b } else { m.player_a };
-                let connections = state.connections.lock().await;
-                if let Some(e) = connections.get(&other) {
-                    let _ = e.tx.send(ServerMessage::MatchDeclined { match_token: match_token.clone() });
-                }
-            }
-            // Terminal: a declined match must not linger PendingAccept — otherwise the
-            // 30s accept-expiry fires a spurious match_expired to both players later.
-            // Only force it when still PendingAccept; a late decline of a live match
-            // (both already accepted) leaves the lifecycle alone.
-            if let Ok(Some(m)) = state.store.get_match(&match_token).await {
-                if m.status == MatchStatus::PendingAccept {
-                    let _ = state
-                        .store
-                        .update_match_status(&match_token, MatchStatus::Disputed)
-                        .await;
-                }
-            }
-            let _ = state
-                .store
-                .record_match_event(&match_token, MatchEvent::Declined, Some(steam_id))
+            // The workflow's handle_decline activity notifies both players
+            // and flips Disputed (the DeclineMatch handler body, moved).
+            crate::temporal::signals::signal_match_choice(state, &match_token, steam_id, false)
                 .await;
         }
         ClientMessage::StartMatch { match_token } => {
-            match state
-                .match_manager
-                .mark_connected(&match_token, steam_id, &state.store)
-                .await
-            {
-                Ok(()) => {
-                    tracing::info!("player {steam_id} started match {match_token}");
-                    // Route into the START window (best-effort): if a window is
-                    // still open for this match, record the start. When both
-                    // have started, the handler below spawns the game.
-                    if let Some(w) = state.start_windows.lock().get(&match_token) {
-                        let _ = w.tx.send(steam_id);
-                    }
-                    if let Ok(Some(m)) = state.store.get_match(&match_token).await {
-                        let other = if steam_id == m.player_a { m.player_b } else { m.player_a };
-                        let connections = state.connections.lock().await;
-                        if let Some(e) = connections.get(&other) {
-                            let _ = e.tx.send(ServerMessage::OpponentConnected { match_token });
-                        }
-                        // Both players connected: the match just flipped to
-                        // Reporting — start the server-authoritative pong game.
-                        if state.config.pong_enabled
-                            && m.game_type == lobby_core::types::GameType::P2p
-                            && m.status == lobby_core::types::MatchStatus::Reporting
-                        {
-                            crate::pong::spawn_game(state, &m);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("player {steam_id} p2p signal rejected for match {match_token}: {e}")
-                }
-            }
+            tracing::info!("player {steam_id} started match {match_token}");
+            // The P2PMatchWorkflow's start signal runs mark_connected (DB
+            // Reporting + opponent_connected + spawn_game for playback) and
+            // its start-window timer owns the forfeit. Cutover: no in-process
+            // fallback — the workflow is the sole lifecycle writer.
+            crate::temporal::signals::signal_start(state, &match_token, steam_id).await;
         }
         ClientMessage::WebrtcOffer { match_token, sdp } => {
             let other = match state.store.get_match(&match_token).await {
@@ -876,75 +766,19 @@ async fn handle_client_message(
             winner,
             demo_hash,
         } => {
-            let report = MatchReport {
-                match_token: match_token.clone(),
-                reporting_player: steam_id,
-                winner,
-                demo_hash,
-            };
-            let outcome = state
-                .match_manager
-                .submit_report(report.clone(), &state.store, &state.store, &state.store)
-                .await;
-
-            match &outcome {
-                Ok(_) => tracing::info!(
-                    "report from {steam_id} for match {match_token}: winner {:?}",
-                    report.winner
-                ),
-                Err(e) => {
-                    tracing::warn!("report from {steam_id} for match {match_token} rejected: {e}");
-                    // Tell the reporter the report was not accepted (e.g. a
-                    // duplicate) so their UI can stop showing it as pending.
-                    let _ = tx.send(ServerMessage::Error {
-                        code: "invalid_report".into(),
-                        message: e.to_string(),
-                    });
-                }
+            tracing::info!(
+                "report from {steam_id} for match {match_token}: winner {:?}",
+                winner
+            );
+            // The P2PMatchWorkflow's who_won + submit_demo signals drive
+            // finish_match / resolve_dispute — the workflow is the sole
+            // lifecycle writer. Cutover: no in-process submit_report.
+            if let Some(w) = winner {
+                crate::temporal::signals::signal_who_won(state, &match_token, steam_id, w).await;
             }
-            // Broadcast the received report to BOTH players so each sees what the
-            // other selected before resolution. Gated on the report actually being
-            // stored (Ok) — a rejected report (wrong state/participant) is not
-            // presented as a fact.
-            if outcome.is_ok() {
-                if let Ok(Some(m)) = state.store.get_match(&match_token).await {
-                    let connections = state.connections.lock().await;
-                    for pid in [m.player_a, m.player_b] {
-                        if let Some(e) = connections.get(&pid) {
-                            let _ = e.tx.send(ServerMessage::ReportReceived {
-                                match_token: match_token.clone(),
-                                reporting_player: steam_id,
-                                winner: report.winner,
-                                demo_hash: report.demo_hash.clone(),
-                            });
-                        }
-                    }
-                }
-            }
-            // On a REAL resolution (both reports processed — match terminal),
-            // tell BOTH players. The first report alone returns Ok(Disputed)
-            // while awaiting the opponent's, so gate on match status, not on Ok.
-            let terminal = match state.store.get_match(&match_token).await {
-                Ok(Some(m)) => {
-                    matches!(m.status, lobby_core::types::MatchStatus::Resolved | lobby_core::types::MatchStatus::Disputed)
-                }
-                _ => false,
-            };
-            if terminal {
-                if let Ok(outcome) = outcome {
-                    tracing::info!("match {match_token} resolved: {outcome:?}");
-                    if let Ok(Some(m)) = state.store.get_match(&match_token).await {
-                        let connections = state.connections.lock().await;
-                        for pid in [m.player_a, m.player_b] {
-                            if let Some(e) = connections.get(&pid) {
-                                let _ = e.tx.send(ServerMessage::MatchResult {
-                                    match_token: match_token.clone(),
-                                    outcome: serde_json::to_value(&outcome).unwrap(),
-                                });
-                            }
-                        }
-                    }
-                }
+            if let Some(h) = demo_hash {
+                crate::temporal::signals::signal_submit_demo(state, &match_token, steam_id, h)
+                    .await;
             }
         }
         // ── Liveness ──

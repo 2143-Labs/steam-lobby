@@ -48,7 +48,7 @@ async fn full_match_lifecycle() {
     let m = result.unwrap();
 
     // Accept
-    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
+    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks);
     mgr.accept_match(&m.match_token, 100, &store).await.unwrap();
     mgr.accept_match(&m.match_token, 200, &store).await.unwrap();
 
@@ -144,7 +144,7 @@ async fn dispute_on_winner_mismatch() {
         .await
         .unwrap();
 
-    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
+    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks);
 
     mgr.submit_report(
         MatchReport {
@@ -187,58 +187,6 @@ async fn dispute_on_winner_mismatch() {
 }
 
 #[tokio::test]
-async fn auto_loss_on_timeout() {
-    let store = MockStore::new();
-    let token = "timeout-test".to_string();
-    store
-        .create_match(&MatchInfo {
-            match_token: token.clone(),
-            player_a: 100,
-            player_a_difficulty: MatchDifficulty::Normal,
-            player_b: 200,
-            player_b_difficulty: MatchDifficulty::Normal,
-            game_mode: "ranked_1v1".into(),
-            game_type: GameType::P2p,
-            server_address: None,
-            join_token: None,
-            result_secret: None,
-            status: MatchStatus::Reporting,
-            created_at: Utc::now(),
-            accepted_at: Some(Utc::now()),
-            started_at: Some(Utc::now()),
-            ended_at: Some(Utc::now() - Duration::seconds(400)),
-            accepted_a: true,
-            accepted_b: true,
-            connected_a: true,
-            connected_b: true,
-        })
-        .await
-        .unwrap();
-
-    store
-        .submit_report(&MatchReport {
-            match_token: token.clone(),
-            reporting_player: 100,
-            winner: Some(100),
-            demo_hash: None,
-        })
-        .await
-        .unwrap();
-
-    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
-    mgr.expire_pending_reports(&store, &store, &store).await.unwrap();
-
-    let m = store.get_match(&token).await.unwrap().unwrap();
-    assert_eq!(m.status, MatchStatus::Resolved);
-    // The lone report's winner (100) gets the win: their mu must have increased,
-    // and the match must be Resolved (the auto-loss the audit found missing).
-    let rating_100 = store.ratings.lock().get(&(100, "ranked_1v1".into())).cloned().unwrap();
-    let rating_200 = store.ratings.lock().get(&(200, "ranked_1v1".into())).cloned().unwrap();
-    assert!(rating_100.mu > 25.0, "winner's mu should increase, got {}", rating_100.mu);
-    assert!(rating_200.mu < 25.0, "loser's mu should decrease, got {}", rating_200.mu);
-}
-
-#[tokio::test]
 async fn winner_must_be_participant() {
     let store = MockStore::new();
     let token = "winner-gate".to_string();
@@ -267,7 +215,7 @@ async fn winner_must_be_participant() {
         .await
         .unwrap();
 
-    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
+    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks);
     let err = mgr
         .submit_report(
             MatchReport {
@@ -318,7 +266,7 @@ async fn double_accept_requires_both() {
         .await
         .unwrap();
 
-    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
+    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks);
     // Player A accepts — match must still be PendingAccept.
     mgr.accept_match(&token, 100, &store).await.unwrap();
     // Player A accepts again — a double-accept must NOT advance the match.
@@ -360,7 +308,7 @@ async fn server_result_resolves() {
         .await
         .unwrap();
 
-    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
+    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks);
     let outcome = mgr
         .resolve_from_gameserver(&token, Some(100), &store, &store, &store)
         .await
@@ -411,7 +359,7 @@ async fn pong_resolve_declares_winner() {
         .await
         .unwrap();
 
-    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
+    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks);
     let outcome = mgr
         .resolve_pong(&token, 100, &store, &store, &store)
         .await
@@ -470,59 +418,13 @@ async fn playing_match_expires() {
         .await
         .unwrap();
 
-    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
+    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks);
     let expired = mgr.expire_playing_matches(&store, 1, &store).await.unwrap();
     assert_eq!(expired, vec![token.clone()]);
     let m = store.get_match(&token).await.unwrap().unwrap();
     assert_eq!(m.status, MatchStatus::Disputed);
 }
 
-#[tokio::test]
-async fn accept_expiry_resets_players() {
-    let store = MockStore::new();
-    let token = "accept-expire".to_string();
-    store.players.lock().insert(100, queued_player(100, 25.0));
-    store.players.lock().insert(200, queued_player(200, 25.0));
-    store
-        .create_match(&MatchInfo {
-            match_token: token.clone(),
-            player_a: 100,
-            player_a_difficulty: MatchDifficulty::Normal,
-            player_b: 200,
-            player_b_difficulty: MatchDifficulty::Normal,
-            game_mode: "ranked_1v1".into(),
-            game_type: GameType::P2p,
-            server_address: None,
-            join_token: None,
-            result_secret: None,
-            status: MatchStatus::PendingAccept,
-            created_at: Utc::now() - Duration::seconds(31),
-            accepted_at: None,
-            started_at: None,
-            ended_at: None,
-            accepted_a: false,
-            accepted_b: false,
-            connected_a: false,
-            connected_b: false,
-        })
-        .await
-        .unwrap();
-
-    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
-    let expired = mgr.expire_pending_accepts(&store, &store).await.unwrap();
-    assert_eq!(expired, vec![token.clone()]);
-    let m = store.get_match(&token).await.unwrap().unwrap();
-    assert_eq!(m.status, MatchStatus::Disputed);
-    // Terminal: both players must be back in the menus so they can re-queue.
-    assert_eq!(
-        store.players.lock().get(&100).unwrap().state,
-        PlayerState::InMenus
-    );
-    assert_eq!(
-        store.players.lock().get(&200).unwrap().state,
-        PlayerState::InMenus
-    );
-}
 
 #[tokio::test]
 async fn duplicate_report_rejected() {
@@ -555,7 +457,7 @@ async fn duplicate_report_rejected() {
         .await
         .unwrap();
 
-    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks, 30, 300);
+    let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks);
     let report_a = MatchReport {
         match_token: token.clone(),
         reporting_player: 100,

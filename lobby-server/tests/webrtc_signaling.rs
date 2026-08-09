@@ -33,7 +33,7 @@ where
 #[sqlx::test]
 async fn turn_endpoint(pool: sqlx::PgPool) {
     // 200 (harness with a turn secret).
-    let h = common::setup_with_turn(pool.clone(), Some("test-turn-secret")).await;
+    let h = common::setup_temporal_with_turn(pool.clone(), Some("test-turn-secret")).await;
     let resp = reqwest::get(format!("{}/internal/turn-credentials", h.base_url))
         .await
         .unwrap();
@@ -46,7 +46,7 @@ async fn turn_endpoint(pool: sqlx::PgPool) {
 
     // 503 — separate harness without a secret (own server on the same per-test DB).
     {
-        let h2 = common::setup_with_turn(pool, None).await;
+        let h2 = common::setup_temporal_with_turn(pool, None).await;
         let resp = reqwest::get(format!("{}/internal/turn-credentials", h2.base_url))
             .await
             .unwrap();
@@ -58,7 +58,7 @@ async fn turn_endpoint(pool: sqlx::PgPool) {
 /// and never forwards signaling to non-participants.
 #[sqlx::test]
 async fn signaling_relay(pool: sqlx::PgPool) {
-    let h = common::setup_with_turn(pool, Some("test-turn-secret")).await;
+    let h = common::setup_temporal_with_turn(pool, Some("test-turn-secret")).await;
 
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
     let mut p2 = LobbyClient::connect(&h.ws_url).await.unwrap();

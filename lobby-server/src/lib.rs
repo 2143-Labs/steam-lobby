@@ -171,11 +171,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         callbacks.clone(),
         config.pair_cooldown_secs as i64,
     );
-    let match_manager = lobby_core::match_lifecycle::MatchManager::new(
-        callbacks,
-        config.match_accept_timeout_secs,
-        config.report_timeout_secs,
-    );
+    let match_manager = lobby_core::match_lifecycle::MatchManager::new(callbacks);
     let http = reqwest::Client::new();
     let state = Arc::new(AppState {
         player_manager,
@@ -209,24 +205,33 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
             temporal_namespace: config.temporal_namespace.clone(),
             temporal_task_queue: config.temporal_task_queue.clone(),
         },
-        start_windows: parking_lot::Mutex::new(std::collections::HashMap::new()),
         openid_states: std::sync::Mutex::new(std::collections::HashMap::new()),
         pong_games: parking_lot::Mutex::new(std::collections::HashMap::new()),
         ticket_limiter: RateLimiter::new(10, std::time::Duration::from_secs(60)),
         test_token_limiter: RateLimiter::new(20, std::time::Duration::from_secs(60)),
         next_generation: std::sync::atomic::AtomicU64::new(0),
         temporal: std::sync::RwLock::new(None),
+        temporal_shutdown: std::sync::RwLock::new(None),
     });
 
     tokio::spawn(ticker::tick_loop(state.clone(), config.ticker_shutdown));
 
-    // The Temporal worker runs in-process on its own thread + current-thread
+    // The Temporal worker runs in-process on its own OS thread + multi-thread
     // tokio runtime (the SDK's Worker::run is !Send — LocalSet-based). On
-    // connect failure it logs and exits, leaving state.temporal None
-    // (handlers fall back to the in-process path). Tests disable this: the
-    // workflow tests build one process-wide worker via OnceLock instead.
+    // connect failure it logs and exits, leaving state.temporal None. The
+    // worker's shutdown handle is stored on AppState so the test harness can
+    // stop it at teardown (production never touches it).
     if !config.temporal_disabled {
-        crate::temporal::start_temporal(state.clone());
+        if let Some(rx) = crate::temporal::start_temporal(state.clone()) {
+            let holder = state.clone();
+            tokio::spawn(async move {
+                if let Ok(handle) = rx.await {
+                    if let Ok(mut g) = holder.temporal_shutdown.write() {
+                        *g = Some(handle);
+                    }
+                }
+            });
+        }
     }
 
     let mut router = Router::new()

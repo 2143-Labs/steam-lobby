@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         temporal_address: std::env::var("TEMPORAL_ADDRESS")
             .unwrap_or_else(|_| "http://localhost:7233".into()),
         temporal_namespace: std::env::var("TEMPORAL_NAMESPACE")
-            .unwrap_or_else(|_| "default".into()),
+            .unwrap_or_else(|_| "pvp".into()),
         temporal_task_queue: std::env::var("TEMPORAL_TASK_QUEUE")
             .unwrap_or_else(|_| "lobby".into()),
         ticker_shutdown: None,

@@ -23,7 +23,7 @@ use lobby_core::pong::{PongGame, PongSide, DT_SECS};
 use tokio::time::timeout;
 
 mod common; // lobby-server/tests/common.rs — TestHarness + setup_pong()
-use common::setup_pong;
+use common::setup_temporal_pong;
 
 /// The shared deterministic input schedule (same formula as the JS/Rust
 /// determinism gauntlet; off: left = 0, right = 331).
@@ -212,28 +212,51 @@ async fn drive_client(
     (winner, d.side, resynced)
 }
 
+/// After both clients report the same winner, the workflow's finish_match
+/// broadcasts GameOver — wait for it.
+async fn wait_game_over(p: &mut LobbyClient, deadline: std::time::Instant) -> u64 {
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(5), p.next_event()).await {
+            Ok(Some(Ok(ServerEvent::GameOver { winner, .. }))) => return winner,
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(e))) => panic!("client error: {e}"),
+            Ok(None) => panic!("connection closed while waiting for GameOver"),
+        }
+    }
+    panic!("GameOver not received within deadline");
+}
+
 #[sqlx::test]
 async fn pong_three_replicas_converge(pool: sqlx::PgPool) {
-    let h = setup_pong(pool).await;
+    let h = setup_temporal_pong(pool).await;
     let (mut p1, mut p2, token) = pair_up(&h, 915, 916, "ranked_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
     // Both clients must drive CONCURRENTLY: the referee only advances when
     // both players' inputs for the next frame are in, so a sequential drive
     // would leave one client silent and the game permanently stalled.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let ((w1, side1, _), (w2, side2, _)) = tokio::join!(
+    // The referee is playback-only: the workflow resolves on the clients'
+    // who_won reports. The schedule is deterministic — the Left player wins —
+    // so both clients report the Left player after the drive.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ((_, side1, _), (_, side2, _)) = tokio::join!(
         drive_client(&mut p1, &token, 915, None, deadline),
         drive_client(&mut p2, &token, 916, None, deadline),
     );
     assert_ne!(side1, side2, "the two clients must be on opposite sides");
 
-    let w1 = w1.expect("p1 must receive GameOver (the schedule wins by frame ~51)");
-    let w2 = w2.expect("p2 must receive GameOver");
-    assert_eq!(w1, w2, "both clients must agree on the winner");
-    // The schedule is deterministic: Left wins. The winner is whoever drew
-    // the Left side (player_a), which is racy.
     let left_player = if side1 == PongSide::Left { 915 } else { 916 };
+    p1.submit_report(&token, Some(left_player), Some("demo-a".into()))
+        .await
+        .unwrap();
+    p2.submit_report(&token, Some(left_player), Some("demo-b".into()))
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let w1 = wait_game_over(&mut p1, deadline).await;
+    let w2 = wait_game_over(&mut p2, deadline).await;
+    assert_eq!(w1, w2, "both clients must agree on the winner");
     assert_eq!(w1, left_player, "the Left player must win (schedule outcome)");
 
     drop(p1);
@@ -242,24 +265,33 @@ async fn pong_three_replicas_converge(pool: sqlx::PgPool) {
 
 #[sqlx::test]
 async fn pong_divergence_detected_and_resynced(pool: sqlx::PgPool) {
-    let h = setup_pong(pool).await;
+    let h = setup_temporal_pong(pool).await;
     let (mut p1, mut p2, token) = pair_up(&h, 913, 914, "ranked_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
     // p1 diverges at frame 25 (well before the winner at ~51); both drives
     // run concurrently (see pong_three_replicas_converge).
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let ((w1, side1, resynced), (w2, side2, _)) = tokio::join!(
+    // Same report-driven GameOver as pong_three_replicas_converge.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ((_, side1, resynced), (_, side2, _)) = tokio::join!(
         drive_client(&mut p1, &token, 913, Some(25), deadline),
         drive_client(&mut p2, &token, 914, None, deadline),
     );
     assert_ne!(side1, side2, "the two clients must be on opposite sides");
 
     assert!(resynced, "the referee must detect p1's divergence and resync it");
-    let w1 = w1.expect("p1 must receive GameOver");
-    let w2 = w2.expect("p2 must receive GameOver");
-    assert_eq!(w1, w2, "both clients must agree on the winner");
     let left_player = if side1 == PongSide::Left { 913 } else { 914 };
+    p1.submit_report(&token, Some(left_player), Some("demo-a".into()))
+        .await
+        .unwrap();
+    p2.submit_report(&token, Some(left_player), Some("demo-b".into()))
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let w1 = wait_game_over(&mut p1, deadline).await;
+    let w2 = wait_game_over(&mut p2, deadline).await;
+    assert_eq!(w1, w2, "both clients must agree on the winner");
     assert_eq!(w1, left_player, "the divergence must not change the outcome");
 
     drop(p1);

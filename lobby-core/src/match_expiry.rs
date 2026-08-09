@@ -6,8 +6,8 @@ use chrono::Utc;
 
 use crate::error::Result;
 use crate::match_lifecycle::MatchManager;
-use crate::traits::{GameCallbacks, MatchStore, PlayerStore, RatingStore};
-use crate::types::{MatchOutcome, MatchStatus, PlayerState};
+use crate::traits::{GameCallbacks, MatchStore, PlayerStore};
+use crate::types::{MatchStatus, PlayerState};
 
 impl<CB: GameCallbacks> MatchManager<CB> {
     /// Expire server-authoritative matches whose gameserver never reported.
@@ -39,108 +39,5 @@ impl<CB: GameCallbacks> MatchManager<CB> {
             }
         }
         Ok(expired)
-    }
-
-    /// Expire matches whose 30s accept window elapsed with at least one player
-    /// still undecided. Returns the tokens that were flipped to Disputed.
-    pub async fn expire_pending_accepts(&self, match_store: &dyn MatchStore, player_store: &dyn PlayerStore) -> Result<Vec<String>> {
-        let matches = match_store
-            .get_matches_by_status(MatchStatus::PendingAccept)
-            .await?;
-        let now = Utc::now();
-        let mut expired = Vec::new();
-        for m in &matches {
-            if (now - m.created_at).num_seconds().max(0) as u64 > self.match_accept_timeout_secs {
-                tracing::info!(
-                    "match {} expired: no accept within {}s ({}, {})",
-                    m.match_token,
-                    self.match_accept_timeout_secs,
-                    m.player_a,
-                    m.player_b
-                );
-                match_store
-                    .update_match_status(&m.match_token, MatchStatus::Disputed)
-                    .await?;
-                // Terminal: both players are free to queue again.
-                player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
-                player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
-                expired.push(m.match_token.clone());
-            }
-        }
-        Ok(expired)
-    }
-
-    /// Resolve matches stuck in Reporting: no reports -> Disputed, a lone
-    /// report -> the reported outcome (validated against the participants).
-    /// Returns the resolved outcomes per token.
-    pub async fn expire_pending_reports(
-        &self,
-        match_store: &dyn MatchStore,
-        rating_store: &dyn RatingStore,
-        player_store: &dyn PlayerStore,
-    ) -> Result<Vec<(String, MatchOutcome)>> {
-        let matches = match_store
-            .get_matches_by_status(MatchStatus::Reporting)
-            .await?;
-        let now = Utc::now();
-        let mut resolved = Vec::new();
-        for m in &matches {
-            if let Some(ended_at) = m.ended_at {
-                if (now - ended_at).num_seconds().max(0) as u64 > self.report_timeout_secs {
-                    let reports = match_store.get_reports(&m.match_token).await?;
-                    if reports.is_empty() {
-                        tracing::info!(
-                            "match {} report window expired with no reports -> Disputed",
-                            m.match_token
-                        );
-                        match_store
-                            .update_match_status(&m.match_token, MatchStatus::Disputed)
-                            .await?;
-                        // Terminal: both players are free to queue again.
-                        player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
-                        player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
-                        resolved.push((m.match_token.clone(), MatchOutcome::Disputed));
-                    } else if reports.len() == 1 {
-                        let report = &reports[0];
-                        let winner_ok = match report.winner {
-                            None => true,
-                            Some(w) => w == m.player_a || w == m.player_b,
-                        };
-                        if !winner_ok {
-                            // A lone report claiming a non-participant winner cannot be trusted.
-                            tracing::info!(
-                                "match {} lone report claims non-participant winner -> Disputed",
-                                m.match_token
-                            );
-                            match_store
-                                .update_match_status(&m.match_token, MatchStatus::Disputed)
-                                .await?;
-                            // Terminal: both players are free to queue again.
-                            player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
-                            player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
-                            resolved.push((m.match_token.clone(), MatchOutcome::Disputed));
-                            continue;
-                        }
-                        let outcome = self
-                            .resolve_agreed(m, report.winner, match_store, rating_store, player_store)
-                            .await?;
-                        let outcome_str = match &outcome {
-                            MatchOutcome::Win { .. } => "Win",
-                            MatchOutcome::Loss { .. } => "Loss",
-                            MatchOutcome::Draw { .. } => "Draw",
-                            _ => "Disputed",
-                        };
-                        tracing::info!(
-                            "match {} report window expired, single report -> {} for {}",
-                            m.match_token,
-                            outcome_str,
-                            m.player_a
-                        );
-                        resolved.push((m.match_token.clone(), outcome));
-                    }
-                }
-            }
-        }
-        Ok(resolved)
     }
 }

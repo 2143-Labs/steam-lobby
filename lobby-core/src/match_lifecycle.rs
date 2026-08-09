@@ -13,17 +13,11 @@ use crate::types::{MatchEvent, MatchOutcome, MatchReport, MatchStatus, OpenSkill
 
 pub struct MatchManager<CB: GameCallbacks> {
     callbacks: CB,
-    pub(crate) match_accept_timeout_secs: u64,
-    pub(crate) report_timeout_secs: u64,
 }
 
 impl<CB: GameCallbacks> MatchManager<CB> {
-    pub fn new(callbacks: CB, match_accept_timeout_secs: u64, report_timeout_secs: u64) -> Self {
-        Self {
-            callbacks,
-            match_accept_timeout_secs,
-            report_timeout_secs,
-        }
+    pub fn new(callbacks: CB) -> Self {
+        Self { callbacks }
     }
 
     pub async fn accept_match(

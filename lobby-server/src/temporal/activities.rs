@@ -39,9 +39,10 @@ pub struct FinishMatchArgs {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
-pub struct ResolveArgs {
+pub struct StartForfeitArgs {
     pub match_token: String,
-    pub winner: SteamId,
+    /// Some(starter) → starter wins; None → neither started (double loss).
+    pub winner: Option<SteamId>,
 }
 
 /// The ticker's pairing body for one mode: scan queue, MMR-band pair, create
@@ -87,7 +88,16 @@ impl LobbyActivities {
             .match_manager
             .mark_connected(&args.match_token, steam_id, &self.state.store)
             .await?;
+        // After the SECOND player connects the match flips to Reporting: spawn
+        // the server-authoritative pong referee for PLAYBACK (Step 11 — it
+        // renders frames/checksums; the workflow owns resolution).
         if let Ok(Some(m)) = self.state.store.get_match(&args.match_token).await {
+            if self.state.config.pong_enabled
+                && m.game_type == lobby_core::types::GameType::P2p
+                && m.status == lobby_core::types::MatchStatus::Reporting
+            {
+                crate::pong::spawn_game(&self.state, &m);
+            }
             let other = if steam_id == m.player_a {
                 m.player_b
             } else {
@@ -116,15 +126,14 @@ impl LobbyActivities {
         let state = self.state.clone();
         let token = args.match_token;
         if let Ok(Some(m)) = state.store.get_match(&token).await {
+            // The workflow's two accept_match activities (one per player)
+            // already recorded the Accepted events; mark_accepts only flips
+            // the status and broadcasts match_started.
             let _ = state.store.mark_accepted(&token, m.player_a).await;
             let _ = state.store.mark_accepted(&token, m.player_b).await;
             let _ = state
                 .store
                 .update_match_status(&token, MatchStatus::InProgress)
-                .await;
-            let _ = state
-                .store
-                .record_match_event(&token, MatchEvent::Accepted, None)
                 .await;
         }
         notify_match_players(
@@ -192,6 +201,15 @@ impl LobbyActivities {
                 .match_manager
                 .resolve_pong(&token, winner, &state.store, &state.store, &state.store)
                 .await?;
+            notify_match_players(
+                &state,
+                &token,
+                ServerMessage::GameOver {
+                    match_token: token.clone(),
+                    winner,
+                },
+            )
+            .await;
             if let Ok(outcome_value) = serde_json::to_value(&outcome) {
                 notify_match_players(
                     &state,
@@ -209,52 +227,69 @@ impl LobbyActivities {
         Ok(())
     }
 
-    /// Resolve a match where a player never started (starter wins) — the
-    /// workflow's start-window timeout branch.
+
+    /// START-window forfeit (the Part A start window's timeout body): the
+    /// match is still InProgress when the window expires — flip it to
+    /// Reporting first (resolve_pong/forfeit validate on Reporting), then
+    /// resolve. One started → the starter wins; neither → double loss.
     #[activity]
-    pub async fn resolve_pong(
+    pub async fn resolve_start_forfeit(
         self: Arc<Self>,
         _ctx: ActivityContext,
-        args: ResolveArgs,
+        args: StartForfeitArgs,
     ) -> Result<(), ActivityError> {
-        self.state
-            .match_manager
-            .resolve_pong(
+        let _ = self
+            .state
+            .store
+            .update_match(
                 &args.match_token,
-                args.winner,
-                &self.state.store,
-                &self.state.store,
-                &self.state.store,
+                MatchStatus::Reporting,
+                chrono::Utc::now(),
             )
-            .await?;
+            .await;
+        let outcome = if let Some(winner) = args.winner {
+            let outcome = self
+                .state
+                .match_manager
+                .resolve_pong(
+                    &args.match_token,
+                    winner,
+                    &self.state.store,
+                    &self.state.store,
+                    &self.state.store,
+                )
+                .await?;
+            notify_match_players(
+                &self.state,
+                &args.match_token,
+                ServerMessage::GameOver {
+                    match_token: args.match_token.clone(),
+                    winner,
+                },
+            )
+            .await;
+            outcome
+        } else {
+            self.state
+                .match_manager
+                .resolve_forfeit(
+                    &args.match_token,
+                    &self.state.store,
+                    &self.state.store,
+                    &self.state.store,
+                )
+                .await?
+        };
+        // MatchResult to both (mirror the old in-process start window).
         notify_match_players(
             &self.state,
             &args.match_token,
-            ServerMessage::GameOver {
+            ServerMessage::MatchResult {
                 match_token: args.match_token.clone(),
-                winner: args.winner,
+                outcome: serde_json::to_value(&outcome).unwrap_or_default(),
             },
         )
         .await;
-        Ok(())
-    }
-
-    /// Resolve a match where neither player started (double loss, Part A).
-    #[activity]
-    pub async fn resolve_forfeit(
-        self: Arc<Self>,
-        _ctx: ActivityContext,
-        args: MatchStateArgs,
-    ) -> Result<(), ActivityError> {
-        self.state
-            .match_manager
-            .resolve_forfeit(
-                &args.match_token,
-                &self.state.store,
-                &self.state.store,
-                &self.state.store,
-            )
-            .await?;
         Ok(())
     }
 
@@ -311,7 +346,7 @@ impl LobbyActivities {
             .find(|(m, _)| *m == mode)
             .map(|(_, t)| *t)
             .unwrap_or(GameType::P2p);
-        let match_info = self
+        let match_info = match self
             .state
             .matchmaking_queue
             .tick(
@@ -322,25 +357,99 @@ impl LobbyActivities {
                 &self.state.store,
                 &self.state.store,
             )
-            .await?;
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("pair_matches tick failed for {mode}: {e}");
+                return Err(ActivityError::from(e));
+            }
+        };
+        tracing::debug!(
+            "pair_matches ran for mode {} (queue size {})",
+            mode,
+            self.state
+                .store
+                .get_queue(&mode)
+                .await
+                .map(|q| q.len())
+                .unwrap_or(0)
+        );
         if let Some(m) = &match_info {
+            tracing::info!(
+                "pair_matches formed match {}: {} vs {}",
+                m.match_token,
+                m.player_a,
+                m.player_b
+            );
+        }
+        if let Some(m) = &match_info {
+            // Start the P2PMatchWorkflow FIRST so the accept signals can never
+            // race ahead of the workflow's existence.
+            crate::temporal::workflows::start_p2p_match(
+                &self.state,
+                m,
+                self.state.config.match_accept_timeout_secs,
+                self.state.config.start_timeout_secs,
+                self.state.config.report_timeout_secs,
+            )
+            .await;
+            // Broadcast MatchFound to both players (mirror the in-process
+            // ticker's notify, ticker.rs:44-108) and signal their sessions.
+
+            for pid in [m.player_a, m.player_b] {
+                let opponent = if pid == m.player_a { m.player_b } else { m.player_a };
+                let opponent_name = self
+                    .state
+                    .steam_auth
+                    .get_player_summary(opponent)
+                    .await
+                    .unwrap_or_else(|_| "Unknown".into());
+                let opponent_player_id = self
+                    .state
+                    .store
+                    .get_user_id(opponent)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|u| u.to_string())
+                    .unwrap_or_default();
+                let msg = ServerMessage::MatchFound {
+                    match_token: m.match_token.clone(),
+                    opponent: crate::ws::OpponentInfo {
+                        player_id: opponent_player_id,
+                        steam_id: opponent,
+                        display_name: opponent_name,
+                    },
+                    timeout_ms: 30_000,
+                    game_type: m.game_type,
+                };
+                let connections = self.state.connections.lock().await;
+                if let Some(e) = connections.get(&pid) {
+                    let _ = e.tx.send(msg);
+                }
+                drop(connections);
+            }
             crate::temporal::workflows::notify_match_found(&self.state, m).await;
         }
         Ok(PairResult { match_info })
     }
 
-    /// Enter the queue: player state Queueing + QueueStore::enqueue. Mirrors
-    /// the BeginMatchmaking handler (ws.rs:641-672).
+    /// Enter the queue: QueueStore::enqueue only. The player state transition
+    /// (→ Queueing) is the separate `set_player_state` activity — calling
+    /// `begin_matchmaking` here would fail with InvalidStateTransition because
+    /// the state is already Queueing by the time this runs.
     #[activity]
     pub async fn enter_queue(
         self: Arc<Self>,
         _ctx: ActivityContext,
         args: QueueArgs,
     ) -> Result<(), ActivityError> {
-        self.state
-            .player_manager
-            .begin_matchmaking(args.steam_id, args.difficulty, &self.state.store)
-            .await?;
+        tracing::info!(
+            "enter_queue activity: steam_id={} mode={}",
+            args.steam_id,
+            args.mode
+        );
         let rating = <dyn lobby_core::traits::RatingStore>::get_rating(
             &self.state.store,
             args.steam_id,
@@ -360,24 +469,26 @@ impl LobbyActivities {
             queued_at: chrono::Utc::now(),
         };
         self.state.store.enqueue(&entry).await?;
+        // Queueing is proof of life: refresh liveness so the stale-queue
+        // sweep (30s since last_heartbeat) never evicts a just-queued entry
+        // whose previous heartbeat predates the queue click (mirrors the
+        // in-process begin_matchmaking).
+        let _ = self.state.store.update_heartbeat(args.steam_id).await;
+        tracing::info!("enter_queue activity done: steam_id={}", args.steam_id);
         Ok(())
     }
 
-    /// Leave the queue: player state InMenus + QueueStore::dequeue. Mirrors
-    /// the CancelMatchmaking handler (ws.rs:673-680).
+    /// Leave the queue: QueueStore::dequeue only (state handled separately).
     #[activity]
     pub async fn leave_queue(
         self: Arc<Self>,
         _ctx: ActivityContext,
         args: QueueArgs,
     ) -> Result<(), ActivityError> {
-        self.state
-            .player_manager
-            .cancel_matchmaking(args.steam_id, &self.state.store)
-            .await?;
         self.state.store.dequeue(args.steam_id, &args.mode).await?;
         Ok(())
     }
+
     /// Set the player state directly (PlayerStore::set_player_state).
     #[activity]
     pub async fn set_player_state(

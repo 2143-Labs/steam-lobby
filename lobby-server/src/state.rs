@@ -80,8 +80,6 @@ pub struct AppState {
     pub ticket_limiter: RateLimiter,
     /// Rate limiter for /auth/test-token.
     pub test_token_limiter: RateLimiter,
-    /// START-window tasks: match_token -> pending window (forfeit timer).
-    pub start_windows: ParkMutex<std::collections::HashMap<String, crate::pong::PendingStart>>,
     /// Bumped per connection so a reconnecting client supersedes a stale one.
     pub next_generation: AtomicU64,
     /// Active pong matches: match_token -> input channel + task handle.
@@ -90,6 +88,10 @@ pub struct AppState {
     /// Temporal is down — handlers fall back to the in-process path (Step 9
     /// transition window; deleted at cutover).
     pub temporal: std::sync::RwLock<Option<Arc<temporalio_client::Client>>>,
+    /// Worker shutdown handle, set once the in-process Temporal worker boots
+    /// (the test harness fires it at teardown so the worker stops polling
+    /// before its test DB drops; production never touches it).
+    pub temporal_shutdown: std::sync::RwLock<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 pub struct OpenIdState {

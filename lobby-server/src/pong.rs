@@ -41,118 +41,6 @@ pub struct ActivePong {
 /// health comparison (clients only ever lag a few frames behind).
 const HEALTH_RING: usize = 128;
 
-/// Registry entry for a pending START window: the 15s forfeit timer that
-/// begins once BOTH players accepted a p2p match (InProgress). Each player's
-/// `start_match` message routes its steam_id into `tx`; if both start before
-/// the timeout the handler's `spawn_game` (triggered by the Reporting flip)
-/// takes over and this window exits on the first branch. If the timeout fires
-/// first, any player who did not start forfeits (or both, for a double loss).
-pub struct PendingStart {
-    pub player_a: u64,
-    pub player_b: u64,
-    /// steam_id of a player who clicked START.
-    pub tx: tokio::sync::mpsc::UnboundedSender<u64>,
-    pub abort: tokio::task::AbortHandle,
-}
-
-/// Spawn the START-window task for a p2p match that just reached InProgress.
-/// Idempotent via the registry, exactly like `spawn_game`: the first spawn
-/// wins and a racing duplicate is aborted.
-pub fn spawn_start_window(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
-    let task_state = state.clone();
-    let token = m.match_token.clone();
-    let task_token = token.clone();
-    let player_a = m.player_a;
-    let player_b = m.player_b;
-    let handle = tokio::spawn(async move {
-        // Pinned deadline: the 15s window is created once, not re-armed per
-        // START — the countdown the client sees maps 1:1 to this sleep.
-        let deadline = tokio::time::sleep(std::time::Duration::from_secs(
-            task_state.config.start_timeout_secs,
-        ));
-        tokio::pin!(deadline);
-        let mut started: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        loop {
-            tokio::select! {
-                Some(pid) = rx.recv() => {
-                    started.insert(pid);
-                    if started.contains(&player_a) && started.contains(&player_b) {
-                        break; // both started — the StartMatch handler spawned the game
-                    }
-                }
-                _ = &mut deadline => {
-                    // Timeout: forfeit any player who didn't start.
-                    if let Ok(Some(match_info)) = task_state.store.get_match(&task_token).await {
-                        if match_info.status == lobby_core::types::MatchStatus::Reporting {
-                            break; // game already running — race, do nothing
-                        }
-                        if match_info.status == lobby_core::types::MatchStatus::InProgress {
-                            let winner = if started.contains(&player_a) { Some(player_a) }
-                                else if started.contains(&player_b) { Some(player_b) } else { None };
-                            let outcome = if let Some(w) = winner {
-                                // resolve_pong requires Reporting (match_lifecycle.rs).
-                                task_state.store
-                                    .update_match(&task_token, lobby_core::types::MatchStatus::Reporting, chrono::Utc::now())
-                                    .await
-                                    .ok();
-                                task_state
-                                    .match_manager
-                                    .resolve_pong(&task_token, w, &task_state.store, &task_state.store, &task_state.store)
-                                    .await
-                            } else {
-                                // Neither started → DOUBLE LOSS (user decision).
-                                task_state.store
-                                    .update_match(&task_token, lobby_core::types::MatchStatus::Reporting, chrono::Utc::now())
-                                    .await
-                                    .ok();
-                                task_state
-                                    .match_manager
-                                    .resolve_forfeit(&task_token, &task_state.store, &task_state.store, &task_state.store)
-                                    .await
-                            };
-                            // Broadcast to both (mirror the disconnect-forfeit block, ws.rs).
-                            let connections = task_state.connections.lock().await;
-                            for pid in [player_a, player_b] {
-                                if let Some(e) = connections.get(&pid) {
-                                    if let Some(w) = winner {
-                                        let _ = e.tx.send(crate::ws::ServerMessage::GameOver {
-                                            match_token: task_token.clone(),
-                                            winner: w,
-                                        });
-                                    }
-                                    if let Ok(o) = &outcome {
-                                        let _ = e.tx.send(crate::ws::ServerMessage::MatchResult {
-                                            match_token: task_token.clone(),
-                                            outcome: serde_json::to_value(o).unwrap(),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-        task_state.start_windows.lock().remove(&task_token);
-    });
-    // Register; a racing duplicate is aborted like `spawn_game`.
-    let mut windows = state.start_windows.lock();
-    if windows.contains_key(&token) {
-        handle.abort();
-        return;
-    }
-    windows.insert(
-        token,
-        PendingStart {
-            player_a,
-            player_b,
-            tx,
-            abort: handle.abort_handle(),
-        },
-    );
-}
 
 /// Pop every queued input with `frame <= next`, applying the last as the
 /// paddle target (inputs for older frames are superseded; between changes the
@@ -359,6 +247,25 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                                 PongSide::Left => players[0],
                                 PongSide::Right => players[1],
                             };
+                            // Step 11: when Temporal owns the match, the
+                            // workflow is the sole lifecycle writer — the
+                            // referee only PLAYS BACK the game. The clients'
+                            // who_won reports drive the workflow's
+                            // finish_match; the referee just logs and exits
+                            // (the match leaves Reporting once the workflow
+                            // resolves, which breaks this loop naturally).
+                            let temporal_up = task_state
+                                .temporal
+                                .read()
+                                .ok()
+                                .map_or(false, |g| g.is_some());
+                            if temporal_up {
+                                tracing::info!(
+                                    "match {task_token} pong ended (winner {winner}) — \
+                                     awaiting workflow finish"
+                                );
+                                break;
+                            }
                             let outcome = task_state
                                 .match_manager
                                 .resolve_pong(

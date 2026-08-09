@@ -8,7 +8,7 @@ use lobby_core::traits::{MatchStore, QueueStore, RatingStore};
 use lobby_core::types::LeaderboardEntry;
 
 use crate::state::AppState;
-use crate::ws::{notify_match_players, OpponentInfo, ServerMessage};
+use crate::ws::{OpponentInfo, ServerMessage};
 
 pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     let mut interval = tokio::time::interval(Duration::from_secs(2));
@@ -27,7 +27,14 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
             _ = interval.tick() => {}
             _ = stop => break,
         }
+
+        // server_arena (non-P2p) stays in-process: the Temporal migration is
+        // p2p-only, so the ticker still pairs Server-type matches. P2p pairing
+        // is the MatchmakerWorkflow's job.
         for (mode, game_type) in &state.game_modes {
+            if *game_type == lobby_core::types::GameType::P2p {
+                continue;
+            }
             match state
                 .matchmaking_queue
                 .tick(mode, *game_type, &state.store, &state.store, &state.store, &state.store)
@@ -46,8 +53,6 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                     let state_a = state.clone();
                     let info_a = match_info.clone();
                     tokio::spawn(async move {
-                        // Fetch the display name BEFORE taking the connections lock so
-                        // the global mutex is never held across a Steam API call.
                         let opponent_name = state_a
                             .steam_auth
                             .get_player_summary(info_a.player_b)
@@ -196,24 +201,6 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
             }
         }
 
-        // Tell both players when their match dies so no client is left
-        // waiting on a panel that can never resolve.
-        if let Ok(expired) = state
-            .match_manager
-            .expire_pending_accepts(&state.store, &state.store)
-            .await
-        {
-            for token in expired {
-                notify_match_players(
-                    &state,
-                    &token,
-                    ServerMessage::MatchExpired {
-                        match_token: token.clone(),
-                    },
-                )
-                .await;
-            }
-        }
         // Server-authoritative matches: allocate a gameserver once both accepted.
         let in_progress = state
             .store
@@ -306,23 +293,6 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                         match_token: token.clone(),
                         outcome: serde_json::to_value(lobby_core::types::MatchOutcome::Disputed)
                             .unwrap(),
-                    },
-                )
-                .await;
-            }
-        }
-        if let Ok(resolved) = state
-            .match_manager
-            .expire_pending_reports(&state.store, &state.store, &state.store)
-            .await
-        {
-            for (token, outcome) in resolved {
-                notify_match_players(
-                    &state,
-                    &token,
-                    ServerMessage::MatchResult {
-                        match_token: token.clone(),
-                        outcome: serde_json::to_value(&outcome).unwrap(),
                     },
                 )
                 .await;

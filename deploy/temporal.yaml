@@ -39,16 +39,22 @@ spec:
         - name: POSTGRES_SEEDS
           value: 127.0.0.1   # same pod — postgres is localhost
         # auto-setup creates the default namespace + schema on first boot
+        - name: DEFAULT_NAMESPACE
+          value: pvp
       ports:
         - containerPort: 7233
           hostPort: 7233    # Temporal gRPC frontend — clients connect here
     - name: temporal-ui
       image: docker.io/temporalio/ui:latest
       env:
+        # Podman play kube: containers share the pod network; `temporal-dev`
+        # resolves to the pod IP (10.89.0.x). 127.0.0.1 would be this
+        # container's OWN loopback — the frontend binds the pod IP, so dialing
+        # localhost fails (the UI shows "connection refused").
         - name: TEMPORAL_ADDRESS
-          value: 127.0.0.1:7233
+          value: temporal-dev:7233
         - name: TEMPORAL_GRPC_ENDPOINT
-          value: 127.0.0.1:7233
+          value: temporal-dev:7233
       ports:
         - containerPort: 8080
           hostPort: 8233    # 8080 is the lobby web port — UI goes on 8233
