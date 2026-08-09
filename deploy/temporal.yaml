@@ -1,0 +1,57 @@
+# Local Temporal dev stack for the lobby-server in-process worker.
+# One Pod, three containers, shared localhost network inside the pod;
+# hostPort exposes the frontend + UI on the host.
+#
+# Run with: just temporal-up   (podman play kube deploy/temporal.yaml)
+#       or: docker compose -f deploy/temporal.yaml up -d   (docker path, same services)
+# Stop with: just temporal-down
+apiVersion: v1
+kind: Pod
+metadata:
+  name: temporal-dev
+  labels:
+    app: temporal-dev
+spec:
+  containers:
+    - name: temporal-postgres
+      image: docker.io/library/postgres:16-alpine
+      env:
+        - name: POSTGRES_USER
+          value: temporal
+        - name: POSTGRES_PASSWORD
+          value: temporal
+        - name: POSTGRES_DB
+          value: temporal
+      volumeMounts:
+        - name: pgdata
+          mountPath: /var/lib/postgresql/data
+    - name: temporal
+      image: docker.io/temporalio/auto-setup:latest
+      env:
+        - name: DB
+          value: postgres12
+        - name: DB_PORT
+          value: "5432"
+        - name: POSTGRES_USER
+          value: temporal
+        - name: POSTGRES_PWD
+          value: temporal
+        - name: POSTGRES_SEEDS
+          value: 127.0.0.1   # same pod — postgres is localhost
+        # auto-setup creates the default namespace + schema on first boot
+      ports:
+        - containerPort: 7233
+          hostPort: 7233    # Temporal gRPC frontend — clients connect here
+    - name: temporal-ui
+      image: docker.io/temporalio/ui:latest
+      env:
+        - name: TEMPORAL_ADDRESS
+          value: 127.0.0.1:7233
+        - name: TEMPORAL_GRPC_ENDPOINT
+          value: 127.0.0.1:7233
+      ports:
+        - containerPort: 8080
+          hostPort: 8233    # 8080 is the lobby web port — UI goes on 8233
+  volumes:
+    - name: pgdata
+      emptyDir: {}          # dev-only, ephemeral by design — demo/tests regenerate state

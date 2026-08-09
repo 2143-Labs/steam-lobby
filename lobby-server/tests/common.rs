@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use lobby_server::{build_app, AppConfig};
+use lobby_server::{AppConfig, build_app};
 use sqlx::ConnectOptions;
 use sqlx::PgPool;
 
@@ -11,9 +11,9 @@ use sqlx::PgPool;
 /// that pool with a `close().await` after the test, which yields the runtime
 /// so the aborted server + ticker unwind BEFORE the post-test DROP DATABASE).
 pub struct TestHarness {
-    pub base_url: String, // "http://127.0.0.1:PORT"
-    pub ws_url: String,   // "ws://127.0.0.1:PORT/ws"
-    pub pool: PgPool,     // the injected test pool (≤5 conns, parented to sqlx's master pool)
+    pub base_url: String,                // "http://127.0.0.1:PORT"
+    pub ws_url: String,                  // "ws://127.0.0.1:PORT/ws"
+    pub pool: PgPool, // the injected test pool (≤5 conns, parented to sqlx's master pool)
     _state: Arc<lobby_server::AppState>, // keep alive so ticker keeps running
     _server: tokio::task::JoinHandle<()>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -56,7 +56,6 @@ pub async fn setup_with_creator(pool: PgPool, creator_url: Option<&str>) -> Test
 pub async fn setup_with_turn(pool: PgPool, turn_secret: Option<&str>) -> TestHarness {
     setup_full(pool, true, None, turn_secret.map(String::from), 15, 0).await
 }
-
 
 async fn setup_full(
     pool: PgPool,
@@ -103,12 +102,18 @@ async fn setup_full(
         pong_countdown_ticks: countdown_ticks,
         turn_secret,
         turn_uris: vec!["turn:turn.john2143.com:3478?transport=udp".into()],
+        temporal_address: "http://localhost:7233".into(),
+        temporal_namespace: "default".into(),
+        temporal_task_queue: "lobby-test".into(),
         ticker_shutdown: Some(shutdown_rx),
+        temporal_disabled: true,
         pool: Some(pool_clone),
     };
 
     let (app, state) = build_app(config).await; // runs migrations (no-op; already applied) + spawns ticker
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind port 0");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind port 0");
     let addr = listener.local_addr().expect("local addr");
     let server = tokio::spawn(async move {
         axum::serve(

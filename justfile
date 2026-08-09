@@ -110,6 +110,32 @@ db-down:
     echo "no lobby-db container to stop"
   fi
   echo "DB stopped"
+
+# start the local Temporal stack (podman play kube; the only container tool on
+# this machine is podman — no docker/podman-compose binaries). auto-setup needs
+# ~30-60s to create the schema + default namespace on first boot.
+temporal-up:
+  #!/usr/bin/env bash
+  set -e
+  if podman pod exists temporal-dev &>/dev/null; then
+    echo "temporal-dev already running"
+  else
+    podman play kube deploy/temporal.yaml
+  fi
+  # Wait until the frontend accepts TCP on :7233 (poll with a bash /dev/tcp connect).
+  for _ in $(seq 1 90); do
+    if (exec 3<>/dev/tcp/localhost/7233) 2>/dev/null; then
+      exec 3>&- 3<&-
+      break
+    fi
+    sleep 1
+  done
+  echo "Temporal ready at localhost:7233, UI at http://localhost:8233"
+
+# stop the local Temporal stack
+temporal-down:
+  podman play kube --down deploy/temporal.yaml
+
 up:
   docker compose up -d
 

@@ -1,6 +1,6 @@
 //! Binary entrypoint: loads env-var config, builds the app, and serves it
 //! with a graceful shutdown. Helpers: `parse_game_modes` and `shutdown_signal`.
-use lobby_server::{build_app, AppConfig};
+use lobby_server::{AppConfig, build_app};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -77,7 +77,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(90),
-        turn_secret: std::env::var("LOBBY_TURN_SECRET").ok().filter(|s| !s.is_empty()),
+        turn_secret: std::env::var("LOBBY_TURN_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty()),
         turn_uris: std::env::var("LOBBY_TURN_URIS")
             .map(|v| {
                 v.split(',')
@@ -86,7 +88,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .collect()
             })
             .unwrap_or_else(|_| vec!["turn:turn.john2143.com:3478?transport=udp".into()]),
+        temporal_address: std::env::var("TEMPORAL_ADDRESS")
+            .unwrap_or_else(|_| "http://localhost:7233".into()),
+        temporal_namespace: std::env::var("TEMPORAL_NAMESPACE")
+            .unwrap_or_else(|_| "default".into()),
+        temporal_task_queue: std::env::var("TEMPORAL_TASK_QUEUE")
+            .unwrap_or_else(|_| "lobby".into()),
         ticker_shutdown: None,
+        temporal_disabled: false,
         pool: None,
     };
 
@@ -117,7 +126,9 @@ fn parse_game_modes(s: &str) -> Vec<(String, lobby_core::types::GameType)> {
                 "p2p" => lobby_core::types::GameType::P2p,
                 "server" => lobby_core::types::GameType::Server,
                 other => {
-                    tracing::warn!("GAME_MODES: unknown game type '{other}' for mode '{name}' — skipping");
+                    tracing::warn!(
+                        "GAME_MODES: unknown game type '{other}' for mode '{name}' — skipping"
+                    );
                     return None;
                 }
             };
@@ -129,7 +140,9 @@ fn parse_game_modes(s: &str) -> Vec<(String, lobby_core::types::GameType)> {
 /// Wait for SIGINT (ctrl-c) or SIGTERM, then let axum drain in-flight connections.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.expect("failed to install ctrl-c handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install ctrl-c handler");
     };
     #[cfg(unix)]
     let terminate = async {

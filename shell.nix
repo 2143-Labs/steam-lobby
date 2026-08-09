@@ -13,5 +13,6 @@ pkgs.mkShell {
     pkg-config
     openssl
     just
+    protobuf   # protoc — prost-wkt-types (temporalio SDK dep) needs it at build time
   ];
 }

@@ -31,6 +31,9 @@ services:
       AUTH_DEV_MODE: ${AUTH_DEV_MODE:-false}
       JWT_TTL_S: ${JWT_TTL_S:-86400}
       RUST_LOG: ${RUST_LOG:-info,lobby_server=debug}
+      TEMPORAL_ADDRESS: ${TEMPORAL_ADDRESS:-http://localhost:7233}
+      TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+      TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-lobby}
     security_opt:
       - no-new-privileges:true
     cap_drop:

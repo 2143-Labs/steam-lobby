@@ -1,13 +1,14 @@
 //! Shared `AppState`: the composition root handed to every axum handler and
 //! the ticker. Config values handlers need are grouped in `RuntimeConfig`
 //! (secrets stay in `SteamAuthService`); the rest are runtime-only structures.
-use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
 use parking_lot::Mutex as ParkMutex;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicU64;
 
 use lobby_core::traits::GameCallbacks;
-use tokio::sync::{mpsc, Mutex as TokioMutex};
+use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::db::PostgresStore;
 use crate::rate_limit::RateLimiter;
@@ -36,6 +37,16 @@ pub struct RuntimeConfig {
     pub turn_secret: Option<String>,
     /// LOBBY_TURN_URIS; TURN server URIs returned to clients.
     pub turn_uris: Vec<String>,
+    /// TEMPORAL_ADDRESS; Temporal gRPC frontend (plaintext URI).
+    pub temporal_address: String,
+    /// TEMPORAL_NAMESPACE; Temporal namespace the worker + client bind to.
+    pub temporal_namespace: String,
+    /// TEMPORAL_TASK_QUEUE; the in-process worker's task queue.
+    pub temporal_task_queue: String,
+    /// MATCH_ACCEPT_TIMEOUT_S; how long a PendingAccept match waits.
+    pub match_accept_timeout_secs: u64,
+    /// REPORT_TIMEOUT_S; how long a Reporting match waits for reports.
+    pub report_timeout_secs: u64,
 }
 
 pub struct AppState {
@@ -75,6 +86,10 @@ pub struct AppState {
     pub next_generation: AtomicU64,
     /// Active pong matches: match_token -> input channel + task handle.
     pub pong_games: ParkMutex<std::collections::HashMap<String, crate::pong::ActivePong>>,
+    /// Temporal client slot, set by the worker once it connects. `None` while
+    /// Temporal is down — handlers fall back to the in-process path (Step 9
+    /// transition window; deleted at cutover).
+    pub temporal: std::sync::RwLock<Option<Arc<temporalio_client::Client>>>,
 }
 
 pub struct OpenIdState {

@@ -1,7 +1,7 @@
 [package]
 name = "lobby-server"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 lobby-core = { path = "../lobby-core" }
@@ -25,6 +25,13 @@ parking_lot = "0.12"
 hmac = "0.12"
 sha1 = "0.10"
 base64 = "0.22"
+temporalio-sdk = "=0.6.0"
+temporalio-client = "=0.6.0"
+temporalio-macros = "=0.6.0"
+temporalio-workflow = "=0.6.0"
+temporalio-common = "=0.6.0"
+futures = "0.3"
+anyhow = "1"
 
 [dev-dependencies]
 lobby-client = { path = "../lobby-client" }
