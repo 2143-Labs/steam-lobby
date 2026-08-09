@@ -1236,7 +1236,7 @@ async fn server_game_full_lifecycle(pool: sqlx::PgPool) {
     *base_slot.lock().await = Some(h.base_url.clone());
     let (mut p1, mut p2, token) = pair_up(&h, 300, 301, "server_arena").await;
 
-    // Accept only — server matches reject p2p_connected (mark_connected guard).
+    // Accept only — server matches reject start_match (mark_connected guard).
     p1.accept_match(&token).await.unwrap();
     p2.accept_match(&token).await.unwrap();
     assert!(wait_for_status(&h.pool, &token, "InProgress").await,
