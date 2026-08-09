@@ -18,9 +18,7 @@ use temporalio_sdk::{
 use lobby_core::types::{MatchDifficulty, MatchInfo, PlayerState, SteamId};
 
 use crate::state::AppState;
-use crate::temporal::activities::{
-    self, FinishMatchArgs, MatchStateArgs, QueueArgs,
-};
+use crate::temporal::activities::{self, FinishMatchArgs, MatchStateArgs, QueueArgs};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared args (all must be Serialize + Deserialize + Send + Sync)
@@ -524,7 +522,10 @@ pub(crate) async fn start_p2p_match(
         )
         .await
     {
-        tracing::warn!("failed to start P2PMatchWorkflow for {}: {e}", m.match_token);
+        tracing::warn!(
+            "failed to start P2PMatchWorkflow for {}: {e}",
+            m.match_token
+        );
     }
 }
 

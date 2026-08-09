@@ -7,12 +7,12 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
-use lobby_core::traits::{MatchStore, PlayerStore, QueueStore};
 use lobby_core::pong::PongSide;
+use lobby_core::traits::{MatchStore, PlayerStore, QueueStore};
 use lobby_core::types::{MatchDifficulty, SteamId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 use crate::pong::{PongInput, RollbackHealth};
 use crate::state::{AppState, ConnectionEntry};
@@ -23,32 +23,19 @@ use crate::state::{AppState, ConnectionEntry};
 /// must be `Auth` or `AuthTicket`; anything else ends the session.
 pub enum ClientMessage {
     /// Authenticate with a JWT session token (from OpenID login).
-    Auth {
-        session_token: String,
-    },
+    Auth { session_token: String },
     /// Authenticate with a raw Steam ticket.
-    AuthTicket {
-        ticket: String,
-    },
+    AuthTicket { ticket: String },
     /// Enter the matchmaking queue for a mode.
-    BeginMatchmaking {
-        mode: String,
-        difficulty: String,
-    },
+    BeginMatchmaking { mode: String, difficulty: String },
     /// Leave the queue.
     CancelMatchmaking,
     /// Accept a found match.
-    AcceptMatch {
-        match_token: String,
-    },
+    AcceptMatch { match_token: String },
     /// Decline a found match; the match becomes `Disputed` if still pending.
-    DeclineMatch {
-        match_token: String,
-    },
+    DeclineMatch { match_token: String },
     /// Click START = my P2P connection is established; begin the match.
-    StartMatch {
-        match_token: String,
-    },
+    StartMatch { match_token: String },
     /// Pong paddle target (normalized paddle-center Y, 0..1), frame-stamped.
     /// `frame` is the sim frame this input applies to (the client's
     /// `session.frame + 1`). No `#[serde(default)]` — clean cutover, the demo
@@ -64,15 +51,9 @@ pub enum ClientMessage {
         target: String,
     },
     /// WebRTC signaling: offer SDP from the offerer (player_a).
-    WebrtcOffer {
-        match_token: String,
-        sdp: String,
-    },
+    WebrtcOffer { match_token: String, sdp: String },
     /// WebRTC signaling: answer SDP from the answerer (player_b).
-    WebrtcAnswer {
-        match_token: String,
-        sdp: String,
-    },
+    WebrtcAnswer { match_token: String, sdp: String },
     /// WebRTC signaling: ICE candidate.
     WebrtcIce {
         match_token: String,
@@ -89,7 +70,10 @@ pub enum ClientMessage {
     /// Submit a match report (`winner` None = draw).
     MatchReport {
         match_token: String,
-        #[serde(default, deserialize_with = "lobby_core::types::deserialize_optional_steam_id")]
+        #[serde(
+            default,
+            deserialize_with = "lobby_core::types::deserialize_optional_steam_id"
+        )]
         winner: Option<u64>,
         demo_hash: Option<String>,
     },
@@ -124,9 +108,7 @@ pub enum ServerMessage {
         leaderboard: Vec<lobby_core::types::LeaderboardEntry>,
     },
     /// The opponent reported their peer-to-peer connection.
-    OpponentConnected {
-        match_token: String,
-    },
+    OpponentConnected { match_token: String },
     /// A match report was stored (broadcast to both players).
     ReportReceived {
         match_token: String,
@@ -182,10 +164,7 @@ pub enum ServerMessage {
     },
     /// The referee has advanced to `frame` — both players' inputs for it are
     /// known and applied. Clients advance their confirmed frame on this.
-    InputAck {
-        match_token: String,
-        frame: u32,
-    },
+    InputAck { match_token: String, frame: u32 },
     /// A round has begun: the referee holds the sim frozen for `countdown_ticks`
     /// 33ms ticks (3-2-1). `frame` is the first frame of the hold (the ball
     /// launches at `frame + countdown_ticks`); `round` is the 0-based round
@@ -249,20 +228,13 @@ pub enum ServerMessage {
         outcome: serde_json::Value, // MatchOutcome serialized
     },
     /// The opponent declined the match.
-    MatchDeclined {
-        match_token: String,
-    },
+    MatchDeclined { match_token: String },
     /// The match expired (accept timeout).
-    MatchExpired {
-        match_token: String,
-    },
+    MatchExpired { match_token: String },
     /// The player's queue entry was dropped (stale heartbeat).
     QueueExpired,
     /// Protocol-level error.
-    Error {
-        code: String,
-        message: String,
-    },
+    Error { code: String, message: String },
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -290,9 +262,7 @@ pub async fn ws_route(
         let same_origin = headers
             .get(axum::http::header::HOST)
             .and_then(|h| h.to_str().ok())
-            .is_some_and(|host| {
-                s == format!("http://{host}") || s == format!("https://{host}")
-            });
+            .is_some_and(|host| s == format!("http://{host}") || s == format!("https://{host}"));
         let allowed = app_state.config.cors_origins.iter().any(|a| a == s)
             || (app_state.config.auth_dev_mode && origin.as_bytes() == b"null")
             || same_origin;
@@ -311,7 +281,8 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
     // Auth phase
-    let (user_id, steam_id) = match authenticate(&mut receiver, &mut sender, &state, peer_ip).await {
+    let (user_id, steam_id) = match authenticate(&mut receiver, &mut sender, &state, peer_ip).await
+    {
         Ok(pair) => pair,
         Err(_) => return,
     };
@@ -525,7 +496,8 @@ async fn authenticate(
     // ── Auth ──
     match cm {
         ClientMessage::Auth { session_token } => {
-            let (_user_id, id, ver) = match state.steam_auth.validate_session_token(&session_token) {
+            let (_user_id, id, ver) = match state.steam_auth.validate_session_token(&session_token)
+            {
                 Ok(v) => v,
                 Err(_) => {
                     tracing::warn!("auth failed (invalid session token) from {peer_ip}");
@@ -596,7 +568,6 @@ async fn authenticate(
         }
     }
 }
-
 
 async fn handle_client_message(
     cm: ClientMessage,
@@ -700,7 +671,10 @@ async fn handle_client_message(
                 }
             }
         }
-        ClientMessage::WebrtcIce { match_token, candidate } => {
+        ClientMessage::WebrtcIce {
+            match_token,
+            candidate,
+        } => {
             let other = match state.store.get_match(&match_token).await {
                 Ok(Some(ref m)) if m.player_a == steam_id => Some(m.player_b),
                 Ok(Some(ref m)) if m.player_b == steam_id => Some(m.player_a),
@@ -717,10 +691,16 @@ async fn handle_client_message(
                 }
             }
         }
-        ClientMessage::GameInput { match_token, target, frame } => {
+        ClientMessage::GameInput {
+            match_token,
+            target,
+            frame,
+        } => {
             // `str::parse` is correctly rounded (serde_json's f64 parser is
             // not — up to 1 ULP off, which would desync the sims).
-            let Ok(target) = target.parse::<f64>() else { return; };
+            let Ok(target) = target.parse::<f64>() else {
+                return;
+            };
             let target = target.clamp(0.0, 1.0);
             // Resolve the side BEFORE taking the parking_lot Mutex (the guard
             // is !Send and must not be held across an await).
@@ -746,17 +726,29 @@ async fn handle_client_message(
                 }
                 let games = state.pong_games.lock();
                 if let Some(g) = games.get(&match_token) {
-                    let _ = g.input_tx.send(PongInput { side, target, frame });
+                    let _ = g.input_tx.send(PongInput {
+                        side,
+                        target,
+                        frame,
+                    });
                 }
             }
         }
-        ClientMessage::RollbackHealth { match_token, frame, checksum } => {
+        ClientMessage::RollbackHealth {
+            match_token,
+            frame,
+            checksum,
+        } => {
             // Checksums travel as decimal strings (JS cannot hold u64 exactly);
             // a malformed report is ignored.
             if let Ok(checksum) = checksum.parse::<u64>() {
                 let games = state.pong_games.lock();
                 if let Some(g) = games.get(&match_token) {
-                    let _ = g.health_tx.send(RollbackHealth { from: steam_id, frame, checksum });
+                    let _ = g.health_tx.send(RollbackHealth {
+                        from: steam_id,
+                        frame,
+                        checksum,
+                    });
                 }
             }
         }

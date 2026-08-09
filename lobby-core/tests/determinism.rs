@@ -31,8 +31,14 @@ fn apply_frame(g: &mut PongGame, frame: u32) {
 /// restart at 0, or the schedule and the trajectory diverge.
 fn run_schedule(g: &mut PongGame, start: u32, frames: u32, offs: (u32, u32)) {
     for frame in start..start + frames {
-        g.set_target(PongSide::Left, ((((frame / 5) * 7919) + offs.0) % 997) as f64 / 997.0);
-        g.set_target(PongSide::Right, ((((frame / 5) * 7919) + offs.1) % 997) as f64 / 997.0);
+        g.set_target(
+            PongSide::Left,
+            ((((frame / 5) * 7919) + offs.0) % 997) as f64 / 997.0,
+        );
+        g.set_target(
+            PongSide::Right,
+            ((((frame / 5) * 7919) + offs.1) % 997) as f64 / 997.0,
+        );
         g.step(DT_SECS);
     }
 }
@@ -71,7 +77,11 @@ fn snapshot_roundtrip_identity() {
     assert_eq!(s.len(), PongGame::STATE_BYTES);
     let mut h = PongGame::new();
     h.restore(&s);
-    assert_eq!(g.full_state(), h.full_state(), "state must roundtrip exactly");
+    assert_eq!(
+        g.full_state(),
+        h.full_state(),
+        "state must roundtrip exactly"
+    );
     assert_eq!(g.checksum(), h.checksum());
 }
 
@@ -117,7 +127,10 @@ fn no_nan_no_negzero_never() {
             let v = f64::from_bits(bits);
             assert!(!v.is_nan(), "NaN in state at frame {frame}");
             assert!(!v.is_infinite(), "±Inf in state at frame {frame}");
-            assert_ne!(bits, 0x8000_0000_0000_0000, "-0.0 in state at frame {frame}");
+            assert_ne!(
+                bits, 0x8000_0000_0000_0000,
+                "-0.0 in state at frame {frame}"
+            );
         }
     }
 }
@@ -139,7 +152,11 @@ fn arrival_schedule_convergence() {
         swapped.set_target(PongSide::Left, schedule(frame, PongSide::Left));
         swapped.step(DT_SECS);
     }
-    assert_eq!(swapped.full_state(), reference.full_state(), "order within a frame is irrelevant");
+    assert_eq!(
+        swapped.full_state(),
+        reference.full_state(),
+        "order within a frame is irrelevant"
+    );
 
     let mut duplicated = PongGame::new();
     for frame in 0..1_000 {
@@ -148,7 +165,11 @@ fn arrival_schedule_convergence() {
         duplicated.set_target(PongSide::Right, schedule(frame, PongSide::Right));
         duplicated.step(DT_SECS);
     }
-    assert_eq!(duplicated.full_state(), reference.full_state(), "duplicate delivery is irrelevant");
+    assert_eq!(
+        duplicated.full_state(),
+        reference.full_state(),
+        "duplicate delivery is irrelevant"
+    );
 }
 
 #[test]
@@ -166,14 +187,18 @@ fn differential_js_matches_rust() {
     // sim and assert every one equals the JS sim's hashes. Proves the core
     // claim (Rust f64 == JS double for this exact op sequence) across the
     // whole trajectory, not just the five golden checkpoints.
-    let raw = std::fs::read_to_string("../web/test/.js-hashes.json")
-        .expect("missing web/test/.js-hashes.json — run `node web/test/diff.mjs` first (or `just js-test`)");
+    let raw = std::fs::read_to_string("../web/test/.js-hashes.json").expect(
+        "missing web/test/.js-hashes.json — run `node web/test/diff.mjs` first (or `just js-test`)",
+    );
     let v: serde_json::Value =
         serde_json::from_str(&raw).expect("malformed web/test/.js-hashes.json");
     let checkpoints = v["checkpoints"].as_object().expect("`checkpoints` object");
 
     let mut g = PongGame::new();
-    assert_eq!(g.checksum(), checkpoints["0"].as_str().unwrap().parse::<u64>().unwrap());
+    assert_eq!(
+        g.checksum(),
+        checkpoints["0"].as_str().unwrap().parse::<u64>().unwrap()
+    );
     for frame in 0..10_000 {
         apply_frame(&mut g, frame);
         let n = frame + 1;

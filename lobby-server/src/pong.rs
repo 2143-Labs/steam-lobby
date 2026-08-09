@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use lobby_core::pong::{PongGame, PongSide, DT_SECS, TICK_MS};
+use lobby_core::pong::{DT_SECS, PongGame, PongSide, TICK_MS};
 
 use lobby_core::traits::MatchStore;
 
@@ -40,7 +40,6 @@ pub struct ActivePong {
 /// How many authoritative (frame, checksum) entries the referee keeps for
 /// health comparison (clients only ever lag a few frames behind).
 const HEALTH_RING: usize = 128;
-
 
 /// Pop every queued input with `frame <= next`, applying the last as the
 /// paddle target (inputs for older frames are superseded; between changes the
@@ -129,10 +128,10 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
         loop {
             interval.tick().await;
             // 1. stop if the match left Reporting (report/expiry raced us)
-            if let Ok(Some(match_info)) = task_state.store.get_match(&task_token).await {
-                if match_info.status != lobby_core::types::MatchStatus::Reporting {
-                    break;
-                }
+            if let Ok(Some(match_info)) = task_state.store.get_match(&task_token).await
+                && match_info.status != lobby_core::types::MatchStatus::Reporting
+            {
+                break;
             }
             // 2. drain inputs into the per-side queues
             while let Ok(i) = input_rx.try_recv() {
@@ -152,8 +151,8 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                 // (unchanged) snapshot + ack so clients' confirmed frames
                 // advance in lockstep during the 3-2-1.
                 frame += 1;
-                let snap = game.snapshot();   // unchanged during hold
-                let cksum = game.checksum();  // constant
+                let snap = game.snapshot(); // unchanged during hold
+                let cksum = game.checksum(); // constant
                 {
                     let connections = task_state.connections.lock().await;
                     for pid in players {
@@ -254,11 +253,8 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                             // finish_match; the referee just logs and exits
                             // (the match leaves Reporting once the workflow
                             // resolves, which breaks this loop naturally).
-                            let temporal_up = task_state
-                                .temporal
-                                .read()
-                                .ok()
-                                .map_or(false, |g| g.is_some());
+                            let temporal_up =
+                                task_state.temporal.read().ok().is_some_and(|g| g.is_some());
                             if temporal_up {
                                 tracing::info!(
                                     "match {task_token} pong ended (winner {winner}) — \
@@ -276,7 +272,9 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                                     &task_state.store,
                                 )
                                 .await;
-                            tracing::info!("match {task_token} pong ended, winner {winner}: {outcome:?}");
+                            tracing::info!(
+                                "match {task_token} pong ended, winner {winner}: {outcome:?}"
+                            );
                             // GameOver to both (best-effort), then match_result like the report path does
                             let connections = task_state.connections.lock().await;
                             for pid in players {
@@ -316,27 +314,34 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
 
             // 8. compare client health against the authoritative ring
             for h in pending_health {
-                let ours = checksums.iter().find(|(f, _)| *f == h.frame).map(|(_, c)| *c);
-                if let Some(ours) = ours {
-                    if ours != h.checksum {
-                        tracing::warn!(
-                            "desync detected match {task_token} player {} frame {}",
-                            h.from,
-                            h.frame
-                        );
-                        let state_hex = game
-                            .full_state()
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<String>();
-                        let connections = task_state.connections.lock().await;
-                        if let Some(e) = connections.get(&h.from) {
-                            let _ = e.tx.send(crate::ws::ServerMessage::RollbackResync {
-                                match_token: task_token.clone(),
-                                frame: frame as u32,
-                                state: state_hex,
-                            });
-                        }
+                let ours = checksums
+                    .iter()
+                    .find(|(f, _)| *f == h.frame)
+                    .map(|(_, c)| *c);
+                if let Some(ours) = ours
+                    && ours != h.checksum
+                {
+                    tracing::warn!(
+                        "desync detected match {task_token} player {} frame {}",
+                        h.from,
+                        h.frame
+                    );
+                    let state_hex = game
+                        .full_state()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>();
+                    let connections = task_state.connections.lock().await;
+                    if let Some(e) = connections.get(&h.from) {
+                        // The state is the CURRENT sim state; label it with the
+                        // current frame, not the (lagging) health report's
+                        // frame — the client re-stepping from h.frame with a
+                        // newer state double-moves the ball and re-diverges.
+                        let _ = e.tx.send(crate::ws::ServerMessage::RollbackResync {
+                            match_token: task_token.clone(),
+                            frame: frame as u32,
+                            state: state_hex,
+                        });
                     }
                 }
             }

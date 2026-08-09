@@ -55,7 +55,10 @@ where
     serializer.serialize_str(&id.to_string())
 }
 /// Serialize an optional Steam ID as a JSON string (or `null`).
-pub fn serialize_optional_steam_id<S>(id: &Option<SteamId>, serializer: S) -> Result<S::Ok, S::Error>
+pub fn serialize_optional_steam_id<S>(
+    id: &Option<SteamId>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
@@ -70,7 +73,10 @@ where
 pub struct LeaderboardEntry {
     /// The abstract account id (users.id) — what the UI shows as "player id".
     pub player_id: String,
-    #[serde(serialize_with = "serialize_steam_id", deserialize_with = "deserialize_steam_id")]
+    #[serde(
+        serialize_with = "serialize_steam_id",
+        deserialize_with = "deserialize_steam_id"
+    )]
     pub steam_id: SteamId,
     pub mu: f64,
     pub sigma: f64,
@@ -163,8 +169,8 @@ pub struct MatchInfo {
     pub ended_at: Option<DateTime<Utc>>,
     pub server_address: Option<String>, // set by mark_server_ready
     pub join_token: Option<String>,     // set by mark_server_ready, relayed in game_server_ready
-    #[serde(skip_serializing)]          // never leaves the server (URL secret)
-    pub result_secret: Option<String>,  // generated at match creation for Server games
+    #[serde(skip_serializing)] // never leaves the server (URL secret)
+    pub result_secret: Option<String>, // generated at match creation for Server games
     pub accepted_a: bool,
     pub accepted_b: bool,
     pub connected_a: bool,
@@ -181,13 +187,21 @@ pub struct MatchReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MatchOutcome {
-    Win { mu_change: f64 },
-    Loss { mu_change: f64 },
-    Draw { mu_change: f64 },
+    Win {
+        mu_change: f64,
+    },
+    Loss {
+        mu_change: f64,
+    },
+    Draw {
+        mu_change: f64,
+    },
     Disputed,
     UnreviewableDispute,
     /// Neither player started within the START window — double loss.
-    Forfeit { mu_change: f64 },
+    Forfeit {
+        mu_change: f64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,7 +239,10 @@ mod tests {
 
     #[test]
     fn steam_id_serializes_as_string() {
-        let v = serde_json::to_value(SteamIdProbe { id: 76_561_198_000_000_000 }).unwrap();
+        let v = serde_json::to_value(SteamIdProbe {
+            id: 76_561_198_000_000_000,
+        })
+        .unwrap();
         assert_eq!(v, json!({ "id": "76561198000000000" }));
     }
 
@@ -259,16 +276,31 @@ mod tests {
 
     #[test]
     fn snake_case_enums_serialize_lowercase() {
-        assert_eq!(serde_json::to_string(&PlayerState::InMenus).unwrap(), "\"in_menus\"");
+        assert_eq!(
+            serde_json::to_string(&PlayerState::InMenus).unwrap(),
+            "\"in_menus\""
+        );
         assert_eq!(
             serde_json::to_string(&PlayerState::MatchAccepted).unwrap(),
             "\"match_accepted\""
         );
         assert_eq!(serde_json::to_string(&GameType::P2p).unwrap(), "\"p2p\"");
-        assert_eq!(serde_json::to_string(&GameType::Server).unwrap(), "\"server\"");
-        assert_eq!(serde_json::to_string(&MatchEvent::Paired).unwrap(), "\"paired\"");
-        assert_eq!(serde_json::to_string(&MatchEvent::Declined).unwrap(), "\"declined\"");
-        assert_eq!(serde_json::to_string(&MatchDifficulty::Hard).unwrap(), "\"hard\"");
+        assert_eq!(
+            serde_json::to_string(&GameType::Server).unwrap(),
+            "\"server\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MatchEvent::Paired).unwrap(),
+            "\"paired\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MatchEvent::Declined).unwrap(),
+            "\"declined\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MatchDifficulty::Hard).unwrap(),
+            "\"hard\""
+        );
     }
 
     #[test]
@@ -278,9 +310,18 @@ mod tests {
             serde_json::to_string(&MatchStatus::PendingAccept).unwrap(),
             "\"PendingAccept\""
         );
-        assert_eq!(serde_json::to_string(&MatchStatus::InProgress).unwrap(), "\"InProgress\"");
-        assert_eq!(serde_json::to_string(&MatchStatus::Disputed).unwrap(), "\"Disputed\"");
-        assert_eq!(serde_json::from_str::<MatchStatus>("\"PendingAccept\"").unwrap(), MatchStatus::PendingAccept);
+        assert_eq!(
+            serde_json::to_string(&MatchStatus::InProgress).unwrap(),
+            "\"InProgress\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MatchStatus::Disputed).unwrap(),
+            "\"Disputed\""
+        );
+        assert_eq!(
+            serde_json::from_str::<MatchStatus>("\"PendingAccept\"").unwrap(),
+            MatchStatus::PendingAccept
+        );
     }
 
     #[test]
@@ -293,7 +334,11 @@ mod tests {
             rating: 2.1,
         };
         let v = serde_json::to_value(&entry).unwrap();
-        assert_eq!(v["steam_id"], json!("76561198000000000"), "leaderboard IDs are strings");
+        assert_eq!(
+            v["steam_id"],
+            json!("76561198000000000"),
+            "leaderboard IDs are strings"
+        );
         let back: LeaderboardEntry = serde_json::from_value(v).unwrap();
         assert_eq!(back.steam_id, entry.steam_id);
         assert_eq!(back.player_id, entry.player_id);

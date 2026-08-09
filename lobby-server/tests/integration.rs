@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::{http::StatusCode, routing::post, Json, Router};
+use axum::{Json, Router, http::StatusCode, routing::post};
 use lobby_client::{LobbyClient, ServerEvent};
 use sqlx::PgPool;
 use tokio::sync::Mutex;
@@ -15,11 +15,7 @@ use common::{
 
 /// Poll `query` (a fresh sqlx query for `token`) until it returns a row or 5s elapses.
 /// The server processes WS reports asynchronously, so a straight fetch could race.
-async fn wait_for_row(
-    pool: &PgPool,
-    token: &str,
-    query: &'static str,
-) -> Option<(String, f64)> {
+async fn wait_for_row(pool: &PgPool, token: &str, query: &'static str) -> Option<(String, f64)> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let row = sqlx::query_as::<_, (String, f64)>(query)
@@ -41,13 +37,12 @@ async fn wait_for_row(
 async fn wait_for_status(pool: &PgPool, token: &str, expected: &str) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let status: Option<String> = sqlx::query_scalar(
-            "SELECT status FROM matches WHERE match_token = $1",
-        )
-        .bind(token)
-        .fetch_optional(pool)
-        .await
-        .expect("query matches");
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM matches WHERE match_token = $1")
+                .bind(token)
+                .fetch_optional(pool)
+                .await
+                .expect("query matches");
         if status.as_deref() == Some(expected) {
             return true;
         }
@@ -64,13 +59,12 @@ async fn wait_for_status(pool: &PgPool, token: &str, expected: &str) -> bool {
 async fn wait_for_status_for(pool: &PgPool, token: &str, expected: &str, secs: u64) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(secs);
     loop {
-        let status: Option<String> = sqlx::query_scalar(
-            "SELECT status FROM matches WHERE match_token = $1",
-        )
-        .bind(token)
-        .fetch_optional(pool)
-        .await
-        .expect("query matches");
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM matches WHERE match_token = $1")
+                .bind(token)
+                .fetch_optional(pool)
+                .await
+                .expect("query matches");
         if status.as_deref() == Some(expected) {
             return true;
         }
@@ -85,11 +79,7 @@ async fn wait_for_status_for(pool: &PgPool, token: &str, expected: &str, secs: u
 /// elapses. The server writes match status and event rows as separate
 /// statements (status first, events after), so a single-shot count read can
 /// race the accept/decline event inserts and see a partial set.
-async fn wait_for_event_counts(
-    pool: &PgPool,
-    token: &str,
-    expected: &[(&str, i64)],
-) -> bool {
+async fn wait_for_event_counts(pool: &PgPool, token: &str, expected: &[(&str, i64)]) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let counts: Vec<(String, i64)> = sqlx::query_as(
@@ -111,11 +101,20 @@ async fn wait_for_event_counts(
 }
 
 /// Connect two clients, auth with distinct test tokens, queue, and get a shared match.
-async fn pair_up(h: &common::TestHarness, p1_id: u64, p2_id: u64, mode: &str) -> (LobbyClient, LobbyClient, String) {
+async fn pair_up(
+    h: &common::TestHarness,
+    p1_id: u64,
+    p2_id: u64,
+    mode: &str,
+) -> (LobbyClient, LobbyClient, String) {
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
     let mut p2 = LobbyClient::connect(&h.ws_url).await.unwrap();
-    p1.authenticate_test_token(p1_id, &h.base_url).await.unwrap();
-    p2.authenticate_test_token(p2_id, &h.base_url).await.unwrap();
+    p1.authenticate_test_token(p1_id, &h.base_url)
+        .await
+        .unwrap();
+    p2.authenticate_test_token(p2_id, &h.base_url)
+        .await
+        .unwrap();
 
     p1.begin_matchmaking(mode, "normal").await.unwrap();
     p2.begin_matchmaking(mode, "normal").await.unwrap();
@@ -131,7 +130,10 @@ async fn pair_up(h: &common::TestHarness, p1_id: u64, p2_id: u64, mode: &str) ->
         .expect("p2 match within 15s")
         .unwrap()
         .unwrap();
-    assert_eq!(m1.match_token, m2.match_token, "both players must get the same match");
+    assert_eq!(
+        m1.match_token, m2.match_token,
+        "both players must get the same match"
+    );
     (p1, p2, m1.match_token)
 }
 
@@ -148,13 +150,17 @@ async fn accept_and_connect(
 ) {
     p1.accept_match(token).await.unwrap();
     p2.accept_match(token).await.unwrap();
-    assert!(wait_for_status(&h.pool, token, "InProgress").await,
-        "both accepts must transition the match to InProgress");
+    assert!(
+        wait_for_status(&h.pool, token, "InProgress").await,
+        "both accepts must transition the match to InProgress"
+    );
 
     p1.start_match(token).await.unwrap();
     p2.start_match(token).await.unwrap();
-    assert!(wait_for_status(&h.pool, token, "Reporting").await,
-        "both connections must transition the match to Reporting");
+    assert!(
+        wait_for_status(&h.pool, token, "Reporting").await,
+        "both connections must transition the match to Reporting"
+    );
 }
 
 #[sqlx::test]
@@ -165,23 +171,28 @@ async fn full_match_lifecycle(pool: sqlx::PgPool) {
 
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
-    p1.submit_report(&token, Some(a1), Some("demo-a")).await.unwrap();
-    p2.submit_report(&token, Some(a1), Some("demo-a")).await.unwrap();
+    p1.submit_report(&token, Some(a1), Some("demo-a"))
+        .await
+        .unwrap();
+    p2.submit_report(&token, Some(a1), Some("demo-a"))
+        .await
+        .unwrap();
 
     // Verify the match resolved AND a match_results row was written.
     // The stored outcome is from player_a's perspective; the queue pairing
     // order is racy, so learn which side p1 (100) landed on before asserting.
-    let row = wait_for_row(&h.pool, &token,
-        "SELECT outcome, mu_change_a FROM match_results WHERE match_token = $1")
-        .await
-        .expect("match_results row exists");
-    let player_a: i64 = sqlx::query_scalar(
-        "SELECT player_a FROM matches WHERE match_token = $1",
+    let row = wait_for_row(
+        &h.pool,
+        &token,
+        "SELECT outcome, mu_change_a FROM match_results WHERE match_token = $1",
     )
-    .bind(&token)
-    .fetch_one(&h.pool)
     .await
-    .unwrap();
+    .expect("match_results row exists");
+    let player_a: i64 = sqlx::query_scalar("SELECT player_a FROM matches WHERE match_token = $1")
+        .bind(&token)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
     let expected = if player_a as u64 == a1 { "Win" } else { "Loss" };
     assert_eq!(row.0, expected, "outcome must match player_a's perspective");
     // The winner's mu increases regardless of which side they landed on.
@@ -192,7 +203,10 @@ async fn full_match_lifecycle(pool: sqlx::PgPool) {
     .fetch_one(&h.pool)
     .await
     .unwrap();
-    assert!(winner_mu > 25.0, "winner's mu should increase, got {winner_mu}");
+    assert!(
+        winner_mu > 25.0,
+        "winner's mu should increase, got {winner_mu}"
+    );
 
     drop(p1);
     drop(p2);
@@ -207,19 +221,25 @@ async fn dispute_on_winner_mismatch(pool: sqlx::PgPool) {
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
     // p1 claims p1 won; p2 claims p2 won — a dispute.
-    p1.submit_report(&token, Some(100), Some("demo-a")).await.unwrap();
-    p2.submit_report(&token, Some(200), Some("demo-b")).await.unwrap();
+    p1.submit_report(&token, Some(100), Some("demo-a"))
+        .await
+        .unwrap();
+    p2.submit_report(&token, Some(200), Some("demo-b"))
+        .await
+        .unwrap();
 
     // After both reports are in, the !agree branch sets status=Disputed.
-    assert!(wait_for_status(&h.pool, &token, "Disputed").await, "match must be Disputed");
+    assert!(
+        wait_for_status(&h.pool, &token, "Disputed").await,
+        "match must be Disputed"
+    );
 
-    let result_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM match_results WHERE match_token = $1",
-    )
-    .bind(&token)
-    .fetch_one(&h.pool)
-    .await
-    .unwrap();
+    let result_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM match_results WHERE match_token = $1")
+            .bind(&token)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
     assert_eq!(result_count, 0, "no outcome recorded for a disputed match");
 
     drop(p1);
@@ -322,23 +342,31 @@ async fn p2p_and_report_visibility(pool: sqlx::PgPool) {
             Ok(None) => break,
         }
     }
-    assert!(saw_opponent, "p1 must learn that the opponent P2P-connected");
+    assert!(
+        saw_opponent,
+        "p1 must learn that the opponent P2P-connected"
+    );
 
     // p1 reports first. The workflow resolves only when BOTH who_won signals
     // are in, so the match must NOT resolve yet (no premature match_result).
-    p1.submit_report(&token, Some(100), Some("demo-a")).await.unwrap();
+    p1.submit_report(&token, Some(100), Some("demo-a"))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(800)).await;
-    let status: String = sqlx::query_scalar(
-        "SELECT status FROM matches WHERE match_token = $1",
-    )
-    .bind(&token)
-    .fetch_one(&h.pool)
-    .await
-    .unwrap();
-    assert_eq!(status, "Reporting", "one report alone must not resolve the match");
+    let status: String = sqlx::query_scalar("SELECT status FROM matches WHERE match_token = $1")
+        .bind(&token)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        status, "Reporting",
+        "one report alone must not resolve the match"
+    );
 
     // p2 agrees; the match resolves and BOTH players receive match_result.
-    p2.submit_report(&token, Some(100), Some("demo-a")).await.unwrap();
+    p2.submit_report(&token, Some(100), Some("demo-a"))
+        .await
+        .unwrap();
 
     for (name, client) in [("p1", &mut p1), ("p2", &mut p2)] {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -354,7 +382,10 @@ async fn p2p_and_report_visibility(pool: sqlx::PgPool) {
                 Ok(None) => break,
             }
         }
-        assert!(saw_result, "{name} must receive match_result after resolution");
+        assert!(
+            saw_result,
+            "{name} must receive match_result after resolution"
+        );
     }
 
     drop(p1);
@@ -374,9 +405,7 @@ async fn decline_notifies_opponent(pool: sqlx::PgPool) {
     let mut p2_told = false;
     while std::time::Instant::now() < deadline {
         match timeout(Duration::from_secs(2), p2.next_event()).await {
-            Ok(Some(Ok(lobby_client::ServerEvent::MatchDeclined {
-                match_token,
-            }))) => {
+            Ok(Some(Ok(lobby_client::ServerEvent::MatchDeclined { match_token }))) => {
                 assert_eq!(match_token, token);
                 p2_told = true;
                 break;
@@ -420,9 +449,7 @@ async fn match_events_logged(pool: sqlx::PgPool) {
         wait_for_status(&h.pool, &token, "InProgress").await,
         "accepts must land"
     );
-    assert!(
-        wait_for_event_counts(&h.pool, &token, &[("paired", 1), ("accepted", 2)]).await,
-    );
+    assert!(wait_for_event_counts(&h.pool, &token, &[("paired", 1), ("accepted", 2)]).await,);
     drop(p1);
     drop(p2);
 
@@ -456,7 +483,11 @@ async fn auth_ok_reports_state(pool: sqlx::PgPool) {
 
     let mut c1 = LobbyClient::connect(&h.ws_url).await.unwrap();
     let auth = c1.authenticate_test_token(601, &h.base_url).await.unwrap();
-    assert_eq!(auth.state, PlayerState::InMenus, "fresh player starts in menus");
+    assert_eq!(
+        auth.state,
+        PlayerState::InMenus,
+        "fresh player starts in menus"
+    );
 
     c1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
 
@@ -464,12 +495,11 @@ async fn auth_ok_reports_state(pool: sqlx::PgPool) {
     // land before asserting the reconnect view.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let state: Option<String> = sqlx::query_scalar(
-            "SELECT state FROM player_state WHERE steam_id = 601",
-        )
-        .fetch_optional(&h.pool)
-        .await
-        .unwrap();
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = 601")
+                .fetch_optional(&h.pool)
+                .await
+                .unwrap();
         if state.as_deref() == Some("Queueing") {
             break;
         }
@@ -508,12 +538,11 @@ async fn reconnect_reports_queueing(pool: sqlx::PgPool) {
     // dropping the connection, so the drop happens while the player is queued.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let queued: Option<i64> = sqlx::query_scalar(
-            "SELECT steam_id FROM matchmaking_queue WHERE steam_id = 602",
-        )
-        .fetch_optional(&h.pool)
-        .await
-        .unwrap();
+        let queued: Option<i64> =
+            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 602")
+                .fetch_optional(&h.pool)
+                .await
+                .unwrap();
         if queued.is_some() {
             break;
         }
@@ -539,8 +568,6 @@ async fn reconnect_reports_queueing(pool: sqlx::PgPool) {
     drop(c2);
 }
 
-
-
 #[sqlx::test]
 async fn queue_expired_notifies_player(pool: sqlx::PgPool) {
     let h = setup_temporal(pool).await;
@@ -556,12 +583,11 @@ async fn queue_expired_notifies_player(pool: sqlx::PgPool) {
     // enqueue the player before backdating, or the UPDATE races the INSERT.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let queued: Option<i64> = sqlx::query_scalar(
-            "SELECT steam_id FROM matchmaking_queue WHERE steam_id = 701",
-        )
-        .fetch_optional(&h.pool)
-        .await
-        .unwrap();
+        let queued: Option<i64> =
+            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 701")
+                .fetch_optional(&h.pool)
+                .await
+                .unwrap();
         if queued.is_some() {
             break;
         }
@@ -607,12 +633,11 @@ async fn stale_entry_resets_player_state(pool: sqlx::PgPool) {
     // menus so a reconnect reports "in_menus", not a stale "queueing".
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let queued: Option<i64> = sqlx::query_scalar(
-            "SELECT steam_id FROM matchmaking_queue WHERE steam_id = 703",
-        )
-        .fetch_optional(&h.pool)
-        .await
-        .unwrap();
+        let queued: Option<i64> =
+            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 703")
+                .fetch_optional(&h.pool)
+                .await
+                .unwrap();
         if queued.is_some() {
             break;
         }
@@ -629,12 +654,11 @@ async fn stale_entry_resets_player_state(pool: sqlx::PgPool) {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(6);
     loop {
-        let state: Option<String> = sqlx::query_scalar(
-            "SELECT state FROM player_state WHERE steam_id = 703",
-        )
-        .fetch_optional(&h.pool)
-        .await
-        .unwrap();
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = 703")
+                .fetch_optional(&h.pool)
+                .await
+                .unwrap();
         if state.as_deref() == Some("InMenus") {
             break;
         }
@@ -660,12 +684,11 @@ async fn heartbeat_keeps_queued_alive(pool: sqlx::PgPool) {
     // Wait for the server to enqueue the player (fire-and-forget message).
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let queued: Option<i64> = sqlx::query_scalar(
-            "SELECT steam_id FROM matchmaking_queue WHERE steam_id = 702",
-        )
-        .fetch_optional(&h.pool)
-        .await
-        .unwrap();
+        let queued: Option<i64> =
+            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 702")
+                .fetch_optional(&h.pool)
+                .await
+                .unwrap();
         if queued.is_some() {
             break;
         }
@@ -692,12 +715,11 @@ async fn heartbeat_keeps_queued_alive(pool: sqlx::PgPool) {
     // One more full tick without a heartbeat (it ages to ~4s) — still well
     // inside the 30s window, so the entry must have survived cleanup.
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let still: Option<i64> = sqlx::query_scalar(
-        "SELECT steam_id FROM matchmaking_queue WHERE steam_id = 702",
-    )
-    .fetch_optional(&h.pool)
-    .await
-    .unwrap();
+    let still: Option<i64> =
+        sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 702")
+            .fetch_optional(&h.pool)
+            .await
+            .unwrap();
     assert!(still.is_some(), "heartbeating player must stay queued");
 
     // And the client must never have been told its entry expired.
@@ -714,7 +736,10 @@ async fn heartbeat_keeps_queued_alive(pool: sqlx::PgPool) {
             Ok(None) => break,
         }
     }
-    assert!(!expired, "heartbeating player must not be told queue_expired");
+    assert!(
+        !expired,
+        "heartbeating player must not be told queue_expired"
+    );
 
     drop(p1);
 }
@@ -831,7 +856,10 @@ async fn ws_frame_size_limit(pool: sqlx::PgPool) {
     loop {
         match timeout(Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(frame)))) => {
-                outcome = Some(format!("close:{}", frame.map(|f| u16::from(f.code)).unwrap_or(0)));
+                outcome = Some(format!(
+                    "close:{}",
+                    frame.map(|f| u16::from(f.code)).unwrap_or(0)
+                ));
                 break;
             }
             Ok(Some(Ok(_))) => continue,
@@ -860,11 +888,17 @@ async fn replaced_connection_keeps_new(pool: sqlx::PgPool) {
     let h = setup(pool).await;
 
     let mut first = LobbyClient::connect(&h.ws_url).await.unwrap();
-    first.authenticate_test_token(500, &h.base_url).await.unwrap();
+    first
+        .authenticate_test_token(500, &h.base_url)
+        .await
+        .unwrap();
 
     // Second connection for the same steam_id replaces the first.
     let mut second = LobbyClient::connect(&h.ws_url).await.unwrap();
-    second.authenticate_test_token(500, &h.base_url).await.unwrap();
+    second
+        .authenticate_test_token(500, &h.base_url)
+        .await
+        .unwrap();
 
     // The first connection must be closed (possibly after a "replaced" notice).
     let mut closed = false;
@@ -958,7 +992,11 @@ async fn ws_origin_restriction(pool: sqlx::PgPool) {
 /// the harness's real `base_url` and the mock re-targets the callback there.
 async fn spawn_mock_creator(
     report: bool,
-) -> (String, Arc<Mutex<Vec<serde_json::Value>>>, Arc<Mutex<Option<String>>>) {
+) -> (
+    String,
+    Arc<Mutex<Vec<serde_json::Value>>>,
+    Arc<Mutex<Option<String>>>,
+) {
     let recorded: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let callback_base: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let recorded_route = recorded.clone();
@@ -981,16 +1019,16 @@ async fn spawn_mock_creator(
                         .unwrap_or_default();
                     tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                        if let Some(b) = base.lock().await.clone() {
-                            if let Ok(u) = url::Url::parse(&cb) {
-                                let target = format!("{}{}", b.trim_end_matches('/'), u.path());
-                                let client = reqwest::Client::new();
-                                let _ = client
-                                    .post(&target)
-                                    .json(&serde_json::json!({ "winner": winner }))
-                                    .send()
-                                    .await;
-                            }
+                        if let Some(b) = base.lock().await.clone()
+                            && let Ok(u) = url::Url::parse(&cb)
+                        {
+                            let target = format!("{}{}", b.trim_end_matches('/'), u.path());
+                            let client = reqwest::Client::new();
+                            let _ = client
+                                .post(&target)
+                                .json(&serde_json::json!({ "winner": winner }))
+                                .send()
+                                .await;
                         }
                     });
                 }
@@ -1066,18 +1104,32 @@ async fn server_game_full_lifecycle(pool: sqlx::PgPool) {
     // Accept only — server matches reject start_match (mark_connected guard).
     p1.accept_match(&token).await.unwrap();
     p2.accept_match(&token).await.unwrap();
-    assert!(wait_for_status(&h.pool, &token, "InProgress").await,
-        "both accepts must transition the match to InProgress");
+    assert!(
+        wait_for_status(&h.pool, &token, "InProgress").await,
+        "both accepts must transition the match to InProgress"
+    );
 
     // The ticker allocates ~2s after the match is InProgress.
-    let _ = wait_for_event("gs-ready p1", &mut p1, std::time::Instant::now() + Duration::from_secs(15), |ev| match ev {
-        ServerEvent::GameServerReady { address, .. } if address == "mock-gs:27015" => Some(()),
-        _ => None,
-    }).await;
-    let _ = wait_for_event("gs-ready p2", &mut p2, std::time::Instant::now() + Duration::from_secs(15), |ev| match ev {
-        ServerEvent::GameServerReady { address, .. } if address == "mock-gs:27015" => Some(()),
-        _ => None,
-    }).await;
+    let _ = wait_for_event(
+        "gs-ready p1",
+        &mut p1,
+        std::time::Instant::now() + Duration::from_secs(15),
+        |ev| match ev {
+            ServerEvent::GameServerReady { address, .. } if address == "mock-gs:27015" => Some(()),
+            _ => None,
+        },
+    )
+    .await;
+    let _ = wait_for_event(
+        "gs-ready p2",
+        &mut p2,
+        std::time::Instant::now() + Duration::from_secs(15),
+        |ev| match ev {
+            ServerEvent::GameServerReady { address, .. } if address == "mock-gs:27015" => Some(()),
+            _ => None,
+        },
+    )
+    .await;
 
     // The creator received the match and a callback URL carrying token + secret.
     let alloc_body = recorded
@@ -1088,41 +1140,67 @@ async fn server_game_full_lifecycle(pool: sqlx::PgPool) {
         .expect("allocate request recorded for the match")
         .clone();
     assert_eq!(alloc_body["game_mode"].as_str(), Some("server_arena"));
-    let cb = alloc_body["result_callback_url"].as_str().unwrap_or_default();
+    let cb = alloc_body["result_callback_url"]
+        .as_str()
+        .unwrap_or_default();
     assert!(
         cb.contains(&format!("/internal/game-result/{token}/")),
         "callback URL must carry token + secret, got {cb}"
     );
-    assert!(!cb.ends_with('/'), "callback URL must have a non-empty secret, got {cb}");
+    assert!(
+        !cb.ends_with('/'),
+        "callback URL must have a non-empty secret, got {cb}"
+    );
 
     // The mock auto-reports player_a's win; both players get the same outcome.
-    let outcome1 = wait_for_event("match-result p1", &mut p1, std::time::Instant::now() + Duration::from_secs(15), |ev| match ev {
-        ServerEvent::MatchResult { outcome, .. } => Some(outcome),
-        _ => None,
-    }).await;
-    let outcome2 = wait_for_event("match-result p2", &mut p2, std::time::Instant::now() + Duration::from_secs(15), |ev| match ev {
-        ServerEvent::MatchResult { outcome, .. } => Some(outcome),
-        _ => None,
-    }).await;
+    let outcome1 = wait_for_event(
+        "match-result p1",
+        &mut p1,
+        std::time::Instant::now() + Duration::from_secs(15),
+        |ev| match ev {
+            ServerEvent::MatchResult { outcome, .. } => Some(outcome),
+            _ => None,
+        },
+    )
+    .await;
+    let outcome2 = wait_for_event(
+        "match-result p2",
+        &mut p2,
+        std::time::Instant::now() + Duration::from_secs(15),
+        |ev| match ev {
+            ServerEvent::MatchResult { outcome, .. } => Some(outcome),
+            _ => None,
+        },
+    )
+    .await;
     assert!(
         outcome1.get("Win").is_some() && outcome2.get("Win").is_some(),
         "both players must receive Win (player_a's perspective), got {outcome1} / {outcome2}"
     );
 
-    assert!(wait_for_status(&h.pool, &token, "Resolved").await, "match must end Resolved");
-    let row = wait_for_row(&h.pool, &token,
-        "SELECT outcome, mu_change_a FROM match_results WHERE match_token = $1")
-        .await
-        .expect("match_results row exists");
-    assert_eq!(row.0, "Win", "stored outcome must be Win");
-    assert!(row.1 > 0.0, "winner's mu change must be positive, got {}", row.1);
-    let server_address: Option<String> = sqlx::query_scalar(
-        "SELECT server_address FROM matches WHERE match_token = $1",
+    assert!(
+        wait_for_status(&h.pool, &token, "Resolved").await,
+        "match must end Resolved"
+    );
+    let row = wait_for_row(
+        &h.pool,
+        &token,
+        "SELECT outcome, mu_change_a FROM match_results WHERE match_token = $1",
     )
-    .bind(&token)
-    .fetch_one(&h.pool)
     .await
-    .unwrap();
+    .expect("match_results row exists");
+    assert_eq!(row.0, "Win", "stored outcome must be Win");
+    assert!(
+        row.1 > 0.0,
+        "winner's mu change must be positive, got {}",
+        row.1
+    );
+    let server_address: Option<String> =
+        sqlx::query_scalar("SELECT server_address FROM matches WHERE match_token = $1")
+            .bind(&token)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
     assert_eq!(server_address.as_deref(), Some("mock-gs:27015"));
 
     drop(p1);
@@ -1137,7 +1215,10 @@ async fn server_game_alloc_timeout(pool: sqlx::PgPool) {
 
     p1.accept_match(&token).await.unwrap();
     p2.accept_match(&token).await.unwrap();
-    assert!(wait_for_status(&h.pool, &token, "InProgress").await, "accepts must land");
+    assert!(
+        wait_for_status(&h.pool, &token, "InProgress").await,
+        "accepts must land"
+    );
 
     // Backdate past the 60s allocation timeout; the next tick disputes it.
     sqlx::query(
@@ -1152,21 +1233,35 @@ async fn server_game_alloc_timeout(pool: sqlx::PgPool) {
     let err1 = wait_for_event("gs-error p1", &mut p1, deadline, |ev| match ev {
         ServerEvent::GameServerError { message, .. } => Some(message),
         _ => None,
-    }).await;
-    assert!(err1.contains("timed out"), "unexpected error message: {err1}");
+    })
+    .await;
+    assert!(
+        err1.contains("timed out"),
+        "unexpected error message: {err1}"
+    );
     let _ = wait_for_event("gs-error p2", &mut p2, deadline, |ev| match ev {
         ServerEvent::GameServerError { .. } => Some(()),
         _ => None,
-    }).await;
+    })
+    .await;
     let _ = wait_for_event("disputed-result p1", &mut p1, deadline, |ev| match ev {
-        ServerEvent::MatchResult { outcome, .. } if outcome.as_str() == Some("Disputed") => Some(()),
+        ServerEvent::MatchResult { outcome, .. } if outcome.as_str() == Some("Disputed") => {
+            Some(())
+        }
         _ => None,
-    }).await;
+    })
+    .await;
     let _ = wait_for_event("disputed-result p2", &mut p2, deadline, |ev| match ev {
-        ServerEvent::MatchResult { outcome, .. } if outcome.as_str() == Some("Disputed") => Some(()),
+        ServerEvent::MatchResult { outcome, .. } if outcome.as_str() == Some("Disputed") => {
+            Some(())
+        }
         _ => None,
-    }).await;
-    assert!(wait_for_status(&h.pool, &token, "Disputed").await, "match must be Disputed");
+    })
+    .await;
+    assert!(
+        wait_for_status(&h.pool, &token, "Disputed").await,
+        "match must be Disputed"
+    );
 
     drop(p1);
     drop(p2);
@@ -1180,17 +1275,32 @@ async fn server_game_result_timeout(pool: sqlx::PgPool) {
 
     p1.accept_match(&token).await.unwrap();
     p2.accept_match(&token).await.unwrap();
-    assert!(wait_for_status(&h.pool, &token, "InProgress").await, "accepts must land");
+    assert!(
+        wait_for_status(&h.pool, &token, "InProgress").await,
+        "accepts must land"
+    );
 
     // Allocation succeeds; wait for server-ready so started_at is set.
-    let _ = wait_for_event("gs-ready p1", &mut p1, std::time::Instant::now() + Duration::from_secs(15), |ev| match ev {
-        ServerEvent::GameServerReady { .. } => Some(()),
-        _ => None,
-    }).await;
-    let _ = wait_for_event("gs-ready p2", &mut p2, std::time::Instant::now() + Duration::from_secs(15), |ev| match ev {
-        ServerEvent::GameServerReady { .. } => Some(()),
-        _ => None,
-    }).await;
+    let _ = wait_for_event(
+        "gs-ready p1",
+        &mut p1,
+        std::time::Instant::now() + Duration::from_secs(15),
+        |ev| match ev {
+            ServerEvent::GameServerReady { .. } => Some(()),
+            _ => None,
+        },
+    )
+    .await;
+    let _ = wait_for_event(
+        "gs-ready p2",
+        &mut p2,
+        std::time::Instant::now() + Duration::from_secs(15),
+        |ev| match ev {
+            ServerEvent::GameServerReady { .. } => Some(()),
+            _ => None,
+        },
+    )
+    .await;
 
     // Backdate past the 300s result timeout; the next tick disputes it.
     sqlx::query(
@@ -1203,14 +1313,23 @@ async fn server_game_result_timeout(pool: sqlx::PgPool) {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let _ = wait_for_event("disputed-result p1", &mut p1, deadline, |ev| match ev {
-        ServerEvent::MatchResult { outcome, .. } if outcome.as_str() == Some("Disputed") => Some(()),
+        ServerEvent::MatchResult { outcome, .. } if outcome.as_str() == Some("Disputed") => {
+            Some(())
+        }
         _ => None,
-    }).await;
+    })
+    .await;
     let _ = wait_for_event("disputed-result p2", &mut p2, deadline, |ev| match ev {
-        ServerEvent::MatchResult { outcome, .. } if outcome.as_str() == Some("Disputed") => Some(()),
+        ServerEvent::MatchResult { outcome, .. } if outcome.as_str() == Some("Disputed") => {
+            Some(())
+        }
         _ => None,
-    }).await;
-    assert!(wait_for_status(&h.pool, &token, "Disputed").await, "match must be Disputed");
+    })
+    .await;
+    assert!(
+        wait_for_status(&h.pool, &token, "Disputed").await,
+        "match must be Disputed"
+    );
 
     drop(p1);
     drop(p2);
@@ -1225,18 +1344,33 @@ async fn game_result_callback_security(pool: sqlx::PgPool) {
 
     p1.accept_match(&token).await.unwrap();
     p2.accept_match(&token).await.unwrap();
-    assert!(wait_for_status(&h.pool, &token, "InProgress").await, "accepts must land");
-    let _ = wait_for_event("match-result p1", &mut p1, std::time::Instant::now() + Duration::from_secs(15), |ev| match ev {
-        ServerEvent::MatchResult { .. } => Some(()),
-        _ => None,
-    }).await;
-    assert!(wait_for_status(&h.pool, &token, "Resolved").await, "happy path must resolve");
+    assert!(
+        wait_for_status(&h.pool, &token, "InProgress").await,
+        "accepts must land"
+    );
+    let _ = wait_for_event(
+        "match-result p1",
+        &mut p1,
+        std::time::Instant::now() + Duration::from_secs(15),
+        |ev| match ev {
+            ServerEvent::MatchResult { .. } => Some(()),
+            _ => None,
+        },
+    )
+    .await;
+    assert!(
+        wait_for_status(&h.pool, &token, "Resolved").await,
+        "happy path must resolve"
+    );
 
     let client = reqwest::Client::new();
 
     // Wrong secret -> 401.
     let resp = client
-        .post(format!("{}/internal/game-result/{token}/wrong-secret", h.base_url))
+        .post(format!(
+            "{}/internal/game-result/{token}/wrong-secret",
+            h.base_url
+        ))
         .json(&serde_json::json!({ "winner": "300" }))
         .send()
         .await
@@ -1244,15 +1378,17 @@ async fn game_result_callback_security(pool: sqlx::PgPool) {
     assert_eq!(resp.status(), 401);
 
     // Correct secret but already resolved -> 409.
-    let secret: String = sqlx::query_scalar(
-        "SELECT result_secret FROM matches WHERE match_token = $1",
-    )
-    .bind(&token)
-    .fetch_one(&h.pool)
-    .await
-    .unwrap();
+    let secret: String =
+        sqlx::query_scalar("SELECT result_secret FROM matches WHERE match_token = $1")
+            .bind(&token)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
     let resp = client
-        .post(format!("{}/internal/game-result/{token}/{secret}", h.base_url))
+        .post(format!(
+            "{}/internal/game-result/{token}/{secret}",
+            h.base_url
+        ))
         .json(&serde_json::json!({ "winner": "300" }))
         .send()
         .await
@@ -1261,7 +1397,10 @@ async fn game_result_callback_security(pool: sqlx::PgPool) {
 
     // Unknown token -> 404.
     let resp = client
-        .post(format!("{}/internal/game-result/nonexistent-token/some-secret", h.base_url))
+        .post(format!(
+            "{}/internal/game-result/nonexistent-token/some-secret",
+            h.base_url
+        ))
         .json(&serde_json::json!({ "winner": "300" }))
         .send()
         .await
@@ -1271,7 +1410,6 @@ async fn game_result_callback_security(pool: sqlx::PgPool) {
     drop(p1);
     drop(p2);
 }
-
 
 #[sqlx::test]
 async fn pong_auto_resolves_on_three_points(pool: sqlx::PgPool) {
@@ -1298,8 +1436,12 @@ async fn pong_auto_resolves_on_three_points(pool: sqlx::PgPool) {
     // Step 11: the referee is playback-only — it exits at 3 points WITHOUT
     // resolving. The workflow resolves on the clients' who_won reports: 110
     // (serve line, scores every rally) claims the win and both report it.
-    p1.submit_report(&token, Some(110), Some("demo-a")).await.unwrap();
-    p2.submit_report(&token, Some(110), Some("demo-b")).await.unwrap();
+    p1.submit_report(&token, Some(110), Some("demo-a"))
+        .await
+        .unwrap();
+    p2.submit_report(&token, Some(110), Some("demo-b"))
+        .await
+        .unwrap();
 
     // The workflow's finish_match resolves after both reports (~5s of rally
     // plus the report round-trip); poll the terminal DB state for 30s.
@@ -1313,13 +1455,21 @@ async fn pong_auto_resolves_on_three_points(pool: sqlx::PgPool) {
         .fetch_one(&h.pool)
         .await
         .unwrap();
-    let expected = if player_a as u64 == 110 { "Win" } else { "Loss" };
-    let outcome: String = sqlx::query_scalar("SELECT outcome FROM match_results WHERE match_token = $1")
-        .bind(&token)
-        .fetch_one(&h.pool)
-        .await
-        .unwrap();
-    assert_eq!(outcome, expected, "outcome must match player_a's perspective");
+    let expected = if player_a as u64 == 110 {
+        "Win"
+    } else {
+        "Loss"
+    };
+    let outcome: String =
+        sqlx::query_scalar("SELECT outcome FROM match_results WHERE match_token = $1")
+            .bind(&token)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        outcome, expected,
+        "outcome must match player_a's perspective"
+    );
 
     // Both players reset to the menus (resolve_agreed terminal reset).
     let s110: String = sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = $1")
@@ -1353,7 +1503,6 @@ async fn pong_auto_resolves_on_three_points(pool: sqlx::PgPool) {
     drop(p2);
 }
 
-
 #[sqlx::test]
 async fn queueing_survives_stale_sweep_after_reconnect(pool: sqlx::PgPool) {
     // A reconnect whose last heartbeat predates the 30s stale window must not
@@ -1380,22 +1529,19 @@ async fn queueing_survives_stale_sweep_after_reconnect(pool: sqlx::PgPool) {
     // entry on the first tick after queueing.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    let queued: Option<i64> = sqlx::query_scalar(
-        "SELECT steam_id FROM matchmaking_queue WHERE steam_id = 702",
-    )
-    .fetch_optional(&h.pool)
-    .await
-    .unwrap();
+    let queued: Option<i64> =
+        sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 702")
+            .fetch_optional(&h.pool)
+            .await
+            .unwrap();
     assert!(
         queued.is_some(),
         "a just-queued player must survive the stale sweep"
     );
-    let state: String = sqlx::query_scalar(
-        "SELECT state FROM player_state WHERE steam_id = 702",
-    )
-    .fetch_one(&h.pool)
-    .await
-    .unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = 702")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
     assert_eq!(state, "Queueing", "queue state must be intact");
 
     drop(c1);
@@ -1429,13 +1575,21 @@ async fn start_timeout_forfeits_non_starter(pool: sqlx::PgPool) {
         .fetch_one(&h.pool)
         .await
         .unwrap();
-    let expected = if player_a as u64 == 110 { "Win" } else { "Loss" };
-    let outcome: String = sqlx::query_scalar("SELECT outcome FROM match_results WHERE match_token = $1")
-        .bind(&token)
-        .fetch_one(&h.pool)
-        .await
-        .unwrap();
-    assert_eq!(outcome, expected, "the starter must be recorded as the winner");
+    let expected = if player_a as u64 == 110 {
+        "Win"
+    } else {
+        "Loss"
+    };
+    let outcome: String =
+        sqlx::query_scalar("SELECT outcome FROM match_results WHERE match_token = $1")
+            .bind(&token)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        outcome, expected,
+        "the starter must be recorded as the winner"
+    );
 
     // The starter's rating rises; the non-starter's falls.
     let mu110: f64 = sqlx::query_scalar(
@@ -1453,7 +1607,10 @@ async fn start_timeout_forfeits_non_starter(pool: sqlx::PgPool) {
     .await
     .unwrap();
     assert!(mu110 > 25.0, "starter's mu should increase, got {mu110}");
-    assert!(mu210 < 25.0, "non-starter's mu should decrease, got {mu210}");
+    assert!(
+        mu210 < 25.0,
+        "non-starter's mu should decrease, got {mu210}"
+    );
 
     drop(p1);
     drop(p2);
@@ -1477,22 +1634,31 @@ async fn start_timeout_forfeits_neither(pool: sqlx::PgPool) {
         wait_for_status_for(&h.pool, &token, "Resolved", 15).await,
         "the 2s START window must resolve the match when nobody starts"
     );
-    let outcome: String = sqlx::query_scalar("SELECT outcome FROM match_results WHERE match_token = $1")
-        .bind(&token)
-        .fetch_one(&h.pool)
-        .await
-        .unwrap();
-    assert_eq!(outcome, "Forfeit", "neither-started must record a double-loss Forfeit");
+    let outcome: String =
+        sqlx::query_scalar("SELECT outcome FROM match_results WHERE match_token = $1")
+            .bind(&token)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        outcome, "Forfeit",
+        "neither-started must record a double-loss Forfeit"
+    );
 
-    let (mu_change_a, mu_change_b): (f64, f64) = sqlx::query_as(
-        "SELECT mu_change_a, mu_change_b FROM match_results WHERE match_token = $1",
-    )
-    .bind(&token)
-    .fetch_one(&h.pool)
-    .await
-    .unwrap();
-    assert!(mu_change_a < 0.0, "player_a must lose rating, got {mu_change_a}");
-    assert!(mu_change_b < 0.0, "player_b must lose rating, got {mu_change_b}");
+    let (mu_change_a, mu_change_b): (f64, f64) =
+        sqlx::query_as("SELECT mu_change_a, mu_change_b FROM match_results WHERE match_token = $1")
+            .bind(&token)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(
+        mu_change_a < 0.0,
+        "player_a must lose rating, got {mu_change_a}"
+    );
+    assert!(
+        mu_change_b < 0.0,
+        "player_b must lose rating, got {mu_change_b}"
+    );
 
     // Terminal: both players return to the menus.
     let s110: String = sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = $1")
@@ -1547,9 +1713,12 @@ async fn pong_broadcasts_round_start_and_holds(pool: sqlx::PgPool) {
     // p1 must receive RoundStart { frame: 0, round: 0, countdown_ticks: 90 }.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let rs = wait_for_event("round_start", &mut p1, deadline, |ev| match ev {
-        ServerEvent::RoundStart { frame, round, countdown_ticks, .. } => {
-            Some((frame, round, countdown_ticks))
-        }
+        ServerEvent::RoundStart {
+            frame,
+            round,
+            countdown_ticks,
+            ..
+        } => Some((frame, round, countdown_ticks)),
         _ => None,
     })
     .await;
@@ -1572,7 +1741,9 @@ async fn pong_broadcasts_round_start_and_holds(pool: sqlx::PgPool) {
     let collect_deadline = std::time::Instant::now() + Duration::from_secs(10);
     while checksums.len() < 120 && std::time::Instant::now() < collect_deadline {
         match timeout(Duration::from_secs(2), p1.next_event()).await {
-            Ok(Some(Ok(ServerEvent::GameState { frame, checksum, .. }))) => {
+            Ok(Some(Ok(ServerEvent::GameState {
+                frame, checksum, ..
+            }))) => {
                 if !checksums.iter().any(|(f, _)| *f == frame) {
                     checksums.push((frame, checksum));
                 }
@@ -1584,7 +1755,11 @@ async fn pong_broadcasts_round_start_and_holds(pool: sqlx::PgPool) {
         }
     }
     checksums.sort_by_key(|(f, _)| *f);
-    assert!(checksums.len() >= 91, "need frames 0..90+, got {}", checksums.len());
+    assert!(
+        checksums.len() >= 91,
+        "need frames 0..90+, got {}",
+        checksums.len()
+    );
     let first = &checksums[0].1;
     for (f, c) in checksums.iter().take(90) {
         assert_eq!(c, first, "frame {f} must be frozen (constant checksum)");

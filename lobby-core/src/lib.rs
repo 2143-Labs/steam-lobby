@@ -9,8 +9,8 @@
 //! - `traits` — the storage/callback traits the core depends on.
 //! - `types` — wire types + Steam-ID serde helpers.
 pub mod error;
-pub mod match_lifecycle;
 mod match_expiry;
+pub mod match_lifecycle;
 pub mod mmr;
 pub mod player;
 pub mod pong;

@@ -28,7 +28,9 @@ async fn enter_menus_is_idempotent_for_existing_players() {
     m.enter_menus(102, &store).await.unwrap();
     // A second login must not clobber state (only first login creates).
     m.enter_menus(102, &store).await.unwrap();
-    m.begin_matchmaking(102, MatchDifficulty::Normal, &store).await.unwrap();
+    m.begin_matchmaking(102, MatchDifficulty::Normal, &store)
+        .await
+        .unwrap();
     m.enter_menus(102, &store).await.unwrap();
     assert_eq!(state(&store, 102).await, PlayerState::Queueing);
 }
@@ -84,7 +86,10 @@ async fn transitions_require_the_expected_prior_state() {
     m.begin_matchmaking(105, MatchDifficulty::Normal, &store)
         .await
         .unwrap();
-    let err = m.begin_matchmaking(105, MatchDifficulty::Normal, &store).await.unwrap_err();
+    let err = m
+        .begin_matchmaking(105, MatchDifficulty::Normal, &store)
+        .await
+        .unwrap_err();
     assert!(matches!(
         err,
         LobbyError::InvalidStateTransition {
@@ -131,10 +136,20 @@ async fn heartbeat_refreshes_liveness() {
     let store = MockStore::new();
     let m = mgr();
     m.enter_menus(107, &store).await.unwrap();
-    let before = store.get_player_state(107).await.unwrap().unwrap().last_heartbeat;
+    let before = store
+        .get_player_state(107)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_heartbeat;
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     m.heartbeat(107, &store).await.unwrap();
-    let after = store.get_player_state(107).await.unwrap().unwrap().last_heartbeat;
+    let after = store
+        .get_player_state(107)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_heartbeat;
     assert!(after > before, "heartbeat must refresh last_heartbeat");
 }
 
@@ -143,11 +158,26 @@ async fn queueing_refreshes_liveness() {
     let store = MockStore::new();
     let m = mgr();
     m.enter_menus(109, &store).await.unwrap();
-    let before = store.get_player_state(109).await.unwrap().unwrap().last_heartbeat;
+    let before = store
+        .get_player_state(109)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_heartbeat;
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    m.begin_matchmaking(109, MatchDifficulty::Normal, &store).await.unwrap();
-    let after = store.get_player_state(109).await.unwrap().unwrap().last_heartbeat;
-    assert!(after > before, "queueing must refresh last_heartbeat so the stale sweep cannot evict a just-queued entry");
+    m.begin_matchmaking(109, MatchDifficulty::Normal, &store)
+        .await
+        .unwrap();
+    let after = store
+        .get_player_state(109)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_heartbeat;
+    assert!(
+        after > before,
+        "queueing must refresh last_heartbeat so the stale sweep cannot evict a just-queued entry"
+    );
 }
 
 #[tokio::test]

@@ -100,7 +100,12 @@ impl PlayerStore for MockStore {
     }
 
     async fn get_token_version(&self, steam_id: SteamId) -> Result<u32> {
-        Ok(self.token_versions.lock().get(&steam_id).copied().unwrap_or(0))
+        Ok(self
+            .token_versions
+            .lock()
+            .get(&steam_id)
+            .copied()
+            .unwrap_or(0))
     }
 
     async fn bump_token_version(&self, steam_id: SteamId) -> Result<()> {
@@ -254,16 +259,11 @@ impl MatchStore for MockStore {
         b: SteamId,
         since: DateTime<Utc>,
     ) -> Result<bool> {
-        Ok(self
-            .matches
-            .lock()
-            .values()
-            .any(|m| {
-                m.status == MatchStatus::Resolved
-                    && ((m.player_a == a && m.player_b == b)
-                        || (m.player_a == b && m.player_b == a))
-                    && m.ended_at.is_some_and(|e| e >= since)
-            }))
+        Ok(self.matches.lock().values().any(|m| {
+            m.status == MatchStatus::Resolved
+                && ((m.player_a == a && m.player_b == b) || (m.player_a == b && m.player_b == a))
+                && m.ended_at.is_some_and(|e| e >= since)
+        }))
     }
 
     async fn resolve_match(
@@ -388,4 +388,3 @@ pub fn queued_player(id: SteamId, _mu: f64) -> PlayerInfo {
         last_heartbeat: Utc::now(),
     }
 }
-

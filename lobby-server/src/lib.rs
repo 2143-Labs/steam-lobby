@@ -221,17 +221,17 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
     // connect failure it logs and exits, leaving state.temporal None. The
     // worker's shutdown handle is stored on AppState so the test harness can
     // stop it at teardown (production never touches it).
-    if !config.temporal_disabled {
-        if let Some(rx) = crate::temporal::start_temporal(state.clone()) {
-            let holder = state.clone();
-            tokio::spawn(async move {
-                if let Ok(handle) = rx.await {
-                    if let Ok(mut g) = holder.temporal_shutdown.write() {
-                        *g = Some(handle);
-                    }
-                }
-            });
-        }
+    if !config.temporal_disabled
+        && let Some(rx) = crate::temporal::start_temporal(state.clone())
+    {
+        let holder = state.clone();
+        tokio::spawn(async move {
+            if let Ok(handle) = rx.await
+                && let Ok(mut g) = holder.temporal_shutdown.write()
+            {
+                *g = Some(handle);
+            }
+        });
     }
 
     let mut router = Router::new()

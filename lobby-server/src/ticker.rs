@@ -37,7 +37,14 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
             }
             match state
                 .matchmaking_queue
-                .tick(mode, *game_type, &state.store, &state.store, &state.store, &state.store)
+                .tick(
+                    mode,
+                    *game_type,
+                    &state.store,
+                    &state.store,
+                    &state.store,
+                    &state.store,
+                )
                 .await
             {
                 Ok(Some(match_info)) => {
@@ -189,7 +196,10 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
             for sid in &removed {
                 // The entry is gone — the owner must be back in the menus so a
                 // later reconnect reports "in_menus", not a stale "queueing".
-                let _ = state.player_manager.handle_disconnect(*sid, &state.store).await;
+                let _ = state
+                    .player_manager
+                    .handle_disconnect(*sid, &state.store)
+                    .await;
             }
             if !removed.is_empty() {
                 let connections = state.connections.lock().await;
@@ -208,7 +218,8 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
             .await;
         if let Ok(matches) = in_progress {
             for m in matches {
-                if m.game_type != lobby_core::types::GameType::Server || m.server_address.is_some() {
+                if m.game_type != lobby_core::types::GameType::Server || m.server_address.is_some()
+                {
                     continue;
                 }
                 let since = m.accepted_at.unwrap_or(m.created_at);
@@ -216,11 +227,15 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                 if age > state.gameserver_alloc_timeout_secs {
                     tracing::info!(
                         "match {} server allocation timed out after {}s -> Disputed",
-                        m.match_token, age
+                        m.match_token,
+                        age
                     );
                     let _ = state
                         .store
-                        .update_match_status(&m.match_token, lobby_core::types::MatchStatus::Disputed)
+                        .update_match_status(
+                            &m.match_token,
+                            lobby_core::types::MatchStatus::Disputed,
+                        )
                         .await;
                     crate::ws::notify_match_players(
                         &state,
@@ -236,8 +251,10 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                         &m.match_token,
                         ServerMessage::MatchResult {
                             match_token: m.match_token.clone(),
-                            outcome: serde_json::to_value(lobby_core::types::MatchOutcome::Disputed)
-                                .unwrap(),
+                            outcome: serde_json::to_value(
+                                lobby_core::types::MatchOutcome::Disputed,
+                            )
+                            .unwrap(),
                         },
                     )
                     .await;
@@ -274,7 +291,10 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                         .await;
                     }
                     Err(e) => {
-                        tracing::warn!("match {} allocation failed (will retry): {e}", m.match_token)
+                        tracing::warn!(
+                            "match {} allocation failed (will retry): {e}",
+                            m.match_token
+                        )
                     }
                 }
             }
@@ -282,7 +302,11 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
         // Gameserver never reported -> Disputed (mirrors the report-timeout path).
         if let Ok(expired) = state
             .match_manager
-            .expire_playing_matches(&state.store, state.gameserver_result_timeout_secs, &state.store)
+            .expire_playing_matches(
+                &state.store,
+                state.gameserver_result_timeout_secs,
+                &state.store,
+            )
             .await
         {
             for token in expired {

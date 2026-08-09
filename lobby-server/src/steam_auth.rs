@@ -3,9 +3,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use jsonwebtoken::{
-    decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
-};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use lobby_core::error::{LobbyError, Result};
 use lobby_core::types::SteamId;
 use reqwest::Client;
@@ -163,10 +161,10 @@ impl SteamAuthService {
     pub async fn get_player_summary(&self, steam_id: SteamId) -> Result<String> {
         {
             let cache = self.display_name_cache.lock().unwrap();
-            if let Some((name, at)) = cache.get(&steam_id) {
-                if at.elapsed() < Duration::from_secs(300) {
-                    return Ok(name.clone());
-                }
+            if let Some((name, at)) = cache.get(&steam_id)
+                && at.elapsed() < Duration::from_secs(300)
+            {
+                return Ok(name.clone());
             }
         }
 
@@ -229,15 +227,12 @@ impl SteamAuthService {
     }
 
     /// Validate a JWT session token; returns (user_id, steam_id, token_version).
-    pub fn validate_session_token(
-        &self,
-        token: &str,
-    ) -> Result<(uuid::Uuid, SteamId, u32)> {
+    pub fn validate_session_token(&self, token: &str) -> Result<(uuid::Uuid, SteamId, u32)> {
         let mut v = Validation::new(Algorithm::HS256);
         v.validate_exp = true;
         v.validate_aud = true;
         v.aud = Some(std::collections::HashSet::from([
-            "steam-lobby-client".to_string(),
+            "steam-lobby-client".to_string()
         ]));
         v.iss = Some(std::collections::HashSet::from(["steam-lobby".to_string()]));
         v.validate_nbf = true;

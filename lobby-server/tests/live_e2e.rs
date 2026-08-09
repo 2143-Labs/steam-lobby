@@ -64,7 +64,7 @@ async fn live_temporal_full_lifecycle() {
     p2.accept_match(&token).await.expect("p2 accept");
 
     // Both players should receive match_started (the workflow's mark_accepts).
-    let started1 = tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match p1.next_event().await {
                 Some(Ok(ServerEvent::MatchStarted { .. })) => break,
@@ -75,7 +75,7 @@ async fn live_temporal_full_lifecycle() {
     })
     .await
     .expect("p1 match_started");
-    let started2 = tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match p2.next_event().await {
                 Some(Ok(ServerEvent::MatchStarted { .. })) => break,
@@ -86,7 +86,7 @@ async fn live_temporal_full_lifecycle() {
     })
     .await
     .expect("p2 match_started");
-    println!("match_started: {started1:?} / {started2:?}");
+    println!("match_started: both players");
 
     p1.start_match(&token).await.expect("p1 start");
     p2.start_match(&token).await.expect("p2 start");
@@ -107,10 +107,10 @@ async fn live_temporal_full_lifecycle() {
     println!("game running, first frame {frame}");
 
     // Both report the same winner (p1 won) → the workflow's finish_match resolves.
-    p1.submit_report(&token, Some(p1_id), Some("demo-a".into()))
+    p1.submit_report(&token, Some(p1_id), Some("demo-a"))
         .await
         .expect("p1 report");
-    p2.submit_report(&token, Some(p1_id), Some("demo-b".into()))
+    p2.submit_report(&token, Some(p1_id), Some("demo-b"))
         .await
         .expect("p2 report");
 

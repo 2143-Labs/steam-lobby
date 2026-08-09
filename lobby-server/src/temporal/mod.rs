@@ -18,7 +18,6 @@ pub mod workflows;
 // runtime keeps the activity pollers from being starved by long workflow
 // replays (the matchmaker's every-2s timer history).
 
-
 use std::sync::Arc;
 
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};

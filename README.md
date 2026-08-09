@@ -26,10 +26,18 @@ cp .env.example .env
 openssl rand -base64 48   # paste the output into JWT_SECRET in .env
 nix-shell shell.nix       # enter dev shell (provides cargo, rustc, just)
 just db-up                # start PostgreSQL in Docker
+just temporal-up          # start the local Temporal stack (podman) on :7233 / UI :8233
 just test                 # run unit tests
-just itest                # run integration tests against Postgres (21 pass)
+just itest                # run integration tests against Postgres (needs db-up + temporal-up)
 just run                  # start server on :8080
 ```
+
+The match lifecycle is orchestrated by Temporal workflows (see "Temporal
+Architecture" below): `just run` starts an in-process worker that connects to
+the local Temporal at `localhost:7233`. Matchmaking requires `just temporal-up`
+to be running — without it the server still boots but queueing does nothing.
+Every lifecycle timer (accept window, START window, report window) is visible
+as a workflow timer in the Temporal UI at `http://localhost:8233`.
 
 To emulate multiple users without Steam, set `AUTH_DEV_MODE=true` in `.env`
 (it must be `false` in production), then open `http://localhost:8080/` in two
@@ -198,6 +206,34 @@ otherwise travel cleartext. The web demo requires `AUTH_DEV_MODE=true` and its
 origin listed in `CORS_ORIGINS`; production deployments must keep
 `AUTH_DEV_MODE=false`.
 
+
+## Temporal Architecture
+
+The p2p match lifecycle is orchestrated by four Temporal workflows running on
+an **in-process Rust worker** inside the lobby-server binary (same Deployment,
+no separate worker pod). The worker connects to the Temporal frontend at
+`TEMPORAL_ADDRESS` (local: `just temporal-up`; cluster:
+`temporal-frontend.default.svc.cluster.local:7233`) in namespace
+`TEMPORAL_NAMESPACE` (default `pvp`), task queue `lobby`.
+
+| Workflow | ID | Job |
+|----------|----|-----|
+| `UserSessionWorkflow` | `user-session-{steam_id}` | Per logged-in player; lives until the disconnect signal. Runs the queue/unqueue/match-found/match-complete state transitions. |
+| `QueueWorkflow` (child) | `queue-{steam_id}-{mode}` | Pure queueing state holder: enters the queue on start, cancelled by unqueue/match-found/disconnect. |
+| `MatchmakerWorkflow` | `matchmaker-{mode}` | One per P2P game mode; every 2s runs the pairing activity (MMR-band match, create match, signal both sessions, start the P2P workflow). |
+| `P2PMatchWorkflow` | `match-{match_token}` | The coordinator: accept window (30s) → START window (15s, forfeit) → report window (300s) — each a workflow timer racing the clients' signals. Sole lifecycle writer. |
+
+The WS handlers only **signal** workflows (`queue`, `unqueue`, `match_choice`,
+`start`, `who_won`, `submit_demo`, `disconnect`); all DB + broadcast work
+happens in activities (`lobby-server/src/temporal/activities.rs`). The
+server-authoritative pong referee stays in-process for **playback only**
+(frames/checksums/round-hold); it no longer resolves matches — the workflow
+resolves on the clients' `who_won` reports, the START-window forfeit, or the
+report-window dispute timer. `server_arena` gameserver matches are out of
+scope for the migration and keep their in-process path.
+
+See `docs/temporal.md` for the full design.
+
 ## How It Works
 
 Players connect over WebSocket and authenticate with a JWT (obtained via Steam OpenID or the dev token endpoint). Once authenticated, a player enters the queue with a difficulty (Easy/Normal/Hard) at their current MMR.
@@ -351,8 +387,9 @@ Client                           Server
   |        (match in progress)    |
   |                                |
   |--- match_report { ... } ----->|
-| `just test` | Run all unit tests (14) + doc test |
-| `just itest` | Run 21 DB-backed integration tests (needs `just db-up`) |
+  |                                |
+  |<--- match_result -------------|
+  |                                |
 
 ### Server-authoritative games
 
@@ -388,15 +425,17 @@ any external service. In production set `GAMESERVER_CREATOR_URL` and `PUBLIC_URL
 | Recipe | What it does |
 |--------|-------------|
 | `just build` | Compile all crates |
-| `just test` | Run all unit tests (10) + doc test |
-| `just itest` | Run 9 DB-backed integration tests (needs `just db-up`) |
+| `just test` | Run all unit tests + doc test |
+| `just itest` | Run the DB-backed integration tests (needs `just db-up` + `just temporal-up`) |
 | `just test-verbose` | Run all tests with `--nocapture` |
 | `just lint` | Clippy with `-D warnings` |
 | `just fmt` | Auto-format with rustfmt |
 | `just fmt-check` | Check formatting without changing files |
-| `just run` | Start the server (needs `.env` + PostgreSQL) |
+| `just run` | Start the server (needs `.env` + PostgreSQL + `just temporal-up`) |
 | `just db-up` | Start PostgreSQL in Docker on port 5432 |
 | `just db-down` | Stop the database container |
+| `just temporal-up` | Start the local Temporal stack (podman): frontend :7233, UI :8233 |
+| `just temporal-down` | Stop the Temporal stack |
 | `just up` | Full Docker stack (lobby + db, builds the image) |
 | `just down` | Stop the full Docker stack |
 | `just clean` | Remove build artifacts (`cargo clean`) |
@@ -406,14 +445,19 @@ any external service. In production set `GAMESERVER_CREATOR_URL` and `PUBLIC_URL
 
 ## Testing
 
-**Unit tests** (no Postgres needed): `just test` — 14 tests covering the match
-lifecycle (accept/connect/report/expiry, winner validation, double-accept
-idempotency, auto-loss on report timeout, gameserver resolution + expiry) and
-the Weng-Lin rating algorithm, using in-memory mock stores.
+**Unit tests** (no Postgres needed): `just test` — the match-lifecycle /
+rating / player-state suites in `lobby-core/tests/` using in-memory mock
+stores.
 
-**Integration tests** (Postgres needed): `just db-up` then `just itest` — 21
+**Integration tests** (Postgres + Temporal needed): `just db-up` and
+`just temporal-up`, then `cargo test -p lobby-server -- --test-threads 4` —
 tests that start the real server in-process (`lobby-server/src/lib.rs`'s
-`build_app`), run it against PostgreSQL, and drive it with `lobby-client`:
+`build_app`), run it against PostgreSQL, and drive it with `lobby-client`.
+The matchmaking/lifecycle tests run through the Temporal workflows (each test
+spins its own worker on a unique task queue); keep `--test-threads 4` — the
+default (all cores) exhausts the local Postgres connection limit.
+`lobby-server/tests/live_e2e.rs` (`#[ignore]`d) drives the same flow against a
+running dev server (`just run`) with Temporal up.
 
 - `full_match_lifecycle` — two players queue, match, accept, connect, report;
   asserts the match resolves, ratings update, and a `match_results` row is written.
@@ -434,10 +478,10 @@ tests that start the real server in-process (`lobby-server/src/lib.rs`'s
 - `game_result_callback_security` — wrong secret → 401, duplicate callback →
   409, unknown token → 404.
 
-The tests use a shared `lobby_test` database (auto-created on first run,
-truncated before each test). It is intentionally never dropped — the next run
-just truncates again. `just db-up` must be running or the tests fail fast with a
-connection error.
+The DB-backed tests use `#[sqlx::test]`: each test gets a fresh, migrated,
+per-test database (created and dropped automatically), so tests run in
+parallel against Postgres without interfering. `just db-up` must be running or
+the tests fail fast with a connection error.
 
 ## Web Demo
 

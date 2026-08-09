@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use lobby_client::{LobbyClient, ServerEvent};
-use lobby_core::pong::{PongGame, PongSide, DT_SECS};
+use lobby_core::pong::{DT_SECS, PongGame, PongSide};
 use tokio::time::timeout;
 
 mod common; // lobby-server/tests/common.rs — TestHarness + setup_pong()
@@ -147,15 +147,26 @@ async fn drive_client(
 
     while Instant::now() < deadline {
         match timeout(Duration::from_secs(5), p.next_event()).await {
-            Ok(Some(Ok(ServerEvent::GameState { frame, player_a, checksum, .. }))) => {
+            Ok(Some(Ok(ServerEvent::GameState {
+                frame,
+                player_a,
+                checksum,
+                ..
+            }))) => {
                 if driver.is_none() {
-                    let side = if my_id == player_a { PongSide::Left } else { PongSide::Right };
+                    let side = if my_id == player_a {
+                        PongSide::Left
+                    } else {
+                        PongSide::Right
+                    };
                     driver = Some(ReplicaDriver::new(side, diverge_at));
                     // Blast all schedule inputs up front; the referee consumes
                     // them at 33ms/frame and gates on both sides.
                     let my_side = side;
                     for f in 0..600 {
-                        p.send_game_input(token, f, schedule(f, my_side)).await.unwrap();
+                        p.send_game_input(token, f, schedule(f, my_side))
+                            .await
+                            .unwrap();
                     }
                 }
                 if let Some(prev) = last_state_frame {
@@ -179,12 +190,14 @@ async fn drive_client(
                         if d.diverged {
                             assert_ne!(
                                 local, srv,
-                                "diverged replica must NOT match the referee at frame {frame}"
+                                "diverged replica must NOT match the referee at frame {frame} (id {my_id}, side {:?})",
+                                d.side
                             );
                         } else {
                             assert_eq!(
                                 local, srv,
-                                "replica diverged from the referee at frame {frame}"
+                                "replica diverged from the referee at frame {frame} (id {my_id}, side {:?})",
+                                d.side
                             );
                         }
                     }
@@ -246,10 +259,10 @@ async fn pong_three_replicas_converge(pool: sqlx::PgPool) {
     assert_ne!(side1, side2, "the two clients must be on opposite sides");
 
     let left_player = if side1 == PongSide::Left { 915 } else { 916 };
-    p1.submit_report(&token, Some(left_player), Some("demo-a".into()))
+    p1.submit_report(&token, Some(left_player), Some("demo-a"))
         .await
         .unwrap();
-    p2.submit_report(&token, Some(left_player), Some("demo-b".into()))
+    p2.submit_report(&token, Some(left_player), Some("demo-b"))
         .await
         .unwrap();
 
@@ -257,7 +270,10 @@ async fn pong_three_replicas_converge(pool: sqlx::PgPool) {
     let w1 = wait_game_over(&mut p1, deadline).await;
     let w2 = wait_game_over(&mut p2, deadline).await;
     assert_eq!(w1, w2, "both clients must agree on the winner");
-    assert_eq!(w1, left_player, "the Left player must win (schedule outcome)");
+    assert_eq!(
+        w1, left_player,
+        "the Left player must win (schedule outcome)"
+    );
 
     drop(p1);
     drop(p2);
@@ -279,12 +295,15 @@ async fn pong_divergence_detected_and_resynced(pool: sqlx::PgPool) {
     );
     assert_ne!(side1, side2, "the two clients must be on opposite sides");
 
-    assert!(resynced, "the referee must detect p1's divergence and resync it");
+    assert!(
+        resynced,
+        "the referee must detect p1's divergence and resync it"
+    );
     let left_player = if side1 == PongSide::Left { 913 } else { 914 };
-    p1.submit_report(&token, Some(left_player), Some("demo-a".into()))
+    p1.submit_report(&token, Some(left_player), Some("demo-a"))
         .await
         .unwrap();
-    p2.submit_report(&token, Some(left_player), Some("demo-b".into()))
+    p2.submit_report(&token, Some(left_player), Some("demo-b"))
         .await
         .unwrap();
 
@@ -292,22 +311,33 @@ async fn pong_divergence_detected_and_resynced(pool: sqlx::PgPool) {
     let w1 = wait_game_over(&mut p1, deadline).await;
     let w2 = wait_game_over(&mut p2, deadline).await;
     assert_eq!(w1, w2, "both clients must agree on the winner");
-    assert_eq!(w1, left_player, "the divergence must not change the outcome");
+    assert_eq!(
+        w1, left_player,
+        "the divergence must not change the outcome"
+    );
 
     drop(p1);
     drop(p2);
 }
 
-
 // ── helpers copied from integration.rs (the itest crate has no shared lib) ──
 
 use sqlx::PgPool;
 
-async fn pair_up(h: &common::TestHarness, p1_id: u64, p2_id: u64, mode: &str) -> (LobbyClient, LobbyClient, String) {
+async fn pair_up(
+    h: &common::TestHarness,
+    p1_id: u64,
+    p2_id: u64,
+    mode: &str,
+) -> (LobbyClient, LobbyClient, String) {
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
     let mut p2 = LobbyClient::connect(&h.ws_url).await.unwrap();
-    p1.authenticate_test_token(p1_id, &h.base_url).await.unwrap();
-    p2.authenticate_test_token(p2_id, &h.base_url).await.unwrap();
+    p1.authenticate_test_token(p1_id, &h.base_url)
+        .await
+        .unwrap();
+    p2.authenticate_test_token(p2_id, &h.base_url)
+        .await
+        .unwrap();
 
     p1.begin_matchmaking(mode, "normal").await.unwrap();
     p2.begin_matchmaking(mode, "normal").await.unwrap();
@@ -323,7 +353,10 @@ async fn pair_up(h: &common::TestHarness, p1_id: u64, p2_id: u64, mode: &str) ->
         .expect("p2 match within 15s")
         .unwrap()
         .unwrap();
-    assert_eq!(m1.match_token, m2.match_token, "both players must get the same match");
+    assert_eq!(
+        m1.match_token, m2.match_token,
+        "both players must get the same match"
+    );
     (p1, p2, m1.match_token)
 }
 
@@ -351,13 +384,12 @@ async fn accept_and_connect(
 async fn wait_for_status(pool: &PgPool, token: &str, expected: &str) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let status: Option<String> = sqlx::query_scalar(
-            "SELECT status FROM matches WHERE match_token = $1",
-        )
-        .bind(token)
-        .fetch_optional(pool)
-        .await
-        .expect("query matches");
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM matches WHERE match_token = $1")
+                .bind(token)
+                .fetch_optional(pool)
+                .await
+                .expect("query matches");
         if status.as_deref() == Some(expected) {
             return true;
         }

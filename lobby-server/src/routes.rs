@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::Json;
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::state::{AppState, OpenIdState};
@@ -65,7 +65,9 @@ fn validate_return_to(return_to: &str, public_url: Option<&str>) -> bool {
         return !return_to.contains('?') && !return_to.contains('#');
     }
     // Absolute: must match the configured public origin exactly.
-    let Some(pub_url) = public_url else { return false };
+    let Some(pub_url) = public_url else {
+        return false;
+    };
     if return_to.contains('#') {
         return false;
     }
@@ -193,7 +195,11 @@ pub async fn steam_callback(
 
     // Find or create the account; the Steam ID is genuinely verified here, so
     // the ('steam', steam_id) identity row is attached. DB error fails closed.
-    let user_id = match state.store.find_or_create_user(steam_id, &display_name, true).await {
+    let user_id = match state
+        .store
+        .find_or_create_user(steam_id, &display_name, true)
+        .await
+    {
         Ok(uid) => uid,
         Err(_) => {
             return (
@@ -215,10 +221,12 @@ pub async fn steam_callback(
                 .into_response();
         }
     };
-    let token = match state
-        .steam_auth
-        .generate_session_token(user_id, steam_id, version, state.config.jwt_ttl_secs)
-    {
+    let token = match state.steam_auth.generate_session_token(
+        user_id,
+        steam_id,
+        version,
+        state.config.jwt_ttl_secs,
+    ) {
         Ok(t) => t,
         Err(e) => {
             tracing::error!("JWT generation failed: {e}");
@@ -292,10 +300,12 @@ pub async fn ticket_auth(
                 .into_response();
         }
     };
-    let token = match state
-        .steam_auth
-        .generate_session_token(user_id, steam_id, version, state.config.jwt_ttl_secs)
-    {
+    let token = match state.steam_auth.generate_session_token(
+        user_id,
+        steam_id,
+        version,
+        state.config.jwt_ttl_secs,
+    ) {
         Ok(t) => t,
         Err(e) => {
             tracing::error!("JWT generation failed: {e}");
@@ -358,10 +368,12 @@ pub async fn test_token(
         }
     };
 
-    let token = match state
-        .steam_auth
-        .generate_session_token(user_id, body.steam_id, version, state.config.jwt_ttl_secs)
-    {
+    let token = match state.steam_auth.generate_session_token(
+        user_id,
+        body.steam_id,
+        version,
+        state.config.jwt_ttl_secs,
+    ) {
         Ok(t) => t,
         Err(e) => {
             tracing::error!("JWT generation failed: {e}");
@@ -378,10 +390,7 @@ pub async fn test_token(
 
 /// Revoke the session token presented in `Authorization: Bearer <token>` by
 /// bumping the player's token_version (all previously minted tokens die).
-pub async fn logout(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     let Some(auth) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -437,12 +446,32 @@ mod tests {
             ("javascript:alert(1)", None, false),
             ("/x?a=b", None, false),
             ("/x#frag", None, false),
-            ("https://evil.com/x", Some("https://lobby.example.com"), false),
-            ("https://lobby.example.com/cb", Some("https://lobby.example.com"), true),
+            (
+                "https://evil.com/x",
+                Some("https://lobby.example.com"),
+                false,
+            ),
+            (
+                "https://lobby.example.com/cb",
+                Some("https://lobby.example.com"),
+                true,
+            ),
             ("https://lobby.example.com/cb", None, false),
-            ("https://lobby.example.com/cb", Some("https://lobby.example.com/"), true),
-            ("https://lobby.example.com/cb?x=1", Some("https://lobby.example.com"), true),
-            ("https://lobby.example.com/cb#frag", Some("https://lobby.example.com"), false),
+            (
+                "https://lobby.example.com/cb",
+                Some("https://lobby.example.com/"),
+                true,
+            ),
+            (
+                "https://lobby.example.com/cb?x=1",
+                Some("https://lobby.example.com"),
+                true,
+            ),
+            (
+                "https://lobby.example.com/cb#frag",
+                Some("https://lobby.example.com"),
+                false,
+            ),
         ];
         for (return_to, public_url, expected) in cases {
             assert_eq!(
@@ -468,7 +497,10 @@ mod tests {
 
 #[derive(Deserialize)]
 pub struct GameResultBody {
-    #[serde(default, deserialize_with = "lobby_core::types::deserialize_optional_steam_id")]
+    #[serde(
+        default,
+        deserialize_with = "lobby_core::types::deserialize_optional_steam_id"
+    )]
     pub winner: Option<u64>, // None = draw
 }
 
@@ -492,7 +524,13 @@ pub async fn game_result(
     }
     match state
         .match_manager
-        .resolve_from_gameserver(&token, body.winner, &state.store, &state.store, &state.store)
+        .resolve_from_gameserver(
+            &token,
+            body.winner,
+            &state.store,
+            &state.store,
+            &state.store,
+        )
         .await
     {
         Ok(outcome) => {
@@ -524,7 +562,9 @@ pub struct ModeInfo {
 
 /// The modes the server actually runs — the demo populates its dropdown from this.
 pub async fn modes(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "modes": state.game_modes.iter().map(|(n, t)| ModeInfo { name: n.clone(), game_type: *t }).collect::<Vec<_>>() }))
+    Json(
+        serde_json::json!({ "modes": state.game_modes.iter().map(|(n, t)| ModeInfo { name: n.clone(), game_type: *t }).collect::<Vec<_>>() }),
+    )
 }
 
 /// Auth surface capabilities the demo uses to gate its login UI:
@@ -541,10 +581,23 @@ pub async fn auth_config(State(state): State<Arc<AppState>>) -> Json<serde_json:
 /// 503 when LOBBY_TURN_SECRET is unset (host candidates only).
 pub async fn turn_credentials(State(state): State<Arc<AppState>>) -> Response {
     let Some(secret) = &state.config.turn_secret else {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "turn not configured"}))).into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "turn not configured"})),
+        )
+            .into_response();
     };
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    Json(crate::turn::mint_turn_credentials(secret, 3600, now, &state.config.turn_uris)).into_response()
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Json(crate::turn::mint_turn_credentials(
+        secret,
+        3600,
+        now,
+        &state.config.turn_uris,
+    ))
+    .into_response()
 }
 
 /// Dev-only fake creator: returns a (simulated) server address and auto-reports

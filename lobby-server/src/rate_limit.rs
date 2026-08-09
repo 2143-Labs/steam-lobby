@@ -56,7 +56,10 @@ mod tests {
         assert!(rl.check(ip(1)));
         assert!(rl.check(ip(1)));
         assert!(rl.check(ip(1)));
-        assert!(!rl.check(ip(1)), "4th hit within the window must be rejected");
+        assert!(
+            !rl.check(ip(1)),
+            "4th hit within the window must be rejected"
+        );
     }
 
     #[test]

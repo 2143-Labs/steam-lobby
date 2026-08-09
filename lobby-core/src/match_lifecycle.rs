@@ -9,7 +9,9 @@ use skillratings::Outcomes;
 use crate::error::{LobbyError, Result};
 use crate::mmr;
 use crate::traits::{GameCallbacks, MatchStore, PlayerStore, RatingStore};
-use crate::types::{MatchEvent, MatchOutcome, MatchReport, MatchStatus, OpenSkillRating, PlayerState, SteamId};
+use crate::types::{
+    MatchEvent, MatchOutcome, MatchReport, MatchStatus, OpenSkillRating, PlayerState, SteamId,
+};
 
 pub struct MatchManager<CB: GameCallbacks> {
     callbacks: CB,
@@ -36,7 +38,11 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         if steam_id != m.player_a && steam_id != m.player_b {
             return Err(LobbyError::NotParticipant(token.to_string()));
         }
-        let first_accept = if steam_id == m.player_a { !m.accepted_a } else { !m.accepted_b };
+        let first_accept = if steam_id == m.player_a {
+            !m.accepted_a
+        } else {
+            !m.accepted_b
+        };
         if match_store.mark_accepted(token, steam_id).await? {
             // Both players have now accepted — transition to InProgress.
             tracing::info!(
@@ -126,7 +132,10 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         // retry, never a second vote. The DB INSERT also has ON CONFLICT
         // DO NOTHING as defense-in-depth against concurrent duplicates.
         let existing = match_store.get_reports(token).await?;
-        if existing.iter().any(|r| r.reporting_player == report.reporting_player) {
+        if existing
+            .iter()
+            .any(|r| r.reporting_player == report.reporting_player)
+        {
             return Err(LobbyError::InvalidReport(token.clone()));
         }
         match_store.submit_report(&report).await?;
@@ -151,8 +160,12 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                 .update_match(token, MatchStatus::Disputed, Utc::now())
                 .await?;
             // Terminal: both players are free to queue again.
-            player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
-            player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
+            player_store
+                .set_player_state(m.player_a, PlayerState::InMenus)
+                .await?;
+            player_store
+                .set_player_state(m.player_b, PlayerState::InMenus)
+                .await?;
             Ok(MatchOutcome::Disputed)
         } else {
             let missing = ra.demo_hash.is_none() || rb.demo_hash.is_none();
@@ -160,8 +173,12 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                 .update_match(token, MatchStatus::Disputed, Utc::now())
                 .await?;
             // Terminal: both players are free to queue again.
-            player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
-            player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
+            player_store
+                .set_player_state(m.player_a, PlayerState::InMenus)
+                .await?;
+            player_store
+                .set_player_state(m.player_b, PlayerState::InMenus)
+                .await?;
             if missing {
                 Ok(MatchOutcome::UnreviewableDispute)
             } else {
@@ -192,7 +209,13 @@ impl<CB: GameCallbacks> MatchManager<CB> {
             Outcomes::DRAW
         };
         let (new_a, new_b) = mmr::update_ratings(&rating_a, &rating_b, sk);
-        let outcome_str = if winner == Some(m.player_a) { "Win" } else if winner == Some(m.player_b) { "Loss" } else { "Draw" };
+        let outcome_str = if winner == Some(m.player_a) {
+            "Win"
+        } else if winner == Some(m.player_b) {
+            "Loss"
+        } else {
+            "Draw"
+        };
         let mu_change_b = new_b.mu - rating_b.mu;
         let mu_change_a = new_a.mu - rating_a.mu;
         match_store
@@ -223,8 +246,12 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         };
         self.callbacks.on_match_ended(m, &outcome).await?;
         // Terminal: both players are free to queue again.
-        player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
-        player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
+        player_store
+            .set_player_state(m.player_a, PlayerState::InMenus)
+            .await?;
+        player_store
+            .set_player_state(m.player_b, PlayerState::InMenus)
+            .await?;
         Ok(outcome)
     }
 
@@ -302,8 +329,14 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         let rating_b = rating_store.get_rating(m.player_b, &m.game_mode).await?;
         let (loser_new, _) = mmr::update_ratings(&rating_a, &rating_b, Outcomes::LOSS);
         let delta = loser_new.mu - rating_a.mu;
-        let new_a = OpenSkillRating { mu: rating_a.mu + delta, ..rating_a };
-        let new_b = OpenSkillRating { mu: rating_b.mu + delta, ..rating_b };
+        let new_a = OpenSkillRating {
+            mu: rating_a.mu + delta,
+            ..rating_a
+        };
+        let new_b = OpenSkillRating {
+            mu: rating_b.mu + delta,
+            ..rating_b
+        };
         match_store
             .resolve_match(
                 &m.match_token,
@@ -320,9 +353,12 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         let outcome = MatchOutcome::Forfeit { mu_change: delta };
         self.callbacks.on_match_ended(&m, &outcome).await?;
         // Terminal: both players are free to queue again.
-        player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
-        player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
+        player_store
+            .set_player_state(m.player_a, PlayerState::InMenus)
+            .await?;
+        player_store
+            .set_player_state(m.player_b, PlayerState::InMenus)
+            .await?;
         Ok(outcome)
     }
-
 }

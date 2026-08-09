@@ -133,7 +133,8 @@ impl<CB: GameCallbacks> MatchmakingQueue<CB> {
                     ended_at: None,
                     server_address: None,
                     join_token: None,
-                    result_secret: (game_type == GameType::Server).then(|| Uuid::new_v4().to_string()),
+                    result_secret: (game_type == GameType::Server)
+                        .then(|| Uuid::new_v4().to_string()),
                     accepted_a: false,
                     accepted_b: false,
                     connected_a: false,
@@ -149,7 +150,9 @@ impl<CB: GameCallbacks> MatchmakingQueue<CB> {
                 }
 
                 match_store.create_match(&match_info).await?;
-                match_store.record_match_event(&match_info.match_token, MatchEvent::Paired, None).await?;
+                match_store
+                    .record_match_event(&match_info.match_token, MatchEvent::Paired, None)
+                    .await?;
                 return Ok(Some(match_info));
             }
         }

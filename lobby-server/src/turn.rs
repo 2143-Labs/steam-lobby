@@ -5,8 +5,8 @@
 //! `password = base64(HMAC-SHA1(secret, username))` with the shared secret
 //! used as the literal HMAC key bytes. Verified end-to-end against coturn
 //! 4.17.0. Pure module — no axum, no DB.
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 
@@ -33,8 +33,8 @@ pub fn mint_turn_credentials(
 ) -> TurnCredentials {
     let expiry = now_secs + ttl_secs;
     let username = format!("{expiry}:steam-lobby");
-    let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts any key length");
+    let mut mac =
+        Hmac::<Sha1>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(username.as_bytes());
     let password = STANDARD.encode(&mac.finalize().into_bytes()[..]);
     TurnCredentials {
@@ -68,7 +68,7 @@ mod tests {
         );
         assert_eq!(
             STANDARD.encode(digest),
-        "7/zfauXrL6LSdBbV8YTfnCWafHk=",
+            "7/zfauXrL6LSdBbV8YTfnCWafHk=",
             "base64 encode mismatch"
         );
     }

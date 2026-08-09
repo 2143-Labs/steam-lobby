@@ -36,19 +36,51 @@ use tokio_tungstenite::tungstenite::Message;
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
-    Auth { session_token: String },
-    BeginMatchmaking { mode: String, difficulty: String },
+    Auth {
+        session_token: String,
+    },
+    BeginMatchmaking {
+        mode: String,
+        difficulty: String,
+    },
     CancelMatchmaking,
-    AcceptMatch { match_token: String },
-    DeclineMatch { match_token: String },
-    StartMatch { match_token: String },
-    GameInput { match_token: String, frame: u32, target: String },
-    RollbackHealth { match_token: String, frame: u32, checksum: String },
-    MatchReport { match_token: String, winner: Option<u64>, demo_hash: Option<String> },
+    AcceptMatch {
+        match_token: String,
+    },
+    DeclineMatch {
+        match_token: String,
+    },
+    StartMatch {
+        match_token: String,
+    },
+    GameInput {
+        match_token: String,
+        frame: u32,
+        target: String,
+    },
+    RollbackHealth {
+        match_token: String,
+        frame: u32,
+        checksum: String,
+    },
+    MatchReport {
+        match_token: String,
+        winner: Option<u64>,
+        demo_hash: Option<String>,
+    },
     Heartbeat,
-    WebrtcOffer { match_token: String, sdp: String },
-    WebrtcAnswer { match_token: String, sdp: String },
-    WebrtcIce { match_token: String, candidate: String },
+    WebrtcOffer {
+        match_token: String,
+        sdp: String,
+    },
+    WebrtcAnswer {
+        match_token: String,
+        sdp: String,
+    },
+    WebrtcIce {
+        match_token: String,
+        candidate: String,
+    },
 }
 
 // Hand-written so session tokens never appear in logs: the JWT is a
@@ -56,9 +88,10 @@ enum ClientMsg {
 impl std::fmt::Debug for ClientMsg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClientMsg::Auth { .. } => {
-                f.debug_struct("Auth").field("session_token", &"<redacted>").finish()
-            }
+            ClientMsg::Auth { .. } => f
+                .debug_struct("Auth")
+                .field("session_token", &"<redacted>")
+                .finish(),
             ClientMsg::BeginMatchmaking { mode, difficulty } => f
                 .debug_struct("BeginMatchmaking")
                 .field("mode", mode)
@@ -77,36 +110,57 @@ impl std::fmt::Debug for ClientMsg {
                 .debug_struct("StartMatch")
                 .field("match_token", match_token)
                 .finish(),
-            ClientMsg::GameInput { match_token, frame, target } => f
+            ClientMsg::GameInput {
+                match_token,
+                frame,
+                target,
+            } => f
                 .debug_struct("GameInput")
                 .field("match_token", match_token)
                 .field("frame", frame)
                 .field("target", target)
                 .finish(),
-            ClientMsg::RollbackHealth { match_token, frame, checksum } => f
+            ClientMsg::RollbackHealth {
+                match_token,
+                frame,
+                checksum,
+            } => f
                 .debug_struct("RollbackHealth")
                 .field("match_token", match_token)
                 .field("frame", frame)
                 .field("checksum", checksum)
                 .finish(),
-            ClientMsg::MatchReport { match_token, winner, demo_hash } => f
+            ClientMsg::MatchReport {
+                match_token,
+                winner,
+                demo_hash,
+            } => f
                 .debug_struct("MatchReport")
                 .field("match_token", match_token)
                 .field("winner", winner)
                 .field("demo_hash", demo_hash)
                 .finish(),
             ClientMsg::Heartbeat => f.write_str("Heartbeat"),
-            ClientMsg::WebrtcOffer { match_token, sdp: _ } => f
+            ClientMsg::WebrtcOffer {
+                match_token,
+                sdp: _,
+            } => f
                 .debug_struct("WebrtcOffer")
                 .field("match_token", match_token)
                 .field("sdp", &"<sdp>")
                 .finish(),
-            ClientMsg::WebrtcAnswer { match_token, sdp: _ } => f
+            ClientMsg::WebrtcAnswer {
+                match_token,
+                sdp: _,
+            } => f
                 .debug_struct("WebrtcAnswer")
                 .field("match_token", match_token)
                 .field("sdp", &"<sdp>")
                 .finish(),
-            ClientMsg::WebrtcIce { match_token, candidate: _ } => f
+            ClientMsg::WebrtcIce {
+                match_token,
+                candidate: _,
+            } => f
                 .debug_struct("WebrtcIce")
                 .field("match_token", match_token)
                 .field("candidate", &"<candidate>")
@@ -141,7 +195,10 @@ pub enum ServerEvent {
         join_token: Option<String>,
     },
     #[serde(rename = "game_server_error")]
-    GameServerError { match_token: String, message: String },
+    GameServerError {
+        match_token: String,
+        message: String,
+    },
     GameState {
         match_token: String,
         frame: u32,
@@ -159,7 +216,10 @@ pub enum ServerEvent {
         checksum: String,
     },
     #[serde(rename = "input_ack")]
-    InputAck { match_token: String, frame: u32 },
+    InputAck {
+        match_token: String,
+        frame: u32,
+    },
     #[serde(rename = "match_started")]
     MatchStarted {
         match_token: String,
@@ -181,7 +241,11 @@ pub enum ServerEvent {
         target: String,
     },
     #[serde(rename = "rollback_resync")]
-    RollbackResync { match_token: String, frame: u32, state: String },
+    RollbackResync {
+        match_token: String,
+        frame: u32,
+        state: String,
+    },
     GameOver {
         match_token: String,
         #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
@@ -199,24 +263,38 @@ pub enum ServerEvent {
         leaderboard: Vec<lobby_core::types::LeaderboardEntry>,
     },
     #[serde(rename = "opponent_connected")]
-    OpponentConnected { match_token: String },
+    OpponentConnected {
+        match_token: String,
+    },
     ReportReceived {
         match_token: String,
         #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
         reporting_player: u64,
-        #[serde(default, deserialize_with = "lobby_core::types::deserialize_optional_steam_id")]
+        #[serde(
+            default,
+            deserialize_with = "lobby_core::types::deserialize_optional_steam_id"
+        )]
         winner: Option<u64>,
         demo_hash: Option<String>,
     },
     #[serde(rename = "match_declined")]
-    MatchDeclined { match_token: String },
+    MatchDeclined {
+        match_token: String,
+    },
     #[serde(rename = "match_expired")]
-    MatchExpired { match_token: String },
+    MatchExpired {
+        match_token: String,
+    },
     #[serde(rename = "match_result")]
-    MatchResult { match_token: String, outcome: serde_json::Value },
+    MatchResult {
+        match_token: String,
+        outcome: serde_json::Value,
+    },
     #[serde(rename = "queue_expired")]
     QueueExpired,
-    Error { message: String },
+    Error {
+        message: String,
+    },
     #[serde(rename = "webrtc_offer")]
     WebrtcOffer {
         match_token: String,
@@ -322,7 +400,8 @@ impl LobbyClient {
         // never closes a tungstenite socket whose stream half is still parked
         // on `next()`, and the server would not see the disconnect.
         let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Message>();
-        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel::<Result<ServerEvent, ClientError>>();
+        let (incoming_tx, incoming_rx) =
+            mpsc::unbounded_channel::<Result<ServerEvent, ClientError>>();
 
         // Outbound task: send frames from the channel to the socket
         tokio::spawn(async move {
@@ -337,18 +416,16 @@ impl LobbyClient {
         tokio::spawn(async move {
             while let Some(msg) = ws_rx.next().await {
                 match msg {
-                    Ok(Message::Text(text)) => {
-                        match serde_json::from_str::<ServerEvent>(&text) {
-                            Ok(event) => {
-                                if incoming_tx.send(Ok(event)).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                let _ = incoming_tx.send(Err(ClientError::Json(e)));
+                    Ok(Message::Text(text)) => match serde_json::from_str::<ServerEvent>(&text) {
+                        Ok(event) => {
+                            if incoming_tx.send(Ok(event)).is_err() {
+                                break;
                             }
                         }
-                    }
+                        Err(e) => {
+                            let _ = incoming_tx.send(Err(ClientError::Json(e)));
+                        }
+                    },
                     Ok(Message::Close(_)) => break,
                     Err(e) => {
                         let _ = incoming_tx.send(Err(ClientError::Connection(e.to_string())));
@@ -384,7 +461,9 @@ impl LobbyClient {
 
     /// Authenticate with a JWT session token. Returns player info on success.
     pub async fn authenticate(&mut self, token: &str) -> Result<AuthOk, ClientError> {
-        self.send(ClientMsg::Auth { session_token: token.to_string() })?;
+        self.send(ClientMsg::Auth {
+            session_token: token.to_string(),
+        })?;
         match self.rx.recv().await.ok_or(ClientError::NoResponse)? {
             Ok(ServerEvent::AuthOk {
                 player_id,
@@ -431,13 +510,16 @@ impl LobbyClient {
     }
 
     /// Enter the matchmaking queue.
-    pub async fn begin_matchmaking(&mut self, mode: &str, difficulty: &str) -> Result<(), ClientError> {
+    pub async fn begin_matchmaking(
+        &mut self,
+        mode: &str,
+        difficulty: &str,
+    ) -> Result<(), ClientError> {
         self.send(ClientMsg::BeginMatchmaking {
             mode: mode.to_string(),
             difficulty: difficulty.to_string(),
         })
     }
-
 
     /// Leave the queue (no server response expected).
     pub async fn cancel_matchmaking(&mut self) -> Result<(), ClientError> {
@@ -488,17 +570,23 @@ impl LobbyClient {
 
     /// Accept a found match.
     pub async fn accept_match(&mut self, match_token: &str) -> Result<(), ClientError> {
-        self.send(ClientMsg::AcceptMatch { match_token: match_token.to_string() })
+        self.send(ClientMsg::AcceptMatch {
+            match_token: match_token.to_string(),
+        })
     }
 
     /// Decline a found match.
     pub async fn decline_match(&mut self, match_token: &str) -> Result<(), ClientError> {
-        self.send(ClientMsg::DeclineMatch { match_token: match_token.to_string() })
+        self.send(ClientMsg::DeclineMatch {
+            match_token: match_token.to_string(),
+        })
     }
 
     /// Notify the server that the P2P connection is established; begin the match.
     pub async fn start_match(&mut self, match_token: &str) -> Result<(), ClientError> {
-        self.send(ClientMsg::StartMatch { match_token: match_token.to_string() })
+        self.send(ClientMsg::StartMatch {
+            match_token: match_token.to_string(),
+        })
     }
 
     /// Send a frame-stamped paddle target for the rollback protocol.
@@ -557,8 +645,18 @@ impl LobbyClient {
     pub async fn wait_for_match(&mut self) -> Result<Option<MatchFound>, ClientError> {
         loop {
             match self.rx.recv().await {
-                Some(Ok(ServerEvent::MatchFound { match_token, opponent, timeout_ms, game_type })) => {
-                    return Ok(Some(MatchFound { match_token, opponent, timeout_ms, game_type }));
+                Some(Ok(ServerEvent::MatchFound {
+                    match_token,
+                    opponent,
+                    timeout_ms,
+                    game_type,
+                })) => {
+                    return Ok(Some(MatchFound {
+                        match_token,
+                        opponent,
+                        timeout_ms,
+                        game_type,
+                    }));
                 }
                 Some(Ok(ServerEvent::Error { message })) => {
                     return Err(ClientError::Server(message));

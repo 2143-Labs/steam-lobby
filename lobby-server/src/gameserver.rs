@@ -26,10 +26,7 @@ pub struct Allocation {
 
 impl GameserverClient {
     /// POST the match to the creator; the creator returns the server endpoint.
-    pub async fn allocate(
-        &self,
-        m: &lobby_core::types::MatchInfo,
-    ) -> Result<Allocation, String> {
+    pub async fn allocate(&self, m: &lobby_core::types::MatchInfo) -> Result<Allocation, String> {
         let creator_url = self
             .creator_url
             .as_deref()
@@ -54,8 +51,18 @@ impl GameserverClient {
             self.client.post(creator_url).json(&body).send(),
         )
         .await
-        .map_err(|_| format!("gameserver creator request timed out for match {}", m.match_token))?
-        .map_err(|e| format!("gameserver creator request failed for match {}: {e}", m.match_token))?;
+        .map_err(|_| {
+            format!(
+                "gameserver creator request timed out for match {}",
+                m.match_token
+            )
+        })?
+        .map_err(|e| {
+            format!(
+                "gameserver creator request failed for match {}: {e}",
+                m.match_token
+            )
+        })?;
         if !resp.status().is_success() {
             return Err(format!(
                 "gameserver creator returned {} for match {}",
@@ -63,10 +70,12 @@ impl GameserverClient {
                 m.match_token
             ));
         }
-        let alloc: Allocation = resp
-            .json()
-            .await
-            .map_err(|e| format!("gameserver creator bad response for match {}: {e}", m.match_token))?;
+        let alloc: Allocation = resp.json().await.map_err(|e| {
+            format!(
+                "gameserver creator bad response for match {}: {e}",
+                m.match_token
+            )
+        })?;
         Ok(alloc)
     }
 }

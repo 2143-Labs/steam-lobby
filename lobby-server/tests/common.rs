@@ -77,7 +77,16 @@ async fn setup_full(
     start_timeout_secs: u64,
     countdown_ticks: u32,
 ) -> TestHarness {
-    setup_full_impl(pool, pong_enabled, creator_url, turn_secret, start_timeout_secs, countdown_ticks, None).await
+    setup_full_impl(
+        pool,
+        pong_enabled,
+        creator_url,
+        turn_secret,
+        start_timeout_secs,
+        countdown_ticks,
+        None,
+    )
+    .await
 }
 
 /// Unique per-test task queue: each test gets its own worker + matchmaker
@@ -107,7 +116,16 @@ pub async fn setup_temporal_with_creator(pool: PgPool, creator_url: Option<&str>
 /// Temporal harness with a TURN secret (webrtc tests).
 pub async fn setup_temporal_with_turn(pool: PgPool, turn_secret: Option<&str>) -> TestHarness {
     let queue = unique_queue();
-    setup_full_impl(pool, true, None, turn_secret.map(String::from), 15, 0, Some(queue)).await
+    setup_full_impl(
+        pool,
+        true,
+        None,
+        turn_secret.map(String::from),
+        15,
+        0,
+        Some(queue),
+    )
+    .await
 }
 
 /// Harness with a live Temporal worker: the WS handlers signal workflows, the
@@ -210,13 +228,13 @@ async fn setup_full_impl(
     if let Some(_q) = &temporal_queue {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while std::time::Instant::now() < deadline {
-            if state.temporal.read().ok().map_or(false, |g| g.is_some()) {
+            if state.temporal.read().ok().is_some_and(|g| g.is_some()) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert!(
-            state.temporal.read().ok().map_or(false, |g| g.is_some()),
+            state.temporal.read().ok().is_some_and(|g| g.is_some()),
             "temporal worker failed to connect within 15s (is `just temporal-up` running?)"
         );
     }

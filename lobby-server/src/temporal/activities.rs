@@ -227,7 +227,6 @@ impl LobbyActivities {
         Ok(())
     }
 
-
     /// START-window forfeit (the Part A start window's timeout body): the
     /// match is still InProgress when the window expires — flip it to
     /// Reporting first (resolve_pong/forfeit validate on Reporting), then
@@ -398,7 +397,11 @@ impl LobbyActivities {
             // ticker's notify, ticker.rs:44-108) and signal their sessions.
 
             for pid in [m.player_a, m.player_b] {
-                let opponent = if pid == m.player_a { m.player_b } else { m.player_a };
+                let opponent = if pid == m.player_a {
+                    m.player_b
+                } else {
+                    m.player_a
+                };
                 let opponent_name = self
                     .state
                     .steam_auth

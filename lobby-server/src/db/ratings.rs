@@ -20,7 +20,14 @@ impl RatingStore for PostgresStore {
         Ok(rows
             .into_iter()
             .map(|(id, mu, sigma, last_updated)| {
-                (id as u64, OpenSkillRating { mu, sigma, last_updated })
+                (
+                    id as u64,
+                    OpenSkillRating {
+                        mu,
+                        sigma,
+                        last_updated,
+                    },
+                )
             })
             .collect())
     }

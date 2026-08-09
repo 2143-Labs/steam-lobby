@@ -3,8 +3,10 @@ mod common;
 use chrono::{Duration, Utc};
 use common::{queued_player, MockStore, TestCallbacks};
 use lobby_core::error::LobbyError;
-use lobby_core::types::{GameType, MatchDifficulty, MatchInfo, MatchReport, MatchStatus, PlayerState, QueueEntry};
 use lobby_core::traits::{MatchStore, QueueStore};
+use lobby_core::types::{
+    GameType, MatchDifficulty, MatchInfo, MatchReport, MatchStatus, PlayerState, QueueEntry,
+};
 
 // ── Tests ────────────────────────────────────────────────
 
@@ -325,7 +327,11 @@ async fn server_result_resolves() {
         .get(&(100, "server_arena".into()))
         .cloned()
         .unwrap();
-    assert!(rating_100.mu > 25.0, "winner's mu should increase, got {}", rating_100.mu);
+    assert!(
+        rating_100.mu > 25.0,
+        "winner's mu should increase, got {}",
+        rating_100.mu
+    );
 }
 
 #[tokio::test]
@@ -376,7 +382,11 @@ async fn pong_resolve_declares_winner() {
         .get(&(100, "ranked_1v1".into()))
         .cloned()
         .unwrap();
-    assert!(rating_100.mu > 25.0, "winner's mu should increase, got {}", rating_100.mu);
+    assert!(
+        rating_100.mu > 25.0,
+        "winner's mu should increase, got {}",
+        rating_100.mu
+    );
     assert_eq!(
         store.players.lock().get(&100).unwrap().state,
         PlayerState::InMenus,
@@ -424,7 +434,6 @@ async fn playing_match_expires() {
     let m = store.get_match(&token).await.unwrap().unwrap();
     assert_eq!(m.status, MatchStatus::Disputed);
 }
-
 
 #[tokio::test]
 async fn duplicate_report_rejected() {
@@ -488,7 +497,10 @@ async fn duplicate_report_rejected() {
         .submit_report(report_b, &store, &store, &store)
         .await
         .unwrap();
-    assert!(matches!(outcome, lobby_core::types::MatchOutcome::Win { .. }));
+    assert!(matches!(
+        outcome,
+        lobby_core::types::MatchOutcome::Win { .. }
+    ));
     assert_eq!(
         store.players.lock().get(&100).unwrap().state,
         PlayerState::InMenus

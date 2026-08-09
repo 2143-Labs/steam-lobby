@@ -36,7 +36,6 @@ impl MatchStore for PostgresStore {
         Ok(row.map(MatchInfo::from))
     }
 
-
     async fn update_match_status(&self, token: &str, status: MatchStatus) -> Result<()> {
         let status_str = format!("{:?}", status);
         sqlx::query("UPDATE matches SET status = $1 WHERE match_token = $2")
@@ -175,7 +174,12 @@ impl MatchStore for PostgresStore {
         Ok(row.0)
     }
 
-    async fn mark_server_ready(&self, token: &str, address: &str, join_token: Option<&str>) -> Result<()> {
+    async fn mark_server_ready(
+        &self,
+        token: &str,
+        address: &str,
+        join_token: Option<&str>,
+    ) -> Result<()> {
         sqlx::query(
             "UPDATE matches SET status = 'Playing', server_address = $2, join_token = $3, started_at = NOW() \
              WHERE match_token = $1",
@@ -206,7 +210,6 @@ impl MatchStore for PostgresStore {
         .map_err(map_db_error)?;
         Ok(())
     }
-
 
     async fn write_match_result(
         &self,
@@ -296,11 +299,13 @@ impl MatchStore for PostgresStore {
         .execute(&mut *tx)
         .await
         .map_err(map_db_error)?;
-        sqlx::query("UPDATE matches SET status = 'Resolved', ended_at = NOW() WHERE match_token = $1")
-            .bind(token)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_db_error)?;
+        sqlx::query(
+            "UPDATE matches SET status = 'Resolved', ended_at = NOW() WHERE match_token = $1",
+        )
+        .bind(token)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
         tx.commit().await.map_err(map_db_error)
     }
 }

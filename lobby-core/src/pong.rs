@@ -20,10 +20,10 @@ const PADDLE_SPEED: f64 = 0.8; // units/sec toward the target
 const PADDLE_CLAMP: (f64, f64) = (0.08, 0.92); // center limits so edges stay on screen
 const BALL_SPEED: f64 = 0.9; // base serve speed, units/sec (3x the original 0.3)
 const SPEED_UP: f64 = 1.06; // per paddle hit — "gets faster and faster"
-const MAX_SPEED: f64 = 6.0; 
+const MAX_SPEED: f64 = 6.0;
 const HIT_RADIUS: f64 = 0.02; // |ball_x - paddle_x| < this counts as a hit
-// Physics sub-step cap so the ball can never tunnel through a paddle at max
-// speed (a 0.04-wide hit window needs steps well under 0.02 units).
+                              // Physics sub-step cap so the ball can never tunnel through a paddle at max
+                              // speed (a 0.04-wide hit window needs steps well under 0.02 units).
 const MAX_SUBSTEP_TRAVEL: f64 = 0.005;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,7 +249,7 @@ impl PongGame {
         self.ball_x = 0.5;
         self.ball_y = 0.5;
         self.ball_vx = match scorer {
-            PongSide::Left => BALL_SPEED, // Right conceded
+            PongSide::Left => BALL_SPEED,   // Right conceded
             PongSide::Right => -BALL_SPEED, // Left conceded
         };
         self.ball_vy = 0.0;
@@ -355,6 +355,9 @@ mod tests {
             (g.snapshot().left_y - PADDLE_CLAMP.0).abs() < 1e-9,
             "paddle must reach the clamp floor"
         );
-        assert!(min_y >= PADDLE_CLAMP.0 - 1e-12, "paddle never below the floor");
+        assert!(
+            min_y >= PADDLE_CLAMP.0 - 1e-12,
+            "paddle never below the floor"
+        );
     }
 }

@@ -11,15 +11,16 @@ use lobby_core::types::{MatchDifficulty, SteamId};
 
 use crate::state::AppState;
 use crate::temporal::activities::QueueArgs;
-use crate::temporal::workflows::{
-    self, ChoiceArgs, DemoArgs, SessionArgs, StartArgs, WhoWonArgs,
-};
+use crate::temporal::workflows::{self, ChoiceArgs, DemoArgs, SessionArgs, StartArgs, WhoWonArgs};
 
 /// The session workflow ID is scoped by task queue so parallel tests (and
 /// dev servers on different queues) never collide on a shared player's
 /// `user-session-{steam_id}`.
 fn session_workflow_id(state: &Arc<AppState>, steam_id: SteamId) -> String {
-    format!("user-session-{steam_id}-{}", state.config.temporal_task_queue)
+    format!(
+        "user-session-{steam_id}-{}",
+        state.config.temporal_task_queue
+    )
 }
 pub(crate) async fn start_user_session(state: &Arc<AppState>, steam_id: SteamId) {
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
@@ -48,8 +49,9 @@ pub(crate) async fn signal_queue(
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
     };
-    let handle = client
-        .get_workflow_handle::<workflows::UserSessionWorkflow>(session_workflow_id(state, steam_id));
+    let handle = client.get_workflow_handle::<workflows::UserSessionWorkflow>(session_workflow_id(
+        state, steam_id,
+    ));
     let _ = handle
         .signal(
             workflows::UserSessionWorkflow::queue,
@@ -68,8 +70,9 @@ pub(crate) async fn signal_unqueue(state: &Arc<AppState>, steam_id: SteamId) {
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
     };
-    let handle = client
-        .get_workflow_handle::<workflows::UserSessionWorkflow>(session_workflow_id(state, steam_id));
+    let handle = client.get_workflow_handle::<workflows::UserSessionWorkflow>(session_workflow_id(
+        state, steam_id,
+    ));
     let _ = handle
         .signal(
             workflows::UserSessionWorkflow::unqueue,
@@ -90,7 +93,8 @@ pub(crate) async fn signal_match_choice(
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
     };
-    let handle = client.get_workflow_handle::<workflows::P2PMatchWorkflow>(format!("match-{token}"));
+    let handle =
+        client.get_workflow_handle::<workflows::P2PMatchWorkflow>(format!("match-{token}"));
     if let Err(e) = handle
         .signal(
             workflows::P2PMatchWorkflow::match_choice,
@@ -108,7 +112,8 @@ pub(crate) async fn signal_start(state: &Arc<AppState>, token: &str, steam_id: S
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
     };
-    let handle = client.get_workflow_handle::<workflows::P2PMatchWorkflow>(format!("match-{token}"));
+    let handle =
+        client.get_workflow_handle::<workflows::P2PMatchWorkflow>(format!("match-{token}"));
     let _ = handle
         .signal(
             workflows::P2PMatchWorkflow::start,
@@ -128,7 +133,8 @@ pub(crate) async fn signal_who_won(
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
     };
-    let handle = client.get_workflow_handle::<workflows::P2PMatchWorkflow>(format!("match-{token}"));
+    let handle =
+        client.get_workflow_handle::<workflows::P2PMatchWorkflow>(format!("match-{token}"));
     let _ = handle
         .signal(
             workflows::P2PMatchWorkflow::who_won,
@@ -148,7 +154,8 @@ pub(crate) async fn signal_submit_demo(
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
     };
-    let handle = client.get_workflow_handle::<workflows::P2PMatchWorkflow>(format!("match-{token}"));
+    let handle =
+        client.get_workflow_handle::<workflows::P2PMatchWorkflow>(format!("match-{token}"));
     let _ = handle
         .signal(
             workflows::P2PMatchWorkflow::submit_demo,
@@ -166,8 +173,9 @@ pub(crate) async fn signal_disconnect(state: &Arc<AppState>, steam_id: SteamId) 
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
     };
-    let handle = client
-        .get_workflow_handle::<workflows::UserSessionWorkflow>(session_workflow_id(state, steam_id));
+    let handle = client.get_workflow_handle::<workflows::UserSessionWorkflow>(session_workflow_id(
+        state, steam_id,
+    ));
     let _ = handle
         .signal(
             workflows::UserSessionWorkflow::disconnect,

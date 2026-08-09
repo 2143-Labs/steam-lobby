@@ -200,13 +200,11 @@ impl PostgresStore {
     /// None when the user row is missing (shouldn't happen — users is the
     /// parent of player_state/ratings — but callers fall back to a placeholder).
     pub async fn get_user_id(&self, steam_id: SteamId) -> Result<Option<uuid::Uuid>> {
-        let row = sqlx::query_as::<_, (uuid::Uuid,)>(
-            "SELECT id FROM users WHERE steam_id = $1",
-        )
-        .bind(steam_id as i64)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_db_error)?;
+        let row = sqlx::query_as::<_, (uuid::Uuid,)>("SELECT id FROM users WHERE steam_id = $1")
+            .bind(steam_id as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_db_error)?;
         Ok(row.map(|r| r.0))
     }
 }

@@ -18,7 +18,9 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         timeout_secs: u64,
         player_store: &dyn PlayerStore,
     ) -> Result<Vec<String>> {
-        let matches = match_store.get_matches_by_status(MatchStatus::Playing).await?;
+        let matches = match_store
+            .get_matches_by_status(MatchStatus::Playing)
+            .await?;
         let now = Utc::now();
         let mut expired = Vec::new();
         for m in &matches {
@@ -26,14 +28,19 @@ impl<CB: GameCallbacks> MatchManager<CB> {
                 if (now - started).num_seconds().max(0) as u64 > timeout_secs {
                     tracing::info!(
                         "match {} no result from gameserver within {}s -> Disputed",
-                        m.match_token, timeout_secs
+                        m.match_token,
+                        timeout_secs
                     );
                     match_store
                         .update_match_status(&m.match_token, MatchStatus::Disputed)
                         .await?;
                     // Terminal: both players are free to queue again.
-                    player_store.set_player_state(m.player_a, PlayerState::InMenus).await?;
-                    player_store.set_player_state(m.player_b, PlayerState::InMenus).await?;
+                    player_store
+                        .set_player_state(m.player_a, PlayerState::InMenus)
+                        .await?;
+                    player_store
+                        .set_player_state(m.player_b, PlayerState::InMenus)
+                        .await?;
                     expired.push(m.match_token.clone());
                 }
             }

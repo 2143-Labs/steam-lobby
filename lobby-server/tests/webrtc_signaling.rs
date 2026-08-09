@@ -67,8 +67,16 @@ async fn signaling_relay(pool: sqlx::PgPool) {
 
     p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
     p2.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
-    let m1 = timeout(Duration::from_secs(15), p1.wait_for_match()).await.unwrap().unwrap().unwrap();
-    let m2 = timeout(Duration::from_secs(15), p2.wait_for_match()).await.unwrap().unwrap().unwrap();
+    let m1 = timeout(Duration::from_secs(15), p1.wait_for_match())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let m2 = timeout(Duration::from_secs(15), p2.wait_for_match())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(m1.match_token, m2.match_token);
     let token = m1.match_token;
 
@@ -78,25 +86,54 @@ async fn signaling_relay(pool: sqlx::PgPool) {
     p2.start_match(&token).await.unwrap();
 
     // Offer/answer/ice round-trip
-    p1.send_webrtc_offer(&token, "sdp-offer-a".into()).await.unwrap();
-    expect(&mut p2, 5, |ev| matches!(ev, ServerEvent::WebrtcOffer { sdp, .. } if sdp == "sdp-offer-a")).await;
-    p2.send_webrtc_answer(&token, "sdp-answer-b".into()).await.unwrap();
-    expect(&mut p1, 5, |ev| matches!(ev, ServerEvent::WebrtcAnswer { sdp, .. } if sdp == "sdp-answer-b")).await;
+    p1.send_webrtc_offer(&token, "sdp-offer-a".into())
+        .await
+        .unwrap();
+    expect(
+        &mut p2,
+        5,
+        |ev| matches!(ev, ServerEvent::WebrtcOffer { sdp, .. } if sdp == "sdp-offer-a"),
+    )
+    .await;
+    p2.send_webrtc_answer(&token, "sdp-answer-b".into())
+        .await
+        .unwrap();
+    expect(
+        &mut p1,
+        5,
+        |ev| matches!(ev, ServerEvent::WebrtcAnswer { sdp, .. } if sdp == "sdp-answer-b"),
+    )
+    .await;
     p1.send_webrtc_ice(&token, "cand-a".into()).await.unwrap();
-    expect(&mut p2, 5, |ev| matches!(ev, ServerEvent::WebrtcIce { candidate, .. } if candidate == "cand-a")).await;
+    expect(
+        &mut p2,
+        5,
+        |ev| matches!(ev, ServerEvent::WebrtcIce { candidate, .. } if candidate == "cand-a"),
+    )
+    .await;
     p2.send_webrtc_ice(&token, "cand-b".into()).await.unwrap();
-    expect(&mut p1, 5, |ev| matches!(ev, ServerEvent::WebrtcIce { candidate, .. } if candidate == "cand-b")).await;
+    expect(
+        &mut p1,
+        5,
+        |ev| matches!(ev, ServerEvent::WebrtcIce { candidate, .. } if candidate == "cand-b"),
+    )
+    .await;
 
     // Negative: non-participant
     let mut p3 = LobbyClient::connect(&h.ws_url).await.unwrap();
     p3.authenticate_test_token(9992, &h.base_url).await.unwrap();
-    p3.send_webrtc_offer(&token, "spoofed-offer".into()).await.unwrap();
+    p3.send_webrtc_offer(&token, "spoofed-offer".into())
+        .await
+        .unwrap();
 
     let end = tokio::time::Instant::now() + Duration::from_millis(500);
     let mut p3_ok = true;
     while tokio::time::Instant::now() < end {
-        if let Ok(Some(Ok(ServerEvent::WebrtcOffer { .. } | ServerEvent::WebrtcAnswer { .. } | ServerEvent::WebrtcIce { .. }))) =
-            timeout(Duration::from_millis(100), p3.next_event()).await
+        if let Ok(Some(Ok(
+            ServerEvent::WebrtcOffer { .. }
+            | ServerEvent::WebrtcAnswer { .. }
+            | ServerEvent::WebrtcIce { .. },
+        ))) = timeout(Duration::from_millis(100), p3.next_event()).await
         {
             p3_ok = false;
         }
@@ -107,7 +144,9 @@ async fn signaling_relay(pool: sqlx::PgPool) {
     let mut p1_ok = true;
     while tokio::time::Instant::now() < end {
         match timeout(Duration::from_millis(100), p1.next_event()).await {
-            Ok(Some(Ok(ServerEvent::WebrtcOffer { from: 9992, .. }))) => { p1_ok = false; }
+            Ok(Some(Ok(ServerEvent::WebrtcOffer { from: 9992, .. }))) => {
+                p1_ok = false;
+            }
             Ok(Some(Ok(_))) => {}
             _ => {}
         }

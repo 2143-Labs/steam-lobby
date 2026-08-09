@@ -114,7 +114,7 @@ impl From<MatchRow> for MatchInfo {
     }
 }
 
-mod players;
 mod matches;
+mod players;
 mod queue;
 mod ratings;
