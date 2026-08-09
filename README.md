@@ -209,28 +209,33 @@ origin listed in `CORS_ORIGINS`; production deployments must keep
 
 ## Temporal Architecture
 
-The p2p match lifecycle is orchestrated by four Temporal workflows running on
-an **in-process Rust worker** inside the lobby-server binary (same Deployment,
+The p2p match lifecycle is orchestrated by Temporal workflows running on an
+**in-process Rust worker** inside the lobby-server binary (same Deployment,
 no separate worker pod). The worker connects to the Temporal frontend at
 `TEMPORAL_ADDRESS` (local: `just temporal-up`; cluster:
 `temporal-frontend.default.svc.cluster.local:7233`) in namespace
 `TEMPORAL_NAMESPACE` (default `pvp`), task queue `lobby`.
 
-| Workflow | ID | Job |
+| Workflow / Schedule | ID | Job |
 |----------|----|-----|
-| `UserSessionWorkflow` | `user-session-{steam_id}` | Per logged-in player; lives until the disconnect signal. Runs the queue/unqueue/match-found/match-complete state transitions. |
-| `QueueWorkflow` (child) | `queue-{steam_id}-{mode}` | Pure queueing state holder: enters the queue on start, cancelled by unqueue/match-found/disconnect. |
-| `MatchmakerWorkflow` | `matchmaker-{mode}` | One per P2P game mode; every 2s runs the pairing activity (MMR-band match, create match, signal both sessions, start the P2P workflow). |
+| **Schedule** (per P2P mode) | `matchmaker-{mode}-{queue}` | Fires a short `PairOnceWorkflow` every 2s (`ScheduleOverlapPolicy::Skip` = single writer); deleted on worker shutdown so tests don't accumulate schedules. |
+| `PairOnceWorkflow` | `pair-{mode}-{queue}-{timestamp}` | One `pair_matches` activity (a single `FOR UPDATE` transaction: MMR-band pair, create match, signal both sessions, start the P2P workflow), then returns. Replaces the old infinite `MatchmakerWorkflow` loop. |
+| `UserSessionWorkflow` | `user-session-{steam_id}-{session_id}` | Per **WS connection** (session UUID). Recovers queue/match state from the DB on start; driven by `queue`/`unqueue`/`match_found`/`queue_expired`/`disconnect` signals; ends on disconnect or the 24h TTL. |
 | `P2PMatchWorkflow` | `match-{match_token}` | The coordinator: accept window (30s) → START window (15s, forfeit) → report window (300s) — each a workflow timer racing the clients' signals. Sole lifecycle writer. |
 
+The queue is the `matchmaking_queue` DB row — there is **no queue workflow**.
+Every workflow terminates on all paths (no loops, no unending flows).
+
 The WS handlers only **signal** workflows (`queue`, `unqueue`, `match_choice`,
-`start`, `who_won`, `submit_demo`, `disconnect`); all DB + broadcast work
+`start`, `who_won`, `submit_demo`, `disconnect`); the ticker's stale-queue
+sweep (out of Temporal) signals `queue_expired`. All DB + broadcast work
 happens in activities (`lobby-server/src/temporal/activities.rs`). The
 server-authoritative pong referee stays in-process for **playback only**
 (frames/checksums/round-hold); it no longer resolves matches — the workflow
 resolves on the clients' `who_won` reports, the START-window forfeit, or the
 report-window dispute timer. `server_arena` gameserver matches are out of
 scope for the migration and keep their in-process path.
+
 
 See `docs/temporal.md` for the full design.
 

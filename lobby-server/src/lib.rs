@@ -167,15 +167,10 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
     );
     let callbacks = DefaultCallbacks;
     let player_manager = lobby_core::player::PlayerManager::new(callbacks.clone());
-    let matchmaking_queue = lobby_core::queue::MatchmakingQueue::with_pair_cooldown(
-        callbacks.clone(),
-        config.pair_cooldown_secs as i64,
-    );
     let match_manager = lobby_core::match_lifecycle::MatchManager::new(callbacks);
     let http = reqwest::Client::new();
     let state = Arc::new(AppState {
         player_manager,
-        matchmaking_queue,
         match_manager,
         steam_auth,
         store,
@@ -201,6 +196,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
             turn_uris: config.turn_uris.clone(),
             match_accept_timeout_secs: config.match_accept_timeout_secs,
             report_timeout_secs: config.report_timeout_secs,
+            pair_cooldown_secs: config.pair_cooldown_secs,
             temporal_address: config.temporal_address.clone(),
             temporal_namespace: config.temporal_namespace.clone(),
             temporal_task_queue: config.temporal_task_queue.clone(),

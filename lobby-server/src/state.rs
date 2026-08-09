@@ -47,13 +47,12 @@ pub struct RuntimeConfig {
     pub match_accept_timeout_secs: u64,
     /// REPORT_TIMEOUT_S; how long a Reporting match waits for reports.
     pub report_timeout_secs: u64,
+    /// LOBBY_PAIR_COOLDOWN_S; anti re-pair window after a resolved match.
+    pub pair_cooldown_secs: u64,
 }
 
 pub struct AppState {
-    /// Per-player state machine (`PlayerState` transitions).
     pub player_manager: lobby_core::player::PlayerManager<DefaultCallbacks>,
-    /// Matchmaking: pairing, re-pair cooldown, stale cleanup.
-    pub matchmaking_queue: lobby_core::queue::MatchmakingQueue<DefaultCallbacks>,
     /// Match lifecycle actions: accept, connect, report, resolve.
     pub match_manager: lobby_core::match_lifecycle::MatchManager<DefaultCallbacks>,
     /// Live WebSocket senders by steam_id.
@@ -103,6 +102,8 @@ pub struct ConnectionEntry {
     pub tx: mpsc::UnboundedSender<ServerMessage>,
     pub generation: u64,
     pub abort: tokio::task::AbortHandle,
+    /// The per-connection session UUID (workflow ID suffix) this connection owns.
+    pub session_id: String,
 }
 
 #[derive(Clone, Default)]

@@ -337,7 +337,18 @@ impl QueueStore for MockStore {
     async fn is_queued(&self, steam_id: SteamId) -> Result<bool> {
         Ok(self.queue.lock().keys().any(|(sid, _)| *sid == steam_id))
     }
+
+    async fn get_queued_entry(&self, steam_id: SteamId) -> Result<Option<QueueEntry>> {
+        Ok(self
+            .queue
+            .lock()
+            .values()
+            .filter(|e| e.steam_id == steam_id)
+            .max_by_key(|e| e.queued_at)
+            .cloned())
+    }
 }
+
 
 #[async_trait]
 impl RatingStore for MockStore {

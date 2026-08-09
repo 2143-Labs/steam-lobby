@@ -152,6 +152,9 @@ pub trait QueueStore: Send + Sync {
     async fn remove_stale_queue_entries(&self, timeout: chrono::Duration) -> Result<Vec<SteamId>>;
     /// True if the player currently has a queue entry in any mode.
     async fn is_queued(&self, steam_id: SteamId) -> Result<bool>;
+    /// The player's current queue entry in any mode (newest first), for
+    /// session recovery on reconnect.
+    async fn get_queued_entry(&self, steam_id: SteamId) -> Result<Option<QueueEntry>>;
 }
 
 #[async_trait]

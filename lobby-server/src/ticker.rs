@@ -30,21 +30,14 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
 
         // server_arena (non-P2p) stays in-process: the Temporal migration is
         // p2p-only, so the ticker still pairs Server-type matches. P2p pairing
-        // is the MatchmakerWorkflow's job.
+        // is the pairing Schedule's job (a PairOnceWorkflow per 2s tick).
         for (mode, game_type) in &state.game_modes {
             if *game_type == lobby_core::types::GameType::P2p {
                 continue;
             }
             match state
-                .matchmaking_queue
-                .tick(
-                    mode,
-                    *game_type,
-                    &state.store,
-                    &state.store,
-                    &state.store,
-                    &state.store,
-                )
+                .store
+                .pair_next_match(mode, *game_type, state.config.pair_cooldown_secs as i64)
                 .await
             {
                 Ok(Some(match_info)) => {
@@ -192,7 +185,7 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                 }
             }
         }
-        if let Ok(removed) = state.matchmaking_queue.cleanup_stale(&state.store).await {
+        if let Ok(removed) = lobby_core::queue::cleanup_stale(&state.store).await {
             for sid in &removed {
                 // The entry is gone — the owner must be back in the menus so a
                 // later reconnect reports "in_menus", not a stale "queueing".
@@ -203,10 +196,19 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
             }
             if !removed.is_empty() {
                 let connections = state.connections.lock().await;
-                for sid in removed {
-                    if let Some(e) = connections.get(&sid) {
+                for sid in &removed {
+                    if let Some(e) = connections.get(sid) {
                         let _ = e.tx.send(ServerMessage::QueueExpired);
                     }
+                }
+                drop(connections);
+                // The sweep runs OUT of Temporal (in-process maintenance); the
+                // session must still learn its queue row is gone, so its
+                // `queued` copy clears and the player can re-queue. Send the
+                // signal after the client notification — a re-queue click only
+                // happens once the client has seen QueueExpired.
+                for sid in &removed {
+                    crate::temporal::signals::signal_queue_expired(&state, *sid).await;
                 }
             }
         }

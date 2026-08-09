@@ -323,10 +323,12 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
         .enter_menus(steam_id, &state.store)
         .await;
 
-    // Temporal path: start the player's UserSessionWorkflow (idempotent —
-    // same workflow_id restarts the session). Best-effort; None while
-    // Temporal is down.
-    crate::temporal::signals::start_user_session(&state, steam_id).await;
+    // Temporal path: start THIS connection's UserSessionWorkflow — a fresh
+    // session per connection (session UUID), so a crash-then-reconnect or a
+    // replaced connection starts a new workflow instead of colliding with the
+    // old one. Best-effort; None while Temporal is down.
+    let session_id = uuid::Uuid::new_v4().to_string();
+    crate::temporal::signals::start_user_session(&state, steam_id, &session_id).await;
 
     // Spawn the outbound message forwarder FIRST so the map entry can hold an
     // abort handle and kill a ghosted connection.
@@ -352,6 +354,7 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
                 tx: tx.clone(),
                 generation: my_gen,
                 abort: outbound_abort,
+                session_id: session_id.clone(),
             },
         ) {
             let _ = old.tx.send(ServerMessage::Error {
@@ -383,6 +386,7 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
                         handle_client_message(
                             cm,
                             steam_id,
+                            &session_id,
                             &state,
                             &tx,
                         )
@@ -424,12 +428,12 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
             .map(|e| e.generation == my_gen)
             .unwrap_or(false)
     };
-    if is_current {
-        // Temporal path: tell the session workflow the player left; its
-        // match-level timers (start window / report window) handle a silent
-        // player. Best-effort; None while Temporal is down.
-        crate::temporal::signals::signal_disconnect(&state, steam_id).await;
-    }
+    // Temporal path: end THIS connection's session workflow — unconditionally,
+    // because with per-connection sessions a connection that ends (including
+    // one replaced by a newer connection for the same player) must end its own
+    // workflow. The `is_current` guard below still decides the player-state
+    // reset (only the current connection's death resets the player).
+    crate::temporal::signals::signal_disconnect(&state, steam_id, &session_id).await;
     if is_current {
         // A brief drop keeps the player queued: the queue entry lives until
         // the stale sweep evicts it (30s without heartbeat), so a reconnect
@@ -572,6 +576,7 @@ async fn authenticate(
 async fn handle_client_message(
     cm: ClientMessage,
     steam_id: SteamId,
+    session_id: &str,
     state: &Arc<AppState>,
     _tx: &mpsc::UnboundedSender<ServerMessage>,
 ) {
@@ -585,14 +590,14 @@ async fn handle_client_message(
             };
             tracing::info!("player {steam_id} entered queue ({mode}, {difficulty})");
             // The UserSessionWorkflow's queue signal runs the enter_queue
-            // activity (player state + queue entry); the MatchmakerWorkflow
+            // activity (player state + queue entry); the pairing Schedule
             // pairs from there. Cutover: no in-process fallback — if Temporal
             // is down, the signal helper no-ops and the client is told nothing
             // (the server is considered unavailable for matchmaking).
-            crate::temporal::signals::signal_queue(state, steam_id, mode, diff).await;
+            crate::temporal::signals::signal_queue(state, steam_id, session_id, mode, diff).await;
         }
         ClientMessage::CancelMatchmaking => {
-            crate::temporal::signals::signal_unqueue(state, steam_id).await;
+            crate::temporal::signals::signal_unqueue(state, steam_id, session_id).await;
             tracing::info!("player {steam_id} left queue (cancelled)");
         }
         // ── Match lifecycle ──

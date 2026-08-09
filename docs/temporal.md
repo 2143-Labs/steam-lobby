@@ -14,49 +14,48 @@ match could sit in `InProgress`/`Reporting` forever. Workflow timers are
 durable — a killed server resumes the match from its last checkpoint, and every
 lifecycle timer is inspectable in the Temporal UI (`localhost:8233` locally).
 
-## The four workflows
+## The workflows
 
 ```
-                    ┌──────────────────────────────────────────┐
-                    │  UserSessionWorkflow                     │
-                    │  id: user-session-{steam_id}-{queue}     │
-                    │  lives until the disconnect signal       │
-                    └───────┬──────────────┬───────────────────┘
-                    queue/  │              │ match_found /
-                    unqueue │              │ match_complete
-                            ▼              ▼
-              ┌─────────────────┐   ┌──────────────────────┐
-              │ QueueWorkflow   │   │ P2PMatchWorkflow     │
-              │ id: queue-{id}- │   │ id: match-{token}    │
-              │      {mode}     │   │ accept → start →     │
-              │ enter_queue +   │   │ report (timers)      │
-              │ wait for cancel │   └──────────┬───────────┘
-              └─────────────────┘              │
-                              ┌────────────────┴─────────┐
-                              │ MatchmakerWorkflow        │
-                              │ id: matchmaker-{mode}-    │
-                              │      {queue}              │
-                              │ every 2s: pair_matches →  │
-                              │ start P2PMatchWorkflow    │
-                              └──────────────────────────┘
+          Schedule (per P2P mode)          ┌───────────────────────────┐
+          matchmaker-{mode}-{queue}  ────▶ │ PairOnceWorkflow          │
+          id: pair-{mode}-{queue}-{ts}     │
+          (single writer)                  │ one pair_matches activity │
+                                          └──────────┬────────────────┘
+                                                     │ creates the match
+                                                     ▼
+┌────────────────────────────────────────┐   ┌──────────────────────┐
+│  UserSessionWorkflow                   │   │ P2PMatchWorkflow     │
+│  id: user-session-{steam_id}-          │   │ id: match-{token}    │
+│       {session_id}  (per connection)   │   │ accept → start →     │
+│  queue/unqueue/match_found/            │   │ report (timers)      │
+│  queue_expired/disconnect signals      │   └──────────┬───────────┘
+│  ends on disconnect or 24h TTL         │              │
+└────────────────────────────────────────┘              │
 ```
 
-- **`UserSessionWorkflow`** — one per logged-in player. Holds the player's
-  queue/match state; ends on the `disconnect` signal (cancelling a pending
-  queue child).
-- **`QueueWorkflow`** (child of a session) — pure queueing state holder: runs
-  `enter_queue` on start, waits for cancellation. The MatchmakerWorkflow does
-  the actual pairing.
-- **`MatchmakerWorkflow`** — one per **P2P** game mode, started at server boot.
-  Every 2s runs the `pair_matches` activity: MMR-band pairing (the
-  `lobby_core::queue` logic), `create_match` + `Paired` event, MatchFound
-  broadcast, session `match_found` signals, then starts the P2P workflow.
+- **`UserSessionWorkflow`** — one per **WS connection** (session UUID in the
+  workflow ID). On start it `sync_session`-recovers the player's queue entry
+  from the DB (reconnect-while-queued), then lives on signals:
+  `queue`/`unqueue`/`match_found`/`queue_expired`/`disconnect`. It ends when
+  the `disconnect` signal arrives **or** the 24h TTL fires — there is no flow
+  that runs forever.
+- **`PairOnceWorkflow`** — the Schedule's per-tick pairing run: one
+  `pair_matches` activity, then returns. A 2s **Schedule** per P2P mode fires
+  it (`ScheduleOverlapPolicy::Skip` = single writer: the server appends a
+  timestamp to each scheduled workflow ID — the task-queue suffix keeps
+  parallel workers' runs distinct, and Skip — not the ID — prevents concurrent
+  pairing runs). Pairing itself is one transaction
+  (`PostgresStore::pair_next_match`, `FOR UPDATE`): scan the
+  queue, MMR-band pair, delete both rows + insert the match + `Paired` event
+  atomically.
 - **`P2PMatchWorkflow`** — the coordinator and **sole lifecycle writer** for a
   match. Phases, each a workflow timer raced against client signals:
   1. **Accept window** (30s, `MATCH_ACCEPT_TIMEOUT_S`): both
      `match_choice{accept:true}` → `mark_accepts` (InProgress + `match_started`
-     broadcast); any decline or timeout → `handle_decline` (Disputed +
-     `match_declined` to both).
+     broadcast); any decline → `handle_decline` (Disputed + `match_declined`
+     to both, recording the **real decliner**); timeout → `handle_decline`
+     with no actor.
   2. **START window** (15s, `LOBBY_START_TIMEOUT_SECS`): both `start` signals
      → `mark_connected` (Reporting + `opponent_connected` + spawn the pong
      referee for playback); timeout → `resolve_start_forfeit` (starter wins,
@@ -66,26 +65,33 @@ lifecycle timer is inspectable in the Temporal UI (`localhost:8233` locally).
      `game_over`/`match_result` broadcasts); disagree or timeout →
      `resolve_dispute` (Disputed).
 
-## Activities
-
-`lobby-server/src/temporal/activities.rs` — `LobbyActivities { state:
-Arc<AppState> }`, the only place DB + broadcast work happens (workflow code
-itself is pure and deterministic):
+**Design rule: no workflow loops, no unending flows.** Pairing is a Schedule
+of short-lived `PairOnceWorkflow` runs (the old `MatchmakerWorkflow`'s
+`loop {}` is gone — it grew ~345k history events/day, past Temporal's 50k
+limit). Every workflow terminates on all paths. The queue itself is the
+`matchmaking_queue` DB row, not a workflow: the per-player lifecycle is the
+session's signals, and the ticker's stale-entry sweep runs **out of Temporal**
+and notifies the session via the `queue_expired` signal (so a queue-expired
+player can re-queue).
 
 `accept_match`, `mark_connected` (also spawns the playback referee),
 `mark_accepts`, `handle_decline`, `finish_match`, `resolve_dispute`,
-`resolve_start_forfeit`, `pair_matches`, `enter_queue` (also refreshes
-heartbeat liveness), `leave_queue`, `set_player_state`, `verify_match`.
+`resolve_start_forfeit`, `pair_matches` (one `pair_next_match` transaction),
+`sync_session` (state + queue-entry recovery for session start),
+`enter_queue` (also refreshes heartbeat liveness), `leave_queue`,
+`set_player_state`, `verify_match`.
 
-## Signals (WS handler → workflow)
+## Signals (WS handler / ticker → workflow)
 
 The WS handlers (`ws.rs`) never call `MatchManager` directly; they signal
 workflows via `state.temporal` (`lobby-server/src/temporal/signals.rs`):
-`start_user_session` (auth), `queue`/`unqueue` (matchmaking),
-`match_choice` (accept/decline), `start`, `who_won` + `submit_demo` (report),
-`disconnect`. If Temporal is down (`state.temporal` is `None`), the helpers
-no-op — the server is considered unavailable for matchmaking (there is no
-in-process fallback; the cutover deleted it).
+`start_user_session` (auth, per connection), `queue`/`unqueue` (matchmaking,
+scoped to the connection's session), `match_choice` (accept/decline), `start`,
+`who_won` + `submit_demo` (report), `disconnect`. The ticker's out-of-Temporal
+stale-entry sweep signals `queue_expired` to the session. If Temporal is down
+(`state.temporal` is `None`), the helpers no-op — the server is considered
+unavailable for matchmaking (there is no in-process fallback; the cutover
+deleted it).
 
 ## The referee is playback-only
 

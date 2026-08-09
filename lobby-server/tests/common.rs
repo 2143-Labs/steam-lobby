@@ -14,7 +14,7 @@ pub struct TestHarness {
     pub base_url: String,                // "http://127.0.0.1:PORT"
     pub ws_url: String,                  // "ws://127.0.0.1:PORT/ws"
     pub pool: PgPool, // the injected test pool (≤5 conns, parented to sqlx's master pool)
-    _state: Arc<lobby_server::AppState>, // keep alive so ticker keeps running
+    pub state: Arc<lobby_server::AppState>, // keep alive so ticker keeps running
     _server: tokio::task::JoinHandle<()>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
@@ -29,7 +29,7 @@ impl Drop for TestHarness {
         // test DB drops (its matchmaker workflow would otherwise keep
         // scheduling activities against the closing pool).
         if let Some(h) = self
-            ._state
+            .state
             .temporal_shutdown
             .write()
             .ok()
@@ -39,6 +39,22 @@ impl Drop for TestHarness {
         }
         let _ = self.shutdown_tx.send(true);
         self._server.abort();
+    }
+}
+
+impl TestHarness {
+    /// Describe a workflow execution by ID and return its status string
+    /// ("Running", "Completed", "Failed", ...). `None` if Temporal is down or
+    /// the workflow doesn't exist.
+    pub async fn workflow_status(&self, workflow_id: &str) -> Option<String> {
+        let client = self.state.temporal.read().ok()?.clone()?;
+        let handle =
+            client.get_workflow_handle::<temporalio_client::UntypedWorkflow>(workflow_id);
+        handle
+            .describe(Default::default())
+            .await
+            .ok()
+            .map(|d| format!("{:?}", d.status()))
     }
 }
 
@@ -269,7 +285,7 @@ async fn setup_full_impl(
         base_url: format!("http://{addr}"),
         ws_url: format!("ws://{addr}/ws"),
         pool,
-        _state: state,
+        state,
         _server: server,
         shutdown_tx,
     }

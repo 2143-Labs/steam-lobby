@@ -1,6 +1,6 @@
-//! Temporal integration: the in-process worker that runs the four lifecycle
-//! workflows (`UserSessionWorkflow`, `QueueWorkflow`, `MatchmakerWorkflow`,
-//! `P2PMatchWorkflow`) plus the `LobbyActivities` they drive.
+//! Temporal integration: the in-process worker that runs the lifecycle
+//! workflows (`UserSessionWorkflow`, `PairOnceWorkflow`, `P2PMatchWorkflow`)
+//! plus the `LobbyActivities` they drive.
 //!
 //! The worker lives inside the lobby-server binary (same axum process, one
 //! Deployment). `start_temporal` connects to the configured Temporal frontend,
@@ -100,56 +100,77 @@ async fn run_worker_inner(
 
     let worker_options = WorkerOptions::new(&state.config.temporal_task_queue)
         .register_workflow::<workflows::UserSessionWorkflow>()?
-        .register_workflow::<workflows::QueueWorkflow>()?
-        .register_workflow::<workflows::MatchmakerWorkflow>()?
+        .register_workflow::<workflows::PairOnceWorkflow>()?
         .register_workflow::<workflows::P2PMatchWorkflow>()?
         .register_activities(activities::LobbyActivities {
             state: state.clone(),
         })
         .build();
 
-    // Start one MatchmakerWorkflow per P2P game mode (replaces the ticker's
-    // pairing loop). server_arena (GameType::Server) stays in-process — the
-    // ticker still pairs it and the gameserver allocation/expiry path owns
-    // its lifecycle (out of scope for v1). Best-effort; a failed start logs
-    // and the mode simply has no matchmaking until the next restart.
+    // One Schedule per P2P game mode fires a short `PairOnceWorkflow` every 2s
+    // (replaces the old per-mode MatchmakerWorkflow `loop {}` — bounded
+    // history). `ScheduleOverlapPolicy::Skip` is the single-writer guarantee:
+    // the server appends a timestamp to each scheduled workflow ID, so Skip —
+    // not the `pair-{mode}` prefix — prevents concurrent pairing runs (the
+    // `FOR UPDATE` in `pair_next_match` is the second line of defense).
+    // server_arena (GameType::Server) stays in-process — the ticker still
+    // pairs it. Schedules survive restarts by design (creating an existing ID
+    // is an error, handled below); the worker deletes only the schedules THIS
+    // boot created on shutdown, so tests don't accumulate schedules on the
+    // dev Temporal while production (which never stops the worker) persists.
+    let mut created_schedules: Vec<String> = Vec::new();
     for (mode, game_type) in &state.game_modes {
         if *game_type != lobby_core::types::GameType::P2p {
             continue;
         }
+        let schedule_id = format!("matchmaker-{mode}-{}", state.config.temporal_task_queue);
         match client
-            .start_workflow(
-                workflows::MatchmakerWorkflow::run,
-                workflows::MatchmakerArgs {
-                    mode: mode.clone(),
-                    accept_timeout_secs: state.config.match_accept_timeout_secs,
-                    start_timeout_secs: state.config.start_timeout_secs,
-                    report_timeout_secs: state.config.report_timeout_secs,
-                },
-                temporalio_client::WorkflowStartOptions::new(
-                    &state.config.temporal_task_queue,
-                    format!("matchmaker-{mode}-{}", state.config.temporal_task_queue),
-                )
-                .build(),
+            .create_schedule(
+                &schedule_id,
+                temporalio_client::schedules::CreateScheduleOptions::builder()
+                    .action(temporalio_client::schedules::ScheduleAction::start_workflow(
+                        workflows::PairOnceWorkflow::run,
+                        workflows::PairOnceArgs { mode: mode.clone() },
+                        &state.config.temporal_task_queue,
+                        // The task queue suffix keeps parallel workers' runs
+                        // distinct: Temporal appends only a 1-second-resolution
+                        // timestamp to the workflow ID, so two schedules firing
+                        // in the same second (e.g. the test suite's per-test
+                        // workers) would otherwise collide on one ID.
+                        format!("pair-{mode}-{}", state.config.temporal_task_queue),
+                    ))
+                    .spec(temporalio_client::schedules::ScheduleSpec::from_interval(
+                        std::time::Duration::from_secs(2),
+                    ))
+                    .overlap_policy(
+                        temporalio_client::schedules::ScheduleOverlapPolicy::Skip,
+                    )
+                    .build(),
             )
             .await
         {
-            Ok(_) => tracing::info!("matchmaker workflow started for {mode}"),
+            Ok(_) => {
+                created_schedules.push(schedule_id);
+                tracing::info!("pairing schedule created for {mode}");
+            }
             Err(e) => {
-                // Already started (server restart with a running matchmaker) is
-                // expected — the existing workflow keeps matching. Anything
-                // else is a real problem.
-                let msg = e.to_string();
-                if msg.contains("already started") {
-                    tracing::debug!("matchmaker workflow already running for {mode}");
+                // Idempotent boot: the schedule already exists (it survives
+                // restarts by design) — keep it. Anything else is a real error.
+                let exists = client
+                    .get_schedule_handle(&schedule_id)
+                    .describe(Default::default())
+                    .await
+                    .is_ok();
+                if exists {
+                    tracing::debug!("pairing schedule already exists for {mode}");
                 } else {
-                    tracing::warn!("failed to start matchmaker workflow for {mode}: {e}");
+                    tracing::warn!("failed to create pairing schedule for {mode}: {e}");
                 }
             }
         }
     }
 
-    let mut worker = Worker::new(&runtime, client, worker_options)
+    let mut worker = Worker::new(&runtime, client.clone(), worker_options)
         .map_err(|e| anyhow::anyhow!("worker init failed: {e}"))?;
     // Hand the caller (the test harness) a shutdown handle so it can stop the
     // worker at teardown; production drops the receiver.
@@ -160,5 +181,12 @@ async fn run_worker_inner(
         state.config.temporal_namespace
     );
     worker.run().await?;
+    // Worker stopped (the test harness fired the shutdown handle): delete the
+    // schedules this boot created so tests don't accumulate schedules on the
+    // dev Temporal. Production never stops the worker, so this is a no-op
+    // there — schedules persist across restarts by design.
+    for id in &created_schedules {
+        let _ = client.get_schedule_handle(id).delete(Default::default()).await;
+    }
     Ok(())
 }

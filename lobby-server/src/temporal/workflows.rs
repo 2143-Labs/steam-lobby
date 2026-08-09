@@ -1,4 +1,4 @@
-//! The four lifecycle workflows. Determinism rules (the SDK enforces these at
+//! The lifecycle workflows. Determinism rules (the SDK enforces these at
 //! runtime — the nondeterminism detector is on by default): workflow code may
 //! NOT use tokio/futures primitives, std time, or I/O — use `ctx.timer()`,
 //! `ctx.wait_condition()`, signals, and activities. All DB + WS work lives in
@@ -6,13 +6,18 @@
 //!
 //! Workflow structs are plain serializable state with `#[derive(Default)]`;
 //! `Arc<AppState>` reaches them only through activities.
+//!
+//! Every workflow terminates: `UserSessionWorkflow` ends on the disconnect
+//! signal or its 24h TTL; `PairOnceWorkflow` returns after one activity; the
+//! `P2PMatchWorkflow` races timers against wait-conditions and every branch
+//! returns. There is deliberately NO long-lived queue/matchmaker workflow —
+//! the queue is the `matchmaking_queue` DB row, driven by session signals.
 use std::sync::Arc;
 use std::time::Duration;
 
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, ChildWorkflowOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
-    workflows::select,
+    ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult, workflows::select,
 };
 
 use lobby_core::types::{MatchDifficulty, MatchInfo, PlayerState, SteamId};
@@ -40,11 +45,8 @@ pub struct MatchCompleteArgs {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
-pub struct MatchmakerArgs {
+pub struct PairOnceArgs {
     pub mode: String,
-    pub accept_timeout_secs: u64,
-    pub start_timeout_secs: u64,
-    pub report_timeout_secs: u64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -87,8 +89,9 @@ fn short_activity() -> ActivityOptions {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. UserSessionWorkflow — one per logged-in player. Owns the session: queue
-//    state, in-match flag, disconnect. Child QueueWorkflow per queue entry.
+// 1. UserSessionWorkflow — one per WS connection. Owns the session: queue
+//    state, in-match flag, disconnect. Driven entirely by signals; the queue
+//    is the DB row, so there is no child workflow.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[workflow]
@@ -103,20 +106,51 @@ pub struct UserSessionWorkflow {
 
 #[workflow_methods]
 impl UserSessionWorkflow {
+    /// Runs before any signal: the session's steam_id is visible to signal
+    /// handlers (a queue/unqueue signal delivered in the workflow's first
+    /// task must not see the default 0).
+    #[init]
+    pub fn init(_ctx: &temporalio_sdk::WorkflowContextView, args: SessionArgs) -> Self {
+        Self {
+            steam_id: args.steam_id,
+            ..Default::default()
+        }
+    }
+
     #[run]
-    pub async fn run(ctx: &mut WorkflowContext<Self>, args: SessionArgs) -> WorkflowResult<()> {
-        ctx.state_mut(|s| s.steam_id = args.steam_id);
-        // Ends when the disconnect signal arrives.
-        ctx.wait_condition(|s| s.disconnected).await;
-        // On disconnect, cancel a still-pending queue child (best-effort).
-        if let Some(queued) = ctx.state(|s| s.queued.clone()) {
-            let _ = ctx
-                .external_workflow(format!("queue-{}-{}", queued.steam_id, queued.mode), None)
-                .cancel(Some("session disconnected".into()))
-                .await;
+    pub async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        // Recover reconnect-while-queued: adopt the DB queue entry so unqueue
+        // works on the new session. The DB row IS the queue — there is no child
+        // workflow to re-link.
+        let steam_id = ctx.state(|s| s.steam_id);
+        if let Ok(sync) = ctx
+            .execute_activity(
+                activities::LobbyActivities::sync_session,
+                steam_id,
+                short_activity(),
+            )
+            .await
+        {
+            ctx.state_mut(|s| {
+                s.queued = sync.queued.map(|q| QueueArgs {
+                    steam_id: q.steam_id,
+                    mode: q.game_mode,
+                    difficulty: q.difficulty,
+                });
+            });
+        }
+        // 24h TTL: kills orphaned sessions whose disconnect signal was lost
+        // (server crash mid-flight). A live connection re-creates its session
+        // on the next reconnect anyway. Deterministic select! — the SDK's
+        // updatable-timer shape (already used at the P2P phase-2 select).
+        const SESSION_TTL: u64 = 24 * 3600;
+        select! {
+            _ = ctx.timer(Duration::from_secs(SESSION_TTL)) => {}
+            _ = ctx.wait_condition(|s| s.disconnected) => {}
         }
         Ok(())
     }
+
 
     #[signal]
     pub async fn queue(ctx: &mut WorkflowContext<Self>, args: QueueArgs) {
@@ -137,21 +171,43 @@ impl UserSessionWorkflow {
                 short_activity(),
             )
             .await;
-        let _ = ctx
-            .start_child_workflow(
-                crate::temporal::workflows::QueueWorkflow::run,
-                args.clone(),
-                ChildWorkflowOptions::workflow_id(format!("queue-{}-{}", args.steam_id, args.mode)),
-            )
-            .await;
         ctx.state_mut(|s| s.queued = Some(args));
     }
 
     #[signal]
     pub async fn unqueue(ctx: &mut WorkflowContext<Self>) {
-        let Some(queued) = ctx.state(|s| s.queued.clone()) else {
-            return;
+        let steam_id = ctx.state(|s| s.steam_id);
+        let queued = match ctx.state(|s| s.queued.clone()) {
+            Some(q) => q,
+            None => {
+                // Fresh session (reconnect): the run's sync_session recovery
+                // may not have landed yet, and an unqueue signal racing it
+                // would see an empty copy. The queue ROW is authoritative —
+                // read it directly (idempotent; the run's own sync does the
+                // same read).
+                let Ok(sync) = ctx
+                    .execute_activity(
+                        activities::LobbyActivities::sync_session,
+                        steam_id,
+                        short_activity(),
+                    )
+                    .await
+                else {
+                    return;
+                };
+                let Some(q) = sync.queued else { return; };
+                QueueArgs {
+                    steam_id: q.steam_id,
+                    mode: q.game_mode,
+                    difficulty: q.difficulty,
+                }
+            }
         };
+        // Clear the session's queue copy FIRST: the queue signal's re-queue
+        // guard reads it, and a re-queue arriving while the DB cleanup below
+        // is in flight must not be swallowed. leave_queue's DELETE and the
+        // re-queue's enter_queue upsert (ON CONFLICT) make row order moot.
+        ctx.state_mut(|s| s.queued = None);
         let _ = ctx
             .execute_activity(
                 activities::LobbyActivities::leave_queue,
@@ -159,26 +215,23 @@ impl UserSessionWorkflow {
                 short_activity(),
             )
             .await;
-        let _ = ctx
-            .execute_activity(
-                activities::LobbyActivities::set_player_state,
-                (queued.steam_id, PlayerState::InMenus),
-                short_activity(),
-            )
-            .await;
-        ctx.state_mut(|s| s.queued = None);
+        // A re-queue may have landed while the cleanup ran (its handler set
+        // s.queued back to Some and scheduled its own Queueing write): don't
+        // clobber that with a stale InMenus reset.
+        if !ctx.state(|s| s.queued.is_some()) {
+            let _ = ctx
+                .execute_activity(
+                    activities::LobbyActivities::set_player_state,
+                    (queued.steam_id, PlayerState::InMenus),
+                    short_activity(),
+                )
+                .await;
+        }
     }
 
     #[signal]
     pub async fn match_found(ctx: &mut WorkflowContext<Self>, args: MatchFoundArgs) {
         let steam_id = ctx.state(|s| s.steam_id);
-        // Cancel the queue child (we leave the queue implicitly on match).
-        if let Some(queued) = ctx.state(|s| s.queued.clone()) {
-            let _ = ctx
-                .external_workflow(format!("queue-{}-{}", queued.steam_id, queued.mode), None)
-                .cancel(Some("match found".into()))
-                .await;
-        }
         let _ = ctx
             .execute_activity(
                 activities::LobbyActivities::set_player_state,
@@ -213,68 +266,42 @@ impl UserSessionWorkflow {
     pub fn disconnect(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {
         self.disconnected = true;
     }
+    /// The ticker's stale-entry sweep dropped our queue row (out of Temporal —
+    /// the cleanup runs in-process). Clear the session's `queued` copy so the
+    /// player can re-queue; the ticker already reset the DB player state.
+    #[signal]
+    pub fn queue_expired(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {
+        self.queued = None;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. QueueWorkflow — child of a session per queue entry. Pure state holder:
-//    enter_queue on start, then waits for cancellation (the session cancels it
-//    on unqueue/match_found/disconnect). The MatchmakerWorkflow does pairing.
+// 2. PairOnceWorkflow — the Schedule's per-tick pairing run. One activity, then
+//    returns. A 2s Schedule per P2P mode fires it; ScheduleOverlapPolicy::Skip
+//    prevents concurrent runs. The activity starts the P2PMatchWorkflow and
+//    signals both sessions' `match_found` before returning.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[workflow]
 #[derive(Default)]
-pub struct QueueWorkflow;
+pub struct PairOnceWorkflow;
 
 #[workflow_methods]
-impl QueueWorkflow {
+impl PairOnceWorkflow {
     #[run]
-    pub async fn run(ctx: &mut WorkflowContext<Self>, args: QueueArgs) -> WorkflowResult<()> {
+    pub async fn run(ctx: &mut WorkflowContext<Self>, args: PairOnceArgs) -> WorkflowResult<()> {
         ctx.execute_activity(
-            activities::LobbyActivities::enter_queue,
-            args,
+            activities::LobbyActivities::pair_matches,
+            args.mode,
             short_activity(),
         )
         .await?;
-        // Wait until the parent session cancels us (unqueue, match_found, or
-        // disconnect). `ctx.cancelled()` resolves when a cancel request lands.
-        ctx.cancelled().await;
         Ok(())
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. MatchmakerWorkflow — one per game mode, started at boot. Replaces the 2s
-//    ticker's pairing loop: every 2s run the pair_matches activity for the
-//    mode. The activity signals both sessions' `match_found` and returns the
-//    formed match; this workflow starts the P2PMatchWorkflow for it.
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[workflow]
-#[derive(Default)]
-pub struct MatchmakerWorkflow;
-
-#[workflow_methods]
-impl MatchmakerWorkflow {
-    #[run]
-    pub async fn run(ctx: &mut WorkflowContext<Self>, args: MatchmakerArgs) -> WorkflowResult<()> {
-        loop {
-            ctx.timer(Duration::from_secs(2)).await;
-            // pair_matches: scan queue, pair by MMR band, create_match + record
-            // the event, START the P2PMatchWorkflow, then broadcast MatchFound
-            // and signal both sessions. The activity owns the P2P-workflow
-            // start so clients can never accept before the workflow exists.
-            ctx.execute_activity(
-                activities::LobbyActivities::pair_matches,
-                args.mode.clone(),
-                short_activity(),
-            )
-            .await?;
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 4. P2PMatchWorkflow — the coordinator. workflow_id = match-{token}. No server
+// 3. P2PMatchWorkflow — the coordinator. workflow_id = match-{token}. No server
 //    referee in the workflow (p2p-first): it coordinates accept → start window
 //    → finish. Each phase races ctx.timer against ctx.wait_condition inside the
 //    SDK's deterministic `select!` (the v0.6.0 updatable_timer shape).
@@ -285,6 +312,8 @@ impl MatchmakerWorkflow {
 pub struct P2PMatchWorkflow {
     accepts: Vec<SteamId>,
     declined: bool,
+    /// Who declined (for the audit event); None = accept-timeout (no actor).
+    declined_by: Option<SteamId>,
     started: Vec<SteamId>,
     who_won: Vec<(SteamId, SteamId)>,
     demo_hashes: Vec<(SteamId, String)>,
@@ -308,9 +337,10 @@ impl P2PMatchWorkflow {
         // / anyone declined".
         select! {
             _ = ctx.timer(Duration::from_secs(args.accept_timeout_secs)) => {
+                // Accept-timeout is NOT a decline — no actor in the event.
                 ctx.execute_activity(
                     activities::LobbyActivities::handle_decline,
-                    (MatchStateArgs { match_token: args.match_token.clone() }, args.player_a),
+                    (MatchStateArgs { match_token: args.match_token.clone() }, None),
                     short_activity(),
                 ).await?;
                 return Ok(());
@@ -322,7 +352,7 @@ impl P2PMatchWorkflow {
                         && s.accepts.contains(&args.player_b))
             }) => {
                 if ctx.state(|s| s.declined) {
-                    let declined_by = ctx.state(|s| s.accepts.first().copied()).unwrap_or(args.player_a);
+                    let declined_by = ctx.state(|s| s.declined_by);
                     ctx.execute_activity(
                         activities::LobbyActivities::handle_decline,
                         (MatchStateArgs { match_token: args.match_token.clone() }, declined_by),
@@ -461,6 +491,7 @@ impl P2PMatchWorkflow {
             }
         } else {
             self.declined = true;
+            self.declined_by = Some(args.steam_id);
         }
     }
 
@@ -536,9 +567,20 @@ pub(crate) async fn notify_match_found(state: &Arc<AppState>, m: &MatchInfo) {
         return;
     };
     for pid in [m.player_a, m.player_b] {
+        // Per-connection sessions: target the CURRENT connection's session.
+        // No connection -> the player is offline, so there is no session to
+        // signal (the MatchFound broadcast still reached the client).
+        let Some(session_id) = state
+            .connections
+            .lock()
+            .await
+            .get(&pid)
+            .map(|e| e.session_id.clone())
+        else {
+            continue;
+        };
         let handle = client.get_workflow_handle::<UserSessionWorkflow>(format!(
-            "user-session-{pid}-{}",
-            state.config.temporal_task_queue
+            "user-session-{pid}-{session_id}"
         ));
         let _ = handle
             .signal(
@@ -557,9 +599,20 @@ pub(crate) async fn signal_session_complete(state: &Arc<AppState>, steam_id: Ste
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
     };
+    // Per-connection sessions: the match_complete signal goes to the CURRENT
+    // connection's session (the one that entered the match). No connection ->
+    // the player is offline; the match already reset their DB state.
+    let Some(session_id) = state
+        .connections
+        .lock()
+        .await
+        .get(&steam_id)
+        .map(|e| e.session_id.clone())
+    else {
+        return;
+    };
     let handle = client.get_workflow_handle::<UserSessionWorkflow>(format!(
-        "user-session-{steam_id}-{}",
-        state.config.temporal_task_queue
+        "user-session-{steam_id}-{session_id}"
     ));
     let _ = handle
         .signal(

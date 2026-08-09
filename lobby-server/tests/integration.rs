@@ -1772,3 +1772,301 @@ async fn pong_broadcasts_round_start_and_holds(pool: sqlx::PgPool) {
     drop(p1);
     drop(p2);
 }
+
+// ── Schedule + queue-lifecycle regressions (matchmaker plan) ─────────────────
+
+#[sqlx::test]
+async fn pair_next_match_atomicity(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
+
+    // Two queued players (Queueing state) for ranked_1v1, seeded directly.
+    for sid in [1001u64, 1002u64] {
+        sqlx::query("INSERT INTO users (steam_id, display_name) VALUES ($1, 'atomic-test')")
+            .bind(sid as i64)
+            .execute(&h.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO player_state (steam_id, state, last_heartbeat) \
+             VALUES ($1, 'Queueing', NOW())",
+        )
+        .bind(sid as i64)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO matchmaking_queue (steam_id, game_mode, match_difficulty, mu, queued_at) \
+             VALUES ($1, 'ranked_1v1', 'normal', 25.0, NOW())",
+        )
+        .bind(sid as i64)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    }
+
+    // Two concurrent pairers: the FOR UPDATE transaction serializes them —
+    // exactly one forms the match, the other sees an empty queue.
+    let (ra, rb) = tokio::join!(
+        h.state
+            .store
+            .pair_next_match("ranked_1v1", lobby_core::types::GameType::P2p, 300),
+        h.state
+            .store
+            .pair_next_match("ranked_1v1", lobby_core::types::GameType::P2p, 300),
+    );
+    let formed = [ra, rb]
+        .iter()
+        .filter(|r| matches!(r, Ok(Some(_))))
+        .count();
+    assert_eq!(formed, 1, "exactly one pairer must form the match");
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM matches WHERE game_mode = 'ranked_1v1'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1, "exactly one match row for the mode");
+}
+
+#[sqlx::test]
+async fn requeue_after_unqueue_pairs(pool: sqlx::PgPool) {
+    let h = setup_temporal(pool).await;
+
+    let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    p1.authenticate_test_token(803, &h.base_url).await.unwrap();
+    p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+
+    // Wait for the entry, then unqueue.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let queued: Option<i64> =
+            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 803")
+                .fetch_optional(&h.pool)
+                .await
+                .unwrap();
+        if queued.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queue row never appeared for the queued player"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    p1.cancel_matchmaking().await.unwrap();
+
+    // The leave_queue activity removes the row asynchronously.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let queued: Option<i64> =
+            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 803")
+                .fetch_optional(&h.pool)
+                .await
+                .unwrap();
+        if queued.is_none() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queue row never removed after unqueue"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Re-queue, then queue a second player: both must get the same match (the
+    // re-queue failure regression — the second queue signal used to be
+    // swallowed by the queue-child "already started" error).
+    p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+    let mut p2 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    p2.authenticate_test_token(804, &h.base_url).await.unwrap();
+    p2.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+
+    let m1 = timeout(Duration::from_secs(15), p1.wait_for_match())
+        .await
+        .expect("p1 match within 15s")
+        .unwrap()
+        .unwrap();
+    let m2 = timeout(Duration::from_secs(15), p2.wait_for_match())
+        .await
+        .expect("p2 match within 15s")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        m1.match_token, m2.match_token,
+        "both players must get the same match"
+    );
+
+    drop(p1);
+    drop(p2);
+}
+
+#[sqlx::test]
+async fn reconnect_then_unqueue_removes_entry(pool: sqlx::PgPool) {
+    let h = setup_temporal(pool).await;
+
+    let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    p1.authenticate_test_token(805, &h.base_url).await.unwrap();
+    p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let queued: Option<i64> =
+            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 805")
+                .fetch_optional(&h.pool)
+                .await
+                .unwrap();
+        if queued.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queue row never appeared for the queued player"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Brief drop (the entry survives the 30s stale window), then reconnect:
+    // the fresh per-connection session must recover the queued state via
+    // sync_session, so unqueue still acts on the DB row.
+    drop(p1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut p2 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    p2.authenticate_test_token(805, &h.base_url).await.unwrap();
+    p2.cancel_matchmaking().await.unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let queued: Option<i64> =
+            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 805")
+                .fetch_optional(&h.pool)
+                .await
+                .unwrap();
+        if queued.is_none() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "recovered session must be able to unqueue"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    drop(p2);
+}
+
+#[sqlx::test]
+async fn p2p_match_workflow_decline_completes(pool: sqlx::PgPool) {
+    let h = setup_temporal(pool).await;
+    let (mut p1, mut p2, token) = pair_up(&h, 801, 802, "ranked_1v1").await;
+
+    // p1 accepts first — the pre-fix code recorded the ACCEPTOR (p1) as the
+    // decliner when one player accepted before the other declined.
+    p1.accept_match(&token).await.unwrap();
+    p2.decline_match(&token).await.unwrap();
+
+    // (a) The match workflow must COMPLETE — not linger in the accept wait.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if h
+            .workflow_status(&format!("match-{token}"))
+            .await
+            .as_deref()
+            == Some("Completed")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "match workflow never completed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // (b) The declined event records the REAL decliner (p2), not the acceptor.
+    let decliner: Option<i64> = sqlx::query_scalar(
+        "SELECT steam_id FROM match_events WHERE match_token = $1 AND event_type = 'declined'",
+    )
+    .bind(&token)
+    .fetch_optional(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        decliner,
+        Some(802),
+        "declined event must record the real decliner"
+    );
+
+    drop(p1);
+    drop(p2);
+}
+
+#[sqlx::test]
+async fn queue_expired_allows_requeue(pool: sqlx::PgPool) {
+    let h = setup_temporal(pool).await;
+
+    let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
+    p1.authenticate_test_token(806, &h.base_url).await.unwrap();
+    p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+
+    // Wait for the entry, then age the heartbeat past the 30s stale window.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let queued: Option<i64> =
+            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 806")
+                .fetch_optional(&h.pool)
+                .await
+                .unwrap();
+        if queued.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queue row never appeared for the queued player"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    sqlx::query(
+        "UPDATE player_state SET last_heartbeat = NOW() - INTERVAL '40 seconds' WHERE steam_id = 806",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    // The ticker evicts the entry and must tell the client QueueExpired.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    let mut expired = false;
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(2), p1.next_event()).await {
+            Ok(Some(Ok(lobby_client::ServerEvent::QueueExpired))) => {
+                expired = true;
+                break;
+            }
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(e))) => panic!("client error: {e}"),
+            Ok(None) => break,
+        }
+    }
+    assert!(expired, "queued player must be told when its entry expires");
+
+    // Re-queue: BEFORE the queue_expired signal, the session's `queued` copy
+    // was never cleared, so this signal was swallowed and no row reappeared.
+    p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let queued: Option<i64> =
+            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 806")
+                .fetch_optional(&h.pool)
+                .await
+                .unwrap();
+        if queued.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queue-expired player must be able to re-queue"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    drop(p1);
+}

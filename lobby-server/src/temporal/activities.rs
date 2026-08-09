@@ -8,7 +8,8 @@ use std::sync::Arc;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 
 use lobby_core::types::{
-    GameType, MatchDifficulty, MatchEvent, MatchInfo, MatchStatus, PlayerState, SteamId,
+    GameType, MatchDifficulty, MatchEvent, MatchInfo, MatchStatus, PlayerState, QueueEntry,
+    SteamId,
 };
 
 use lobby_core::traits::{MatchStore, PlayerStore, QueueStore};
@@ -51,6 +52,15 @@ pub struct StartForfeitArgs {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct PairResult {
     pub match_info: Option<MatchInfo>,
+}
+
+/// Raw DB shapes for session start: the player's state + current queue entry,
+/// recovered so a reconnect-while-queued player can unqueue on the new session.
+/// The session run does the mapping (QueueEntry -> QueueArgs).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SessionSync {
+    pub state: PlayerState,
+    pub queued: Option<QueueEntry>,
 }
 
 pub struct LobbyActivities {
@@ -155,7 +165,7 @@ impl LobbyActivities {
         self: Arc<Self>,
         _ctx: ActivityContext,
         args: MatchStateArgs,
-        declined_by: SteamId,
+        declined_by: Option<SteamId>,
     ) -> Result<(), ActivityError> {
         let state = self.state.clone();
         let token = args.match_token;
@@ -177,7 +187,7 @@ impl LobbyActivities {
         }
         let _ = state
             .store
-            .record_match_event(&token, MatchEvent::Declined, Some(declined_by))
+            .record_match_event(&token, MatchEvent::Declined, declined_by)
             .await;
         Ok(())
     }
@@ -347,14 +357,11 @@ impl LobbyActivities {
             .unwrap_or(GameType::P2p);
         let match_info = match self
             .state
-            .matchmaking_queue
-            .tick(
+            .store
+            .pair_next_match(
                 &mode,
                 game_type,
-                &self.state.store,
-                &self.state.store,
-                &self.state.store,
-                &self.state.store,
+                self.state.config.pair_cooldown_secs as i64,
             )
             .await
         {
@@ -516,5 +523,22 @@ impl LobbyActivities {
             Ok(None) => Err(lobby_core::error::LobbyError::MatchNotFound(args.match_token).into()),
             Err(e) => Err(e.into()),
         }
+    }
+    /// Recover the raw DB state for a session start: the player's state +
+    /// current queue entry (reconnect-while-queued). The session run maps the
+    /// queue entry to `QueueArgs` — the recovered session_id must be the NEW
+    /// session's, which only the run knows.
+    #[activity]
+    pub async fn sync_session(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        steam_id: SteamId,
+    ) -> Result<SessionSync, ActivityError> {
+        let state = self.state.store.get_player_state(steam_id).await?;
+        let queued = self.state.store.get_queued_entry(steam_id).await?;
+        Ok(SessionSync {
+            state: state.map(|p| p.state).unwrap_or(PlayerState::InMenus),
+            queued,
+        })
     }
 }

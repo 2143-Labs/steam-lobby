@@ -5,7 +5,8 @@ use common::{queued_player, MockStore, TestCallbacks};
 use lobby_core::error::LobbyError;
 use lobby_core::traits::{MatchStore, QueueStore};
 use lobby_core::types::{
-    GameType, MatchDifficulty, MatchInfo, MatchReport, MatchStatus, PlayerState, QueueEntry,
+    GameType, MatchDifficulty, MatchEvent, MatchInfo, MatchReport, MatchStatus, PlayerState,
+    QueueEntry,
 };
 
 // ── Tests ────────────────────────────────────────────────
@@ -40,14 +41,35 @@ async fn full_match_lifecycle() {
         .await
         .unwrap();
 
-    // Tick
-    let queue = lobby_core::queue::MatchmakingQueue::new(TestCallbacks);
-    let result = queue
-        .tick("ranked_1v1", GameType::P2p, &store, &store, &store, &store)
+    // Pairing now lives in lobby-server's `PostgresStore::pair_next_match`
+    // (a `FOR UPDATE` transaction — not available against MockStore), so the
+    // lifecycle under test starts at the formed match.
+    let m = MatchInfo {
+        match_token: "lifecycle-token".into(),
+        player_a: 100,
+        player_a_difficulty: MatchDifficulty::Normal,
+        player_b: 200,
+        player_b_difficulty: MatchDifficulty::Normal,
+        game_mode: "ranked_1v1".into(),
+        game_type: GameType::P2p,
+        status: MatchStatus::PendingAccept,
+        created_at: Utc::now(),
+        accepted_at: None,
+        started_at: None,
+        ended_at: None,
+        server_address: None,
+        join_token: None,
+        result_secret: None,
+        accepted_a: false,
+        accepted_b: false,
+        connected_a: false,
+        connected_b: false,
+    };
+    store.create_match(&m).await.unwrap();
+    store
+        .record_match_event(&m.match_token, MatchEvent::Paired, None)
         .await
         .unwrap();
-    assert!(result.is_some());
-    let m = result.unwrap();
 
     // Accept
     let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks);
