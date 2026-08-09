@@ -1,5 +1,7 @@
 FROM rust:1.97.1-alpine AS builder
-RUN apk add --no-cache musl-dev pkgconfig openssl-dev
+# protobuf (protoc): prost-wkt-types, a transitive dep of the temporalio SDK,
+# compiles proto files at build time — mirrors shell.nix.
+RUN apk add --no-cache musl-dev pkgconfig openssl-dev protobuf
 WORKDIR /app
 COPY . .
 RUN cargo build --release -p lobby-server
