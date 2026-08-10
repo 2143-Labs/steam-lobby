@@ -973,3 +973,5 @@ pub async fn mock_allocate(
     });
     Json(serde_json::json!({ "server_address": "127.0.0.1:25565", "join_token": "mock-join" }))
 }
+
+// ci-cache-reuse probe
