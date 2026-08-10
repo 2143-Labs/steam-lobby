@@ -185,6 +185,21 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                 }
             }
         }
+
+        // Safety net for the idle-paused pairing schedules: if players are
+        // queued but the schedule is paused (a resume was lost), unpause it
+        // so the next tick pairs them. Idle cost is the get_queue SELECT
+        // above; the schedule RPC only happens when >=2 are queued.
+        for (mode, game_type) in &state.game_modes {
+            if *game_type != lobby_core::types::GameType::P2p {
+                continue;
+            }
+            if let Ok(queue) = state.store.get_queue(mode).await
+                && queue.len() >= 2
+            {
+                crate::temporal::schedule::ensure_running(&state, mode).await;
+            }
+        }
         if let Ok(removed) = lobby_core::queue::cleanup_stale(&state.store).await {
             for sid in &removed {
                 // The entry is gone — the owner must be back in the menus so a

@@ -371,16 +371,25 @@ impl LobbyActivities {
                 return Err(ActivityError::from(e));
             }
         };
+        let remaining = self
+            .state
+            .store
+            .get_queue(&mode)
+            .await
+            .map(|q| q.len())
+            .unwrap_or(0);
         tracing::debug!(
             "pair_matches ran for mode {} (queue size {})",
             mode,
-            self.state
-                .store
-                .get_queue(&mode)
-                .await
-                .map(|q| q.len())
-                .unwrap_or(0)
+            remaining
         );
+        // Idle schedule: fewer than two players left (no pair possible) —
+        // pause the pairing schedule so an idle server stops creating
+        // `PairOnceWorkflow` runs. `enter_queue` unpauses it; the in-process
+        // ticker is the safety net. Best-effort.
+        if remaining < 2 {
+            crate::temporal::schedule::pause_if_idle(&self.state, &mode).await;
+        }
         if let Some(m) = &match_info {
             tracing::info!(
                 "pair_matches formed match {}: {} vs {}",
@@ -484,6 +493,10 @@ impl LobbyActivities {
         // whose previous heartbeat predates the queue click (mirrors the
         // in-process begin_matchmaking).
         let _ = self.state.store.update_heartbeat(args.steam_id).await;
+        // The pairing schedule may be paused (idle). A fresh queue entry
+        // means a pair may be possible again — unpause it so the next tick
+        // pairs. Best-effort; the in-process ticker re-checks too.
+        crate::temporal::schedule::ensure_running(&self.state, &args.mode).await;
         tracing::info!("enter_queue activity done: steam_id={}", args.steam_id);
         Ok(())
     }

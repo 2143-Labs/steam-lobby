@@ -218,7 +218,7 @@ no separate worker pod). The worker connects to the Temporal frontend at
 
 | Workflow / Schedule | ID | Job |
 |----------|----|-----|
-| **Schedule** (per P2P mode) | `matchmaker-{mode}-{queue}` | Fires a short `PairOnceWorkflow` every 2s (`ScheduleOverlapPolicy::Skip` = single writer); deleted on worker shutdown so tests don't accumulate schedules. |
+| **Schedule** (per P2P mode) | `matchmaker-{mode}-{queue}` | Fires a short `PairOnceWorkflow` every 2s (`ScheduleOverlapPolicy::Skip` = single writer); **pauses when the queue is idle** (fewer than 2 players), unpauses on enqueue; deleted on worker shutdown so tests don't accumulate schedules. |
 | `PairOnceWorkflow` | `pair-{mode}-{queue}-{timestamp}` | One `pair_matches` activity (a single `FOR UPDATE` transaction: MMR-band pair, create match, signal both sessions, start the P2P workflow), then returns. Replaces the old infinite `MatchmakerWorkflow` loop. |
 | `UserSessionWorkflow` | `user-session-{steam_id}-{session_id}` | Per **WS connection** (session UUID). Recovers queue/match state from the DB on start; driven by `queue`/`unqueue`/`match_found`/`queue_expired`/`disconnect` signals; ends on disconnect or the 24h TTL. |
 | `P2PMatchWorkflow` | `match-{match_token}` | The coordinator: accept window (30s) → START window (15s, forfeit) → report window (300s) — each a workflow timer racing the clients' signals. Sole lifecycle writer. |

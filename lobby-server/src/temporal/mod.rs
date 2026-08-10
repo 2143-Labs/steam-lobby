@@ -8,6 +8,7 @@
 //! lifetime. On connect failure it logs and exits, leaving `state.temporal`
 //! `None` so the WS handlers fall back to the in-process path.
 pub mod activities;
+pub mod schedule;
 pub mod signals;
 pub mod workflows;
 // The SDK worker runs workflow tasks on an internal `tokio::task::LocalSet`

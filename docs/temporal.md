@@ -74,6 +74,14 @@ session's signals, and the ticker's stale-entry sweep runs **out of Temporal**
 and notifies the session via the `queue_expired` signal (so a queue-expired
 player can re-queue).
 
+**The schedule pauses when idle.** After each run, `pair_matches` pauses the
+mode's schedule if fewer than two players remain in the queue (no pair
+possible), and `enter_queue` unpauses it when a player enqueues — so an idle
+server creates ~zero workflows instead of a `PairOnceWorkflow` every 2s. The
+in-process ticker re-checks every 2s and unpauses if ≥2 players are queued
+(safety net for a lost resume). A side benefit: when the worker is down the
+schedule is usually paused, so no pending-task pileup during a restart.
+
 `accept_match`, `mark_connected` (also spawns the playback referee),
 `mark_accepts`, `handle_decline`, `finish_match`, `resolve_dispute`,
 `resolve_start_forfeit`, `pair_matches` (one `pair_next_match` transaction),
