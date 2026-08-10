@@ -162,6 +162,7 @@ if (location.protocol.startsWith("http")) {
 // unreachable (offline / file://), show only the dev-panel — the Steam
 // button navigates to an HTTP endpoint that doesn't exist offline, and the
 // browser's security policy blocks cross-scheme redirects (file:// → http://).
+const cfgUrl = $("server-url").value.trim().replace(/\/+$/, "") + "/auth/config";
 fetch(cfgUrl).then(r => r.ok ? r.json() : null).then(cfg => {
   if (!cfg) {
     $("dev-panel").style.display = "";
