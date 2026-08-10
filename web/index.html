@@ -172,6 +172,10 @@ fetch(cfgUrl).then(r => r.ok ? r.json() : null).then(cfg => {
   $("steam-login").style.display = providers.includes("steam") ? "" : "none";
   $("dev-panel").style.display = cfg.dev_mode ? "" : "none";
   $("guest-login").style.display = cfg.guest_login ? "" : "none";
+  // The bare Connect button is the dev test-token path (or completing a
+  // Steam login from a #token= fragment). In production the test-token
+  // endpoint 404s, so hide it unless a fragment token is present.
+  $("btn-connect").style.display = (cfg.dev_mode || fragmentToken) ? "" : "none";
   // Render every non-Steam provider as a "Sign in with {label}" button.
   const labels = { discord: "Discord", au2143: "au.2143.me" };
   const extra = providers.filter(p => p !== "steam");
