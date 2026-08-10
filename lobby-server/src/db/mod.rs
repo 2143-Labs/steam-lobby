@@ -68,9 +68,9 @@ fn parse_player_state(s: &str) -> PlayerState {
 #[derive(sqlx::FromRow)]
 struct MatchRow {
     match_token: String,
-    player_a: i64,
+    player_a: uuid::Uuid,
     player_a_difficulty: String,
-    player_b: i64,
+    player_b: uuid::Uuid,
     player_b_difficulty: String,
     game_mode: String,
     game_type: String,
@@ -92,9 +92,9 @@ impl From<MatchRow> for MatchInfo {
     fn from(r: MatchRow) -> Self {
         MatchInfo {
             match_token: r.match_token,
-            player_a: r.player_a as u64,
+            player_a: r.player_a,
             player_a_difficulty: parse_difficulty(&r.player_a_difficulty),
-            player_b: r.player_b as u64,
+            player_b: r.player_b,
             player_b_difficulty: parse_difficulty(&r.player_b_difficulty),
             game_mode: r.game_mode,
             game_type: parse_game_type(&r.game_type),

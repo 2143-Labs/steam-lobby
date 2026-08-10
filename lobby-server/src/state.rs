@@ -4,7 +4,6 @@
 use parking_lot::Mutex as ParkMutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU64;
 
 use lobby_core::traits::GameCallbacks;
@@ -55,8 +54,8 @@ pub struct AppState {
     pub player_manager: lobby_core::player::PlayerManager<DefaultCallbacks>,
     /// Match lifecycle actions: accept, connect, report, resolve.
     pub match_manager: lobby_core::match_lifecycle::MatchManager<DefaultCallbacks>,
-    /// Live WebSocket senders by steam_id.
-    pub connections: TokioMutex<HashMap<u64, ConnectionEntry>>,
+    /// Live WebSocket senders by player_id (users.id).
+    pub connections: TokioMutex<HashMap<uuid::Uuid, ConnectionEntry>>,
     /// Steam ticket/OpenID auth + session JWTs.
     pub steam_auth: SteamAuthService,
     /// Postgres-backed storage for all core traits.
@@ -74,7 +73,7 @@ pub struct AppState {
     /// Config handlers need, copied once at startup (see `RuntimeConfig`).
     pub config: RuntimeConfig,
     /// OpenID login states awaiting their callback (600s TTL, 4096 cap).
-    pub openid_states: StdMutex<HashMap<String, OpenIdState>>,
+    pub openid_states: ParkMutex<HashMap<String, OpenIdState>>,
     /// Rate limiter for /auth/ticket.
     pub ticket_limiter: RateLimiter,
     /// Rate limiter for /auth/test-token.
@@ -91,11 +90,19 @@ pub struct AppState {
     /// (the test harness fires it at teardown so the worker stops polling
     /// before its test DB drops; production never touches it).
     pub temporal_shutdown: std::sync::RwLock<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// OAuth2/OIDC provider registry (discord, au2143) for the generic
+    /// /auth/{provider} routes.
+    pub auth_providers: std::sync::Arc<crate::auth_providers::AuthProviderRegistry>,
 }
+
 
 pub struct OpenIdState {
     pub return_to: String,
     pub created_at: std::time::Instant,
+    /// Which provider issued this state (must match the callback's provider).
+    pub provider: String,
+    /// PKCE verifier for providers with `use_pkce` (au2143); None for discord.
+    pub code_verifier: Option<String>,
 }
 
 pub struct ConnectionEntry {

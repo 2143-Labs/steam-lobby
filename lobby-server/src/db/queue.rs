@@ -7,11 +7,11 @@ use super::*;
 impl QueueStore for PostgresStore {
     async fn enqueue(&self, entry: &QueueEntry) -> Result<()> {
         sqlx::query(
-            "INSERT INTO matchmaking_queue (steam_id, game_mode, match_difficulty, mu, queued_at) \
+            "INSERT INTO matchmaking_queue (user_id, game_mode, match_difficulty, mu, queued_at) \
              VALUES ($1, $2, $3, $4, NOW()) \
-             ON CONFLICT (steam_id, game_mode) DO UPDATE SET match_difficulty = $3, mu = $4, queued_at = NOW()",
+             ON CONFLICT (user_id, game_mode) DO UPDATE SET match_difficulty = $3, mu = $4, queued_at = NOW()",
         )
-        .bind(entry.steam_id as i64)
+        .bind(entry.user_id)
         .bind(&entry.game_mode)
         .bind(format!("{:?}", entry.difficulty).to_lowercase())
         .bind(entry.mu)
@@ -21,9 +21,9 @@ impl QueueStore for PostgresStore {
         Ok(())
     }
 
-    async fn dequeue(&self, steam_id: SteamId, mode: &str) -> Result<()> {
-        sqlx::query("DELETE FROM matchmaking_queue WHERE steam_id = $1 AND game_mode = $2")
-            .bind(steam_id as i64)
+    async fn dequeue(&self, user_id: uuid::Uuid, mode: &str) -> Result<()> {
+        sqlx::query("DELETE FROM matchmaking_queue WHERE user_id = $1 AND game_mode = $2")
+            .bind(user_id)
             .bind(mode)
             .execute(&self.pool)
             .await
@@ -32,8 +32,8 @@ impl QueueStore for PostgresStore {
     }
 
     async fn get_queue(&self, mode: &str) -> Result<Vec<QueueEntry>> {
-        let rows = sqlx::query_as::<_, (i64, String, String, f64, DateTime<Utc>)>(
-            "SELECT steam_id, game_mode, match_difficulty, mu, queued_at \
+        let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, f64, DateTime<Utc>)>(
+            "SELECT user_id, game_mode, match_difficulty, mu, queued_at \
              FROM matchmaking_queue WHERE game_mode = $1",
         )
         .bind(mode)
@@ -43,8 +43,8 @@ impl QueueStore for PostgresStore {
 
         Ok(rows
             .into_iter()
-            .map(|(sid, gm, md, mu, qa)| QueueEntry {
-                steam_id: sid as u64,
+            .map(|(uid, gm, md, mu, qa)| QueueEntry {
+                user_id: uid,
                 game_mode: gm,
                 difficulty: parse_difficulty(&md),
                 mu,
@@ -53,16 +53,16 @@ impl QueueStore for PostgresStore {
             .collect())
     }
 
-    async fn remove_stale_queue_entries(&self, timeout: Duration) -> Result<Vec<SteamId>> {
+    async fn remove_stale_queue_entries(&self, timeout: Duration) -> Result<Vec<uuid::Uuid>> {
         // Liveness is the player's heartbeat, not the moment they queued:
         // a client that keeps heartbeating may stay queued indefinitely.
         let cutoff = Utc::now() - timeout;
-        let rows = sqlx::query_scalar::<_, i64>(
+        let rows = sqlx::query_scalar::<_, uuid::Uuid>(
             "DELETE FROM matchmaking_queue q \
              USING player_state ps \
-             WHERE q.steam_id = ps.steam_id \
+             WHERE q.user_id = ps.user_id \
                AND ps.last_heartbeat < $1 \
-             RETURNING q.steam_id",
+             RETURNING q.user_id",
         )
         .bind(cutoff)
         .fetch_all(&self.pool)
@@ -71,29 +71,29 @@ impl QueueStore for PostgresStore {
         if !rows.is_empty() {
             tracing::info!("removed {} stale queue entries (no heartbeat)", rows.len());
         }
-        Ok(rows.into_iter().map(|id| id as SteamId).collect())
+        Ok(rows)
     }
 
-    async fn is_queued(&self, steam_id: SteamId) -> Result<bool> {
+    async fn is_queued(&self, user_id: uuid::Uuid) -> Result<bool> {
         sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM matchmaking_queue WHERE steam_id = $1)",
+            "SELECT EXISTS(SELECT 1 FROM matchmaking_queue WHERE user_id = $1)",
         )
-        .bind(steam_id as i64)
+        .bind(user_id)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_error)
     }
-    async fn get_queued_entry(&self, steam_id: SteamId) -> Result<Option<QueueEntry>> {
+    async fn get_queued_entry(&self, user_id: uuid::Uuid) -> Result<Option<QueueEntry>> {
         let row = sqlx::query_as::<_, (String, String, f64, DateTime<Utc>)>(
             "SELECT game_mode, match_difficulty, mu, queued_at \
-             FROM matchmaking_queue WHERE steam_id = $1 ORDER BY queued_at DESC LIMIT 1",
+             FROM matchmaking_queue WHERE user_id = $1 ORDER BY queued_at DESC LIMIT 1",
         )
-        .bind(steam_id as i64)
+        .bind(user_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(map_db_error)?;
         Ok(row.map(|(gm, md, mu, qa)| QueueEntry {
-            steam_id,
+            user_id,
             game_mode: gm,
             difficulty: parse_difficulty(&md),
             mu,
@@ -114,8 +114,8 @@ impl PostgresStore {
     ) -> Result<Option<MatchInfo>> {
         let mut tx = self.pool.begin().await.map_err(map_db_error)?;
 
-        let queue: Vec<QueueEntry> = sqlx::query_as::<_, (i64, String, String, f64, DateTime<Utc>)>(
-            "SELECT steam_id, game_mode, match_difficulty, mu, queued_at \
+        let queue: Vec<QueueEntry> = sqlx::query_as::<_, (uuid::Uuid, String, String, f64, DateTime<Utc>)>(
+            "SELECT user_id, game_mode, match_difficulty, mu, queued_at \
              FROM matchmaking_queue WHERE game_mode = $1 ORDER BY queued_at ASC FOR UPDATE",
         )
         .bind(mode)
@@ -123,8 +123,8 @@ impl PostgresStore {
         .await
         .map_err(map_db_error)?
         .into_iter()
-        .map(|(sid, gm, md, mu, qa)| QueueEntry {
-            steam_id: sid as u64,
+        .map(|(uid, gm, md, mu, qa)| QueueEntry {
+            user_id: uid,
             game_mode: gm,
             difficulty: parse_difficulty(&md),
             mu,
@@ -143,16 +143,16 @@ impl PostgresStore {
 
         // Pre-fetch every queued player's state once (O(n) reads inside the tx
         // instead of O(n²)); a missing row means the player is not Queueing.
-        let ids: Vec<i64> = queue.iter().map(|e| e.steam_id as i64).collect();
-        let states: HashMap<i64, Option<PlayerState>> = sqlx::query_as::<_, (i64, String)>(
-            "SELECT steam_id, state FROM player_state WHERE steam_id = ANY($1)",
+        let ids: Vec<uuid::Uuid> = queue.iter().map(|e| e.user_id).collect();
+        let states: HashMap<uuid::Uuid, Option<PlayerState>> = sqlx::query_as::<_, (uuid::Uuid, String)>(
+            "SELECT user_id, state FROM player_state WHERE user_id = ANY($1)",
         )
         .bind(&ids)
         .fetch_all(&mut *tx)
         .await
         .map_err(map_db_error)?
         .into_iter()
-        .map(|(sid, state)| (sid, Some(parse_player_state(&state))))
+        .map(|(uid, state)| (uid, Some(parse_player_state(&state))))
         .collect();
 
         for i in 0..queue.len() {
@@ -160,11 +160,9 @@ impl PostgresStore {
 
             // Skip desynced players — and, since we hold the FOR UPDATE lock,
             // drop their stale entry atomically so the next pairer never sees it.
-            if states.get(&(player_a.steam_id as i64)).and_then(|s| *s)
-                != Some(PlayerState::Queueing)
-            {
-                sqlx::query("DELETE FROM matchmaking_queue WHERE steam_id = $1 AND game_mode = $2")
-                    .bind(player_a.steam_id as i64)
+            if states.get(&player_a.user_id).and_then(|s| *s) != Some(PlayerState::Queueing) {
+                sqlx::query("DELETE FROM matchmaking_queue WHERE user_id = $1 AND game_mode = $2")
+                    .bind(player_a.user_id)
                     .bind(mode)
                     .execute(&mut *tx)
                     .await
@@ -178,16 +176,14 @@ impl PostgresStore {
             // Find first compatible opponent
             let mut opponent: Option<QueueEntry> = None;
             for player_b in queue.iter().cloned() {
-                if player_b.steam_id == player_a.steam_id {
+                if player_b.user_id == player_a.user_id {
                     continue;
                 }
 
                 // Skip if opponent is also desynced (same atomic delete as above).
-                if states.get(&(player_b.steam_id as i64)).and_then(|s| *s)
-                    != Some(PlayerState::Queueing)
-                {
-                    sqlx::query("DELETE FROM matchmaking_queue WHERE steam_id = $1 AND game_mode = $2")
-                        .bind(player_b.steam_id as i64)
+                if states.get(&player_b.user_id).and_then(|s| *s) != Some(PlayerState::Queueing) {
+                    sqlx::query("DELETE FROM matchmaking_queue WHERE user_id = $1 AND game_mode = $2")
+                        .bind(player_b.user_id)
                         .bind(mode)
                         .execute(&mut *tx)
                         .await
@@ -202,8 +198,8 @@ impl PostgresStore {
                      WHERE ((player_a = $1 AND player_b = $2) OR (player_a = $2 AND player_b = $1)) \
                        AND status = 'Resolved' AND ended_at >= $3)",
                 )
-                .bind(player_a.steam_id as i64)
-                .bind(player_b.steam_id as i64)
+                .bind(player_a.user_id)
+                .bind(player_b.user_id)
                 .bind(now - chrono::Duration::seconds(pair_cooldown_secs))
                 .fetch_one(&mut *tx)
                 .await
@@ -221,14 +217,14 @@ impl PostgresStore {
             if let Some(player_b) = opponent {
                 // Remove both from the queue (within the same transaction as the
                 // match insert — the fix for the old dequeue-then-create window).
-                sqlx::query("DELETE FROM matchmaking_queue WHERE steam_id = $1 AND game_mode = $2")
-                    .bind(player_a.steam_id as i64)
+                sqlx::query("DELETE FROM matchmaking_queue WHERE user_id = $1 AND game_mode = $2")
+                    .bind(player_a.user_id)
                     .bind(mode)
                     .execute(&mut *tx)
                     .await
                     .map_err(map_db_error)?;
-                sqlx::query("DELETE FROM matchmaking_queue WHERE steam_id = $1 AND game_mode = $2")
-                    .bind(player_b.steam_id as i64)
+                sqlx::query("DELETE FROM matchmaking_queue WHERE user_id = $1 AND game_mode = $2")
+                    .bind(player_b.user_id)
                     .bind(mode)
                     .execute(&mut *tx)
                     .await
@@ -236,9 +232,9 @@ impl PostgresStore {
 
                 let match_info = MatchInfo {
                     match_token: uuid::Uuid::new_v4().to_string(),
-                    player_a: player_a.steam_id,
+                    player_a: player_a.user_id,
                     player_a_difficulty: player_a.difficulty,
-                    player_b: player_b.steam_id,
+                    player_b: player_b.user_id,
                     player_b_difficulty: player_b.difficulty,
                     game_mode: mode.to_string(),
                     game_type,
@@ -262,9 +258,9 @@ impl PostgresStore {
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PendingAccept', NOW())",
                 )
                 .bind(&match_info.match_token)
-                .bind(match_info.player_a as i64)
+                .bind(match_info.player_a)
                 .bind(format!("{:?}", match_info.player_a_difficulty).to_lowercase())
-                .bind(match_info.player_b as i64)
+                .bind(match_info.player_b)
                 .bind(format!("{:?}", match_info.player_b_difficulty).to_lowercase())
                 .bind(&match_info.game_mode)
                 .bind(format!("{:?}", match_info.game_type).to_lowercase())
@@ -273,7 +269,7 @@ impl PostgresStore {
                 .await
                 .map_err(map_db_error)?;
                 sqlx::query(
-                    "INSERT INTO match_events (match_token, event_type, steam_id) VALUES ($1, $2, NULL)",
+                    "INSERT INTO match_events (match_token, event_type, user_id) VALUES ($1, $2, NULL)",
                 )
                 .bind(&match_info.match_token)
                 .bind(format!("{:?}", MatchEvent::Paired).to_lowercase())

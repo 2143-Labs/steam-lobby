@@ -22,7 +22,7 @@ pub struct PongInput {
 
 /// A client's reported checksum for a frame (from `RollbackHealth`).
 pub struct RollbackHealth {
-    pub from: u64,
+    pub from: uuid::Uuid,
     pub frame: u32,
     pub checksum: u64,
 }
@@ -30,8 +30,8 @@ pub struct RollbackHealth {
 /// Registry entry for a running pong match.
 pub struct ActivePong {
     /// Participants, for disconnect-forfeit lookup.
-    pub player_a: u64,
-    pub player_b: u64,
+    pub player_a: uuid::Uuid,
+    pub player_b: uuid::Uuid,
     pub input_tx: tokio::sync::mpsc::UnboundedSender<PongInput>,
     pub health_tx: tokio::sync::mpsc::UnboundedSender<RollbackHealth>,
     pub abort: tokio::task::AbortHandle,
@@ -95,8 +95,8 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                     let _ = e.tx.send(crate::ws::ServerMessage::GameState {
                         match_token: task_token.clone(),
                         frame: 0,
-                        player_a: players[0],
-                        player_b: players[1],
+                        player_a: players[0].to_string(),
+                        player_b: players[1].to_string(),
                         left_y: snap.left_y,
                         right_y: snap.right_y,
                         ball_x: snap.ball_x,
@@ -160,8 +160,8 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                             let _ = e.tx.send(crate::ws::ServerMessage::GameState {
                                 match_token: task_token.clone(),
                                 frame: frame as u32,
-                                player_a: players[0],
-                                player_b: players[1],
+                                player_a: players[0].to_string(),
+                                player_b: players[1].to_string(),
                                 left_y: snap.left_y,
                                 right_y: snap.right_y,
                                 ball_x: snap.ball_x,
@@ -211,8 +211,8 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                                 let _ = e.tx.send(crate::ws::ServerMessage::GameState {
                                     match_token: task_token.clone(),
                                     frame: next,
-                                    player_a: players[0],
-                                    player_b: players[1],
+                                    player_a: players[0].to_string(),
+                                    player_b: players[1].to_string(),
                                     left_y: snap.left_y,
                                     right_y: snap.right_y,
                                     ball_x: snap.ball_x,
@@ -281,7 +281,7 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                                 if let Some(e) = connections.get(&pid) {
                                     let _ = e.tx.send(crate::ws::ServerMessage::GameOver {
                                         match_token: task_token.clone(),
-                                        winner,
+                                        winner: winner.to_string(),
                                     });
                                     if let Ok(o) = &outcome {
                                         let _ = e.tx.send(crate::ws::ServerMessage::MatchResult {

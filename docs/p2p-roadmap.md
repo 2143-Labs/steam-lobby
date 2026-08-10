@@ -48,7 +48,7 @@ Signaling messages (`WebrtcOffer/Answer/Ice`) are live in ws.rs (server ↔ clie
 4. Exchange offer/answer/ICE via the existing lobby WebSocket using the new message types
 5. Once data channel open, send `game_input` targets over it instead of the WebSocket relay
 
-**MQTT option (roadmap item 6):** the existing mosquitto broker (`mosquitto-nodeport`, LB 192.168.6.19) can carry ICE candidates for lower latency than the lobby-server ws relay — offer/answer still go through the lobby-server (validates match participation), but ICE candidates go over MQTT topic `steam-lobby/{match_token}/ice/{steam_id}`. This is a performance optimization, not a requirement.
+**MQTT option (roadmap item 6):** the existing mosquitto broker (`mosquitto-nodeport`, LB 192.168.6.19) can carry ICE candidates for lower latency than the lobby-server ws relay — offer/answer still go through the lobby-server (validates match participation), but ICE candidates go over MQTT topic `steam-lobby/{match_token}/ice/{player_id}`. This is a performance optimization, not a requirement.
 
 ## 4. Rollback networking
 

@@ -37,8 +37,8 @@ impl GameserverClient {
             m.match_token,
             m.result_secret.as_deref().unwrap_or_default()
         );
-        // Steam IDs travel as decimal strings on the wire (JS-safe, matches the
-        // rest of the protocol); the creator/mocks read them with .as_str().
+        // Player ids (users.id UUIDs) travel as their canonical string form on
+        // the wire; the creator/mocks read them with .as_str().
         let body = serde_json::json!({
             "match_token": m.match_token,
             "game_mode": m.game_mode,

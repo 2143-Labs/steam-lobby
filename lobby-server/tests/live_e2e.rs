@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use lobby_client::{LobbyClient, ServerEvent};
 
-async fn auth_client(base: &str, steam_id: u64) -> LobbyClient {
+async fn auth_client(base: &str, steam_id: u64) -> (LobbyClient, String) {
     let token: serde_json::Value = reqwest::Client::new()
         .post(format!("{base}/auth/test-token"))
         .json(&serde_json::json!({ "steam_id": steam_id }))
@@ -19,8 +19,8 @@ async fn auth_client(base: &str, steam_id: u64) -> LobbyClient {
     let token = token["token"].as_str().expect("token").to_string();
     let ws_url = base.replace("http", "ws") + "/ws";
     let mut c = LobbyClient::connect(&ws_url).await.expect("connect");
-    c.authenticate(&token).await.expect("auth");
-    c
+    let auth = c.authenticate(&token).await.expect("auth");
+    (c, auth.player_id)
 }
 
 #[tokio::test]
@@ -28,7 +28,7 @@ async fn auth_client(base: &str, steam_id: u64) -> LobbyClient {
 async fn live_temporal_full_lifecycle() {
     let base = std::env::var("LOBBY_BASE").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
     // Fresh dev IDs per run: the 300s pair cooldown blocks re-pairing the same
-    // two steam_ids right after a resolved match.
+    // two dev accounts right after a resolved match.
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -36,8 +36,8 @@ async fn live_temporal_full_lifecycle() {
         % 1_000_000;
     let p1_id = 900_000 + n;
     let p2_id = 901_000 + n;
-    let mut p1 = auth_client(&base, p1_id).await;
-    let mut p2 = auth_client(&base, p2_id).await;
+    let (mut p1, p1_pid) = auth_client(&base, p1_id).await;
+    let (mut p2, _p2_pid) = auth_client(&base, p2_id).await;
 
     p1.begin_matchmaking("ranked_1v1", "normal")
         .await
@@ -107,10 +107,10 @@ async fn live_temporal_full_lifecycle() {
     println!("game running, first frame {frame}");
 
     // Both report the same winner (p1 won) → the workflow's finish_match resolves.
-    p1.submit_report(&token, Some(p1_id), Some("demo-a"))
+    p1.submit_report(&token, Some(&p1_pid), Some("demo-a"))
         .await
         .expect("p1 report");
-    p2.submit_report(&token, Some(p1_id), Some("demo-b"))
+    p2.submit_report(&token, Some(&p1_pid), Some("demo-b"))
         .await
         .expect("p2 report");
 

@@ -101,6 +101,7 @@ async fn setup_full(
         start_timeout_secs,
         countdown_ticks,
         None,
+        vec![],
     )
     .await
 }
@@ -126,7 +127,7 @@ pub async fn setup_temporal_pong_countdown(pool: PgPool) -> TestHarness {
 /// ticker still pairs Server-type matches and allocates gameservers).
 pub async fn setup_temporal_with_creator(pool: PgPool, creator_url: Option<&str>) -> TestHarness {
     let queue = unique_queue();
-    setup_full_impl(pool, false, creator_url, None, 15, 0, Some(queue)).await
+    setup_full_impl(pool, false, creator_url, None, 15, 0, Some(queue), vec![]).await
 }
 
 /// Temporal harness with a TURN secret (webrtc tests).
@@ -140,6 +141,7 @@ pub async fn setup_temporal_with_turn(pool: PgPool, turn_secret: Option<&str>) -
         15,
         0,
         Some(queue),
+        vec![],
     )
     .await
 }
@@ -176,6 +178,27 @@ async fn setup_temporal_full(
         start_timeout_secs,
         countdown_ticks,
         Some(queue),
+        vec![],
+    )
+    .await
+}
+
+/// Temporal harness with injected OAuth/OIDC provider configs (the provider
+/// tests point them at a mock OAuth server).
+pub async fn setup_temporal_with_auth(
+    pool: PgPool,
+    providers: Vec<lobby_server::auth_providers::ProviderConfig>,
+) -> TestHarness {
+    let queue = unique_queue();
+    setup_full_impl(
+        pool,
+        true,
+        None,
+        None,
+        15,
+        0,
+        Some(queue),
+        providers,
     )
     .await
 }
@@ -188,6 +211,7 @@ async fn setup_full_impl(
     start_timeout_secs: u64,
     countdown_ticks: u32,
     temporal_queue: Option<String>,
+    providers: Vec<lobby_server::auth_providers::ProviderConfig>,
 ) -> TestHarness {
     // sqlx::test has already created + migrated the per-test database; the
     // URL is the one piece of info the test binary does not otherwise know.
@@ -234,6 +258,15 @@ async fn setup_full_impl(
         ticker_shutdown: Some(shutdown_rx),
         temporal_disabled: temporal_queue.is_none(),
         pool: Some(pool_clone),
+        discord_client_id: None,
+        discord_client_secret: None,
+        au2143_client_id: None,
+        au2143_client_secret: None,
+        au2143_issuer: "https://au.2143.me".into(),
+        au2143_authorize_url: None,
+        au2143_token_url: None,
+        au2143_userinfo_url: None,
+        provider_overrides: providers,
     };
 
     let (app, state) = build_app(config).await; // runs migrations (no-op; already applied) + spawns ticker

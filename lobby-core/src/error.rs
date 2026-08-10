@@ -1,12 +1,12 @@
 //! `LobbyError` variants and the crate-wide `Result` alias, built on
 //! `thiserror`. Every fallible API in the core returns `Result<T>`.
-use crate::types::{PlayerState, SteamId};
+use crate::types::{PlayerId, PlayerState};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum LobbyError {
     #[error("player not found: {0}")]
-    PlayerNotFound(SteamId),
+    PlayerNotFound(PlayerId),
     #[error("invalid state transition: from {from:?} to {to:?}")]
     InvalidStateTransition { from: PlayerState, to: PlayerState },
     #[error("match not found: {0}")]

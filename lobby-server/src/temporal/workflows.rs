@@ -20,7 +20,7 @@ use temporalio_sdk::{
     ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult, workflows::select,
 };
 
-use lobby_core::types::{MatchDifficulty, MatchInfo, PlayerState, SteamId};
+use lobby_core::types::{MatchDifficulty, MatchInfo, PlayerId, PlayerState};
 
 use crate::state::AppState;
 use crate::temporal::activities::{self, FinishMatchArgs, MatchStateArgs, QueueArgs};
@@ -31,7 +31,7 @@ use crate::temporal::activities::{self, FinishMatchArgs, MatchStateArgs, QueueAr
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct SessionArgs {
-    pub steam_id: SteamId,
+    pub user_id: uuid::Uuid,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -52,8 +52,8 @@ pub struct PairOnceArgs {
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct MatchArgs {
     pub match_token: String,
-    pub player_a: SteamId,
-    pub player_b: SteamId,
+    pub player_a: PlayerId,
+    pub player_b: PlayerId,
     pub mode: String,
     pub difficulty: MatchDifficulty,
     pub accept_timeout_secs: u64,
@@ -63,24 +63,24 @@ pub struct MatchArgs {
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct ChoiceArgs {
-    pub steam_id: SteamId,
+    pub user_id: PlayerId,
     pub accept: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct StartArgs {
-    pub steam_id: SteamId,
+    pub user_id: PlayerId,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct WhoWonArgs {
-    pub steam_id: SteamId,
-    pub winner: SteamId,
+    pub user_id: PlayerId,
+    pub winner: PlayerId,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct DemoArgs {
-    pub steam_id: SteamId,
+    pub user_id: PlayerId,
     pub demo_hash: String,
 }
 
@@ -97,7 +97,7 @@ fn short_activity() -> ActivityOptions {
 #[workflow]
 #[derive(Default)]
 pub struct UserSessionWorkflow {
-    steam_id: SteamId,
+    user_id: uuid::Uuid,
     queued: Option<QueueArgs>,
     in_match: bool,
     last_match: Option<String>,
@@ -106,13 +106,13 @@ pub struct UserSessionWorkflow {
 
 #[workflow_methods]
 impl UserSessionWorkflow {
-    /// Runs before any signal: the session's steam_id is visible to signal
+    /// Runs before any signal: the session's user_id is visible to signal
     /// handlers (a queue/unqueue signal delivered in the workflow's first
-    /// task must not see the default 0).
+    /// task must not see the default nil UUID).
     #[init]
     pub fn init(_ctx: &temporalio_sdk::WorkflowContextView, args: SessionArgs) -> Self {
         Self {
-            steam_id: args.steam_id,
+            user_id: args.user_id,
             ..Default::default()
         }
     }
@@ -122,18 +122,18 @@ impl UserSessionWorkflow {
         // Recover reconnect-while-queued: adopt the DB queue entry so unqueue
         // works on the new session. The DB row IS the queue — there is no child
         // workflow to re-link.
-        let steam_id = ctx.state(|s| s.steam_id);
+        let user_id = ctx.state(|s| s.user_id);
         if let Ok(sync) = ctx
             .execute_activity(
                 activities::LobbyActivities::sync_session,
-                steam_id,
+                user_id,
                 short_activity(),
             )
             .await
         {
             ctx.state_mut(|s| {
                 s.queued = sync.queued.map(|q| QueueArgs {
-                    steam_id: q.steam_id,
+                    user_id: q.user_id,
                     mode: q.game_mode,
                     difficulty: q.difficulty,
                 });
@@ -160,7 +160,7 @@ impl UserSessionWorkflow {
         let _ = ctx
             .execute_activity(
                 activities::LobbyActivities::set_player_state,
-                (args.steam_id, PlayerState::Queueing),
+                (args.user_id, PlayerState::Queueing),
                 short_activity(),
             )
             .await;
@@ -176,7 +176,7 @@ impl UserSessionWorkflow {
 
     #[signal]
     pub async fn unqueue(ctx: &mut WorkflowContext<Self>) {
-        let steam_id = ctx.state(|s| s.steam_id);
+        let user_id = ctx.state(|s| s.user_id);
         let queued = match ctx.state(|s| s.queued.clone()) {
             Some(q) => q,
             None => {
@@ -188,7 +188,7 @@ impl UserSessionWorkflow {
                 let Ok(sync) = ctx
                     .execute_activity(
                         activities::LobbyActivities::sync_session,
-                        steam_id,
+                        user_id,
                         short_activity(),
                     )
                     .await
@@ -197,7 +197,7 @@ impl UserSessionWorkflow {
                 };
                 let Some(q) = sync.queued else { return; };
                 QueueArgs {
-                    steam_id: q.steam_id,
+                    user_id: q.user_id,
                     mode: q.game_mode,
                     difficulty: q.difficulty,
                 }
@@ -222,7 +222,7 @@ impl UserSessionWorkflow {
             let _ = ctx
                 .execute_activity(
                     activities::LobbyActivities::set_player_state,
-                    (queued.steam_id, PlayerState::InMenus),
+                    (queued.user_id, PlayerState::InMenus),
                     short_activity(),
                 )
                 .await;
@@ -231,11 +231,11 @@ impl UserSessionWorkflow {
 
     #[signal]
     pub async fn match_found(ctx: &mut WorkflowContext<Self>, args: MatchFoundArgs) {
-        let steam_id = ctx.state(|s| s.steam_id);
+        let user_id = ctx.state(|s| s.user_id);
         let _ = ctx
             .execute_activity(
                 activities::LobbyActivities::set_player_state,
-                (steam_id, PlayerState::InMatch),
+                (user_id, PlayerState::InMatch),
                 short_activity(),
             )
             .await;
@@ -248,11 +248,11 @@ impl UserSessionWorkflow {
 
     #[signal]
     pub async fn match_complete(ctx: &mut WorkflowContext<Self>, _args: MatchCompleteArgs) {
-        let steam_id = ctx.state(|s| s.steam_id);
+        let user_id = ctx.state(|s| s.user_id);
         let _ = ctx
             .execute_activity(
                 activities::LobbyActivities::set_player_state,
-                (steam_id, PlayerState::InMenus),
+                (user_id, PlayerState::InMenus),
                 short_activity(),
             )
             .await;
@@ -310,13 +310,13 @@ impl PairOnceWorkflow {
 #[workflow]
 #[derive(Default)]
 pub struct P2PMatchWorkflow {
-    accepts: Vec<SteamId>,
+    accepts: Vec<PlayerId>,
     declined: bool,
     /// Who declined (for the audit event); None = accept-timeout (no actor).
-    declined_by: Option<SteamId>,
-    started: Vec<SteamId>,
-    who_won: Vec<(SteamId, SteamId)>,
-    demo_hashes: Vec<(SteamId, String)>,
+    declined_by: Option<PlayerId>,
+    started: Vec<PlayerId>,
+    who_won: Vec<(PlayerId, PlayerId)>,
+    demo_hashes: Vec<(PlayerId, String)>,
 }
 
 #[workflow_methods]
@@ -451,11 +451,11 @@ impl P2PMatchWorkflow {
             }
             _ = ctx.wait_condition(|s| s.who_won.len() == 2) => {
                 let (wa, wb) = {
-                    let mut a = 0u64;
-                    let mut b = 0u64;
+                    let mut a = None;
+                    let mut b = None;
                     for (sid, w) in &ctx.state(|s| s.who_won.clone()) {
-                        if *sid == args.player_a { a = *w; }
-                        if *sid == args.player_b { b = *w; }
+                        if *sid == args.player_a { a = Some(*w); }
+                        if *sid == args.player_b { b = Some(*w); }
                     }
                     (a, b)
                 };
@@ -466,7 +466,7 @@ impl P2PMatchWorkflow {
                         activities::LobbyActivities::finish_match,
                         FinishMatchArgs {
                             match_token: args.match_token.clone(),
-                            winner: Some(wa),
+                            winner: wa,
                             demo_hashes: demos,
                         },
                         short_activity(),
@@ -486,32 +486,32 @@ impl P2PMatchWorkflow {
     #[signal]
     pub fn match_choice(&mut self, _ctx: &mut SyncWorkflowContext<Self>, args: ChoiceArgs) {
         if args.accept {
-            if !self.accepts.contains(&args.steam_id) {
-                self.accepts.push(args.steam_id);
+            if !self.accepts.contains(&args.user_id) {
+                self.accepts.push(args.user_id);
             }
         } else {
             self.declined = true;
-            self.declined_by = Some(args.steam_id);
+            self.declined_by = Some(args.user_id);
         }
     }
 
     #[signal]
     pub fn start(&mut self, _ctx: &mut SyncWorkflowContext<Self>, args: StartArgs) {
-        if !self.started.contains(&args.steam_id) {
-            self.started.push(args.steam_id);
+        if !self.started.contains(&args.user_id) {
+            self.started.push(args.user_id);
         }
     }
 
     #[signal]
     pub fn who_won(&mut self, _ctx: &mut SyncWorkflowContext<Self>, args: WhoWonArgs) {
-        self.who_won.retain(|(sid, _)| *sid != args.steam_id);
-        self.who_won.push((args.steam_id, args.winner));
+        self.who_won.retain(|(sid, _)| *sid != args.user_id);
+        self.who_won.push((args.user_id, args.winner));
     }
 
     #[signal]
     pub fn submit_demo(&mut self, _ctx: &mut SyncWorkflowContext<Self>, args: DemoArgs) {
-        self.demo_hashes.retain(|(sid, _)| *sid != args.steam_id);
-        self.demo_hashes.push((args.steam_id, args.demo_hash));
+        self.demo_hashes.retain(|(sid, _)| *sid != args.user_id);
+        self.demo_hashes.push((args.user_id, args.demo_hash));
     }
 }
 
@@ -595,7 +595,11 @@ pub(crate) async fn notify_match_found(state: &Arc<AppState>, m: &MatchInfo) {
 }
 
 /// Signal a session's `match_complete` (called by the finish_match activity).
-pub(crate) async fn signal_session_complete(state: &Arc<AppState>, steam_id: SteamId, token: &str) {
+pub(crate) async fn signal_session_complete(
+    state: &Arc<AppState>,
+    user_id: uuid::Uuid,
+    token: &str,
+) {
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
     };
@@ -606,13 +610,13 @@ pub(crate) async fn signal_session_complete(state: &Arc<AppState>, steam_id: Ste
         .connections
         .lock()
         .await
-        .get(&steam_id)
+        .get(&user_id)
         .map(|e| e.session_id.clone())
     else {
         return;
     };
     let handle = client.get_workflow_handle::<UserSessionWorkflow>(format!(
-        "user-session-{steam_id}-{session_id}"
+        "user-session-{user_id}-{session_id}"
     ));
     let _ = handle
         .signal(

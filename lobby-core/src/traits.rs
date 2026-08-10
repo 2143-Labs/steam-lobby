@@ -8,25 +8,25 @@ use std::collections::HashMap;
 use crate::error::Result;
 use crate::types::{
     MatchDifficulty, MatchInfo, MatchReport, MatchStatus, OpenSkillRating, PlayerInfo, PlayerState,
-    QueueEntry, SteamId,
+    PlayerId, QueueEntry, SteamId,
 };
 
 /// Game-specific callbacks. Implement for your game type.
 /// All methods have default no-op implementations so partial impls work.
 #[async_trait]
 pub trait GameCallbacks: Send + Sync {
-    async fn on_player_in_menu(&self, _steam_id: SteamId) -> Result<()> {
+    async fn on_player_in_menu(&self, _user_id: PlayerId) -> Result<()> {
         Ok(())
     }
     async fn on_player_queueing(
         &self,
-        _steam_id: SteamId,
+        _user_id: PlayerId,
         _mode: &str,
         _difficulty: MatchDifficulty,
     ) -> Result<()> {
         Ok(())
     }
-    async fn on_player_cancel_queue(&self, _steam_id: SteamId) -> Result<()> {
+    async fn on_player_cancel_queue(&self, _user_id: PlayerId) -> Result<()> {
         Ok(())
     }
     /// Return false to reject the match for this player (game-specific logic).
@@ -46,10 +46,10 @@ pub trait GameCallbacks: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
-    async fn on_player_disconnected(&self, _steam_id: SteamId) -> Result<()> {
+    async fn on_player_disconnected(&self, _user_id: PlayerId) -> Result<()> {
         Ok(())
     }
-    async fn on_heartbeat(&self, _steam_id: SteamId) -> Result<()> {
+    async fn on_heartbeat(&self, _user_id: PlayerId) -> Result<()> {
         Ok(())
     }
     async fn on_generate_match_token(&self, _match: &MatchInfo) -> Result<String> {
@@ -60,19 +60,19 @@ pub trait GameCallbacks: Send + Sync {
 /// Storage abstraction — swap impls for testing vs production.
 #[async_trait]
 pub trait PlayerStore: Send + Sync {
-    async fn upsert_player(&self, steam_id: SteamId, display_name: &str) -> Result<()>;
-    async fn get_player_state(&self, steam_id: SteamId) -> Result<Option<PlayerInfo>>;
-    async fn get_rating(&self, steam_id: SteamId, mode: &str) -> Result<OpenSkillRating>;
+    async fn upsert_player(&self, user_id: PlayerId, display_name: &str) -> Result<()>;
+    async fn get_player_state(&self, user_id: PlayerId) -> Result<Option<PlayerInfo>>;
+    async fn get_rating(&self, user_id: PlayerId, mode: &str) -> Result<OpenSkillRating>;
     async fn update_rating(
         &self,
-        steam_id: SteamId,
+        user_id: PlayerId,
         mode: &str,
         rating: &OpenSkillRating,
     ) -> Result<()>;
-    async fn set_player_state(&self, steam_id: SteamId, state: PlayerState) -> Result<()>;
-    async fn update_heartbeat(&self, steam_id: SteamId) -> Result<()>;
-    async fn get_token_version(&self, steam_id: SteamId) -> Result<u32>;
-    async fn bump_token_version(&self, steam_id: SteamId) -> Result<()>;
+    async fn set_player_state(&self, user_id: PlayerId, state: PlayerState) -> Result<()>;
+    async fn update_heartbeat(&self, user_id: PlayerId) -> Result<()>;
+    async fn get_token_version(&self, user_id: PlayerId) -> Result<u32>;
+    async fn bump_token_version(&self, user_id: PlayerId) -> Result<()>;
 }
 
 #[async_trait]
@@ -93,10 +93,10 @@ pub trait MatchStore: Send + Sync {
     ) -> Result<()>;
     /// Record one player's acceptance.
     /// Returns true when, after this call, BOTH players have accepted.
-    async fn mark_accepted(&self, token: &str, steam_id: SteamId) -> Result<bool>;
+    async fn mark_accepted(&self, token: &str, user_id: PlayerId) -> Result<bool>;
     /// Record one player's P2P connection.
     /// Returns true when, after this call, BOTH players have connected.
-    async fn mark_started(&self, token: &str, steam_id: SteamId) -> Result<bool>;
+    async fn mark_started(&self, token: &str, user_id: PlayerId) -> Result<bool>;
     /// Record that a server-authoritative match's gameserver is ready and the
     /// match is now Playing (sets server_address, join_token, started_at=NOW()).
     async fn mark_server_ready(
@@ -110,9 +110,8 @@ pub trait MatchStore: Send + Sync {
         &self,
         match_token: &str,
         event: crate::types::MatchEvent,
-        steam_id: Option<SteamId>,
+        actor: Option<PlayerId>,
     ) -> Result<()>;
-    /// Persist a resolved match outcome record.
     async fn write_match_result(
         &self,
         token: &str,
@@ -123,8 +122,8 @@ pub trait MatchStore: Send + Sync {
     /// True if the pair has a Resolved match that ended at/after `since`.
     async fn recent_match_between(
         &self,
-        a: SteamId,
-        b: SteamId,
+        a: PlayerId,
+        b: PlayerId,
         since: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool>;
     /// Atomically apply a full match resolution (ratings, result record, status).
@@ -133,8 +132,8 @@ pub trait MatchStore: Send + Sync {
         &self,
         token: &str,
         game_mode: &str,
-        player_a: SteamId,
-        player_b: SteamId,
+        player_a: PlayerId,
+        player_b: PlayerId,
         outcome: &str,
         mu_change_a: Option<f64>,
         mu_change_b: Option<f64>,
@@ -146,25 +145,25 @@ pub trait MatchStore: Send + Sync {
 #[async_trait]
 pub trait QueueStore: Send + Sync {
     async fn enqueue(&self, entry: &QueueEntry) -> Result<()>;
-    async fn dequeue(&self, steam_id: SteamId, mode: &str) -> Result<()>;
+    async fn dequeue(&self, user_id: PlayerId, mode: &str) -> Result<()>;
     async fn get_queue(&self, mode: &str) -> Result<Vec<QueueEntry>>;
-    /// Remove stale entries; returns the steam_ids that were removed.
-    async fn remove_stale_queue_entries(&self, timeout: chrono::Duration) -> Result<Vec<SteamId>>;
+    /// Remove stale entries; returns the user_ids that were removed.
+    async fn remove_stale_queue_entries(&self, timeout: chrono::Duration) -> Result<Vec<PlayerId>>;
     /// True if the player currently has a queue entry in any mode.
-    async fn is_queued(&self, steam_id: SteamId) -> Result<bool>;
+    async fn is_queued(&self, user_id: PlayerId) -> Result<bool>;
     /// The player's current queue entry in any mode (newest first), for
     /// session recovery on reconnect.
-    async fn get_queued_entry(&self, steam_id: SteamId) -> Result<Option<QueueEntry>>;
+    async fn get_queued_entry(&self, user_id: PlayerId) -> Result<Option<QueueEntry>>;
 }
 
 #[async_trait]
 pub trait RatingStore: Send + Sync {
-    async fn get_rating(&self, steam_id: SteamId, mode: &str) -> Result<OpenSkillRating>;
+    async fn get_rating(&self, user_id: PlayerId, mode: &str) -> Result<OpenSkillRating>;
     /// All ratings for one mode, ordered by display rating (`mu - 3*sigma`) descending.
-    async fn list_ratings(&self, mode: &str) -> Result<Vec<(SteamId, OpenSkillRating)>>;
+    async fn list_ratings(&self, mode: &str) -> Result<Vec<(PlayerId, OpenSkillRating)>>;
     async fn update_rating(
         &self,
-        steam_id: SteamId,
+        user_id: PlayerId,
         mode: &str,
         rating: &OpenSkillRating,
     ) -> Result<()>;

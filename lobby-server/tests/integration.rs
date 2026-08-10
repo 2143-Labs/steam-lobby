@@ -10,8 +10,9 @@ use tokio::time::timeout;
 mod common; // lobby-server/tests/common.rs — TestHarness + setup()
 use common::{
     setup, setup_temporal, setup_temporal_pong, setup_temporal_pong_countdown,
-    setup_temporal_pong_start_timeout, setup_temporal_with_creator,
+    setup_temporal_pong_start_timeout, setup_temporal_with_auth, setup_temporal_with_creator,
 };
+use lobby_server::auth_providers::{ProviderConfig, ProviderKind};
 
 /// Poll `query` (a fresh sqlx query for `token`) until it returns a row or 5s elapses.
 /// The server processes WS reports asynchronously, so a straight fetch could race.
@@ -101,20 +102,18 @@ async fn wait_for_event_counts(pool: &PgPool, token: &str, expected: &[(&str, i6
 }
 
 /// Connect two clients, auth with distinct test tokens, queue, and get a shared match.
+/// Returns the clients, the shared match token, and both players' player_ids
+/// (UUIDs from `AuthOk` — the report winner / DB identity key).
 async fn pair_up(
     h: &common::TestHarness,
     p1_id: u64,
     p2_id: u64,
     mode: &str,
-) -> (LobbyClient, LobbyClient, String) {
+) -> (LobbyClient, LobbyClient, String, String, String) {
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
     let mut p2 = LobbyClient::connect(&h.ws_url).await.unwrap();
-    p1.authenticate_test_token(p1_id, &h.base_url)
-        .await
-        .unwrap();
-    p2.authenticate_test_token(p2_id, &h.base_url)
-        .await
-        .unwrap();
+    let a1 = p1.authenticate_test_token(p1_id, &h.base_url).await.unwrap();
+    let a2 = p2.authenticate_test_token(p2_id, &h.base_url).await.unwrap();
 
     p1.begin_matchmaking(mode, "normal").await.unwrap();
     p2.begin_matchmaking(mode, "normal").await.unwrap();
@@ -134,7 +133,7 @@ async fn pair_up(
         m1.match_token, m2.match_token,
         "both players must get the same match"
     );
-    (p1, p2, m1.match_token)
+    (p1, p2, m1.match_token, a1.player_id, a2.player_id)
 }
 
 /// Both clients accept, then both signal START, synchronizing on server
@@ -166,15 +165,14 @@ async fn accept_and_connect(
 #[sqlx::test]
 async fn full_match_lifecycle(pool: sqlx::PgPool) {
     let h = setup_temporal_pong(pool).await;
-    let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
-    let a1 = 100u64;
+    let (mut p1, mut p2, token, pid1, _pid2) = pair_up(&h, 100, 200, "ranked_1v1").await;
 
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
-    p1.submit_report(&token, Some(a1), Some("demo-a"))
+    p1.submit_report(&token, Some(&pid1), Some("demo-a"))
         .await
         .unwrap();
-    p2.submit_report(&token, Some(a1), Some("demo-a"))
+    p2.submit_report(&token, Some(&pid1), Some("demo-a"))
         .await
         .unwrap();
 
@@ -188,18 +186,19 @@ async fn full_match_lifecycle(pool: sqlx::PgPool) {
     )
     .await
     .expect("match_results row exists");
-    let player_a: i64 = sqlx::query_scalar("SELECT player_a FROM matches WHERE match_token = $1")
-        .bind(&token)
-        .fetch_one(&h.pool)
-        .await
-        .unwrap();
-    let expected = if player_a as u64 == a1 { "Win" } else { "Loss" };
+    let player_a: uuid::Uuid =
+        sqlx::query_scalar("SELECT player_a FROM matches WHERE match_token = $1")
+            .bind(&token)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    let expected = if player_a.to_string() == pid1 { "Win" } else { "Loss" };
     assert_eq!(row.0, expected, "outcome must match player_a's perspective");
     // The winner's mu increases regardless of which side they landed on.
     let winner_mu: f64 = sqlx::query_scalar(
-        "SELECT mu FROM ratings WHERE steam_id = $1 AND game_mode = 'ranked_1v1'",
+        "SELECT mu FROM ratings WHERE user_id = $1::uuid AND game_mode = 'ranked_1v1'",
     )
-    .bind(a1 as i64)
+    .bind(&pid1)
     .fetch_one(&h.pool)
     .await
     .unwrap();
@@ -215,16 +214,15 @@ async fn full_match_lifecycle(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn dispute_on_winner_mismatch(pool: sqlx::PgPool) {
     let h = setup_temporal_pong(pool).await;
-
-    let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
+    let (mut p1, mut p2, token, pid1, pid2) = pair_up(&h, 100, 200, "ranked_1v1").await;
 
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
     // p1 claims p1 won; p2 claims p2 won — a dispute.
-    p1.submit_report(&token, Some(100), Some("demo-a"))
+    p1.submit_report(&token, Some(&pid1), Some("demo-a"))
         .await
         .unwrap();
-    p2.submit_report(&token, Some(200), Some("demo-b"))
+    p2.submit_report(&token, Some(&pid2), Some("demo-b"))
         .await
         .unwrap();
 
@@ -282,7 +280,7 @@ async fn queue_stats_received(pool: sqlx::PgPool) {
     let h = setup_temporal(pool).await;
 
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
-    p1.authenticate_test_token(901, &h.base_url).await.unwrap();
+    let auth = p1.authenticate_test_token(901, &h.base_url).await.unwrap();
     p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
 
     // The ticker pushes queue_status every ~2s while the player is queued.
@@ -302,7 +300,7 @@ async fn queue_stats_received(pool: sqlx::PgPool) {
                 );
                 assert!(queue_size >= 1, "queue must contain the queued player");
                 assert!(
-                    leaderboard.iter().any(|e| e.steam_id == 901),
+                    leaderboard.iter().any(|e| e.player_id == auth.player_id),
                     "leaderboard must include the queued player"
                 );
                 got = true;
@@ -324,7 +322,7 @@ async fn queue_stats_received(pool: sqlx::PgPool) {
 async fn p2p_and_report_visibility(pool: sqlx::PgPool) {
     let h = setup_temporal(pool).await;
 
-    let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
+    let (mut p1, mut p2, token, pid1, _pid2) = pair_up(&h, 100, 200, "ranked_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
     // accept_and_connect sends both start_match signals; p1 must learn that
@@ -349,7 +347,7 @@ async fn p2p_and_report_visibility(pool: sqlx::PgPool) {
 
     // p1 reports first. The workflow resolves only when BOTH who_won signals
     // are in, so the match must NOT resolve yet (no premature match_result).
-    p1.submit_report(&token, Some(100), Some("demo-a"))
+    p1.submit_report(&token, Some(&pid1), Some("demo-a"))
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -364,7 +362,7 @@ async fn p2p_and_report_visibility(pool: sqlx::PgPool) {
     );
 
     // p2 agrees; the match resolves and BOTH players receive match_result.
-    p2.submit_report(&token, Some(100), Some("demo-a"))
+    p2.submit_report(&token, Some(&pid1), Some("demo-a"))
         .await
         .unwrap();
 
@@ -396,7 +394,7 @@ async fn p2p_and_report_visibility(pool: sqlx::PgPool) {
 async fn decline_notifies_opponent(pool: sqlx::PgPool) {
     let h = setup_temporal(pool).await;
 
-    let (mut p1, mut p2, token) = pair_up(&h, 100, 200, "ranked_1v1").await;
+    let (mut p1, mut p2, token, _pid1, _pid2) = pair_up(&h, 100, 200, "ranked_1v1").await;
 
     p1.decline_match(&token).await.unwrap();
 
@@ -442,7 +440,7 @@ async fn match_events_logged(pool: sqlx::PgPool) {
     let h = setup_temporal(pool).await;
 
     // Scenario 1: pairing + both accepts are logged.
-    let (mut p1, mut p2, token) = pair_up(&h, 400, 401, "ranked_1v1").await;
+    let (mut p1, mut p2, token, _pid1, _pid2) = pair_up(&h, 400, 401, "ranked_1v1").await;
     p1.accept_match(&token).await.unwrap();
     p2.accept_match(&token).await.unwrap();
     assert!(
@@ -454,7 +452,7 @@ async fn match_events_logged(pool: sqlx::PgPool) {
     drop(p2);
 
     // Scenario 2: decline is logged and the match is immediately terminal.
-    let (mut q1, _q2, token2) = pair_up(&h, 402, 403, "ranked_1v1").await;
+    let (mut q1, _q2, token2, q1_pid, _q2_pid) = pair_up(&h, 402, 403, "ranked_1v1").await;
     q1.decline_match(&token2).await.unwrap();
     assert!(
         wait_for_status(&h.pool, &token2, "Disputed").await,
@@ -464,14 +462,18 @@ async fn match_events_logged(pool: sqlx::PgPool) {
         wait_for_event_counts(&h.pool, &token2, &[("paired", 1), ("declined", 1)]).await,
         "pairing + decline events must be logged"
     );
-    let actor: i64 = sqlx::query_scalar(
-        "SELECT steam_id FROM match_events WHERE match_token = $1 AND event_type = 'declined'",
+    let actor: Option<String> = sqlx::query_scalar(
+        "SELECT user_id::text FROM match_events WHERE match_token = $1 AND event_type = 'declined'",
     )
     .bind(&token2)
-    .fetch_one(&h.pool)
+    .fetch_optional(&h.pool)
     .await
     .unwrap();
-    assert_eq!(actor, 402, "decline event records the declining player");
+    assert_eq!(
+        actor.as_deref(),
+        Some(q1_pid.as_str()),
+        "decline event records the declining player"
+    );
     drop(q1);
 }
 
@@ -496,7 +498,8 @@ async fn auth_ok_reports_state(pool: sqlx::PgPool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let state: Option<String> =
-            sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = 601")
+            sqlx::query_scalar("SELECT state FROM player_state WHERE user_id = $1::uuid")
+                .bind(&auth.player_id)
                 .fetch_optional(&h.pool)
                 .await
                 .unwrap();
@@ -531,15 +534,16 @@ async fn reconnect_reports_queueing(pool: sqlx::PgPool) {
     let h = setup_temporal(pool).await;
 
     let mut c1 = LobbyClient::connect(&h.ws_url).await.unwrap();
-    c1.authenticate_test_token(602, &h.base_url).await.unwrap();
+    let auth1 = c1.authenticate_test_token(602, &h.base_url).await.unwrap();
     c1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
 
     // begin_matchmaking is fire-and-forget: wait for the entry to land before
     // dropping the connection, so the drop happens while the player is queued.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let queued: Option<i64> =
-            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 602")
+        let queued: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM matchmaking_queue WHERE user_id = $1::uuid")
+                .bind(&auth1.player_id)
                 .fetch_optional(&h.pool)
                 .await
                 .unwrap();
@@ -573,7 +577,7 @@ async fn queue_expired_notifies_player(pool: sqlx::PgPool) {
     let h = setup_temporal(pool).await;
 
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
-    p1.authenticate_test_token(701, &h.base_url).await.unwrap();
+    let auth = p1.authenticate_test_token(701, &h.base_url).await.unwrap();
     p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
 
     // Pretend the player idled past the 30s stale window; the next tick
@@ -583,8 +587,9 @@ async fn queue_expired_notifies_player(pool: sqlx::PgPool) {
     // enqueue the player before backdating, or the UPDATE races the INSERT.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let queued: Option<i64> =
-            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 701")
+        let queued: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM matchmaking_queue WHERE user_id = $1::uuid")
+                .bind(&auth.player_id)
                 .fetch_optional(&h.pool)
                 .await
                 .unwrap();
@@ -597,7 +602,8 @@ async fn queue_expired_notifies_player(pool: sqlx::PgPool) {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    sqlx::query("UPDATE player_state SET last_heartbeat = NOW() - INTERVAL '40 seconds' WHERE steam_id = 701")
+    sqlx::query("UPDATE player_state SET last_heartbeat = NOW() - INTERVAL '40 seconds' WHERE user_id = $1::uuid")
+        .bind(&auth.player_id)
         .execute(&h.pool)
         .await
         .unwrap();
@@ -625,7 +631,7 @@ async fn stale_entry_resets_player_state(pool: sqlx::PgPool) {
     let h = setup_temporal(pool).await;
 
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
-    p1.authenticate_test_token(703, &h.base_url).await.unwrap();
+    let auth = p1.authenticate_test_token(703, &h.base_url).await.unwrap();
     p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
 
     // Wait for the entry, then pretend the player idled past the 30s stale
@@ -633,8 +639,9 @@ async fn stale_entry_resets_player_state(pool: sqlx::PgPool) {
     // menus so a reconnect reports "in_menus", not a stale "queueing".
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let queued: Option<i64> =
-            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 703")
+        let queued: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM matchmaking_queue WHERE user_id = $1::uuid")
+                .bind(&auth.player_id)
                 .fetch_optional(&h.pool)
                 .await
                 .unwrap();
@@ -647,7 +654,8 @@ async fn stale_entry_resets_player_state(pool: sqlx::PgPool) {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    sqlx::query("UPDATE player_state SET last_heartbeat = NOW() - INTERVAL '40 seconds' WHERE steam_id = 703")
+    sqlx::query("UPDATE player_state SET last_heartbeat = NOW() - INTERVAL '40 seconds' WHERE user_id = $1::uuid")
+        .bind(&auth.player_id)
         .execute(&h.pool)
         .await
         .unwrap();
@@ -655,7 +663,8 @@ async fn stale_entry_resets_player_state(pool: sqlx::PgPool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(6);
     loop {
         let state: Option<String> =
-            sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = 703")
+            sqlx::query_scalar("SELECT state FROM player_state WHERE user_id = $1::uuid")
+                .bind(&auth.player_id)
                 .fetch_optional(&h.pool)
                 .await
                 .unwrap();
@@ -678,14 +687,15 @@ async fn heartbeat_keeps_queued_alive(pool: sqlx::PgPool) {
     let h = setup_temporal(pool).await;
 
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
-    p1.authenticate_test_token(702, &h.base_url).await.unwrap();
+    let auth = p1.authenticate_test_token(702, &h.base_url).await.unwrap();
     p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
 
     // Wait for the server to enqueue the player (fire-and-forget message).
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let queued: Option<i64> =
-            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 702")
+        let queued: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM matchmaking_queue WHERE user_id = $1::uuid")
+                .bind(&auth.player_id)
                 .fetch_optional(&h.pool)
                 .await
                 .unwrap();
@@ -702,7 +712,8 @@ async fn heartbeat_keeps_queued_alive(pool: sqlx::PgPool) {
     // The player's heartbeat is 40s old: without heartbeats the next tick
     // would drop the entry (see queue_expired_notifies_player). Keep the
     // client heartbeating across several 2s ticker cycles instead.
-    sqlx::query("UPDATE player_state SET last_heartbeat = NOW() - INTERVAL '40 seconds' WHERE steam_id = 702")
+    sqlx::query("UPDATE player_state SET last_heartbeat = NOW() - INTERVAL '40 seconds' WHERE user_id = $1::uuid")
+        .bind(&auth.player_id)
         .execute(&h.pool)
         .await
         .unwrap();
@@ -715,8 +726,9 @@ async fn heartbeat_keeps_queued_alive(pool: sqlx::PgPool) {
     // One more full tick without a heartbeat (it ages to ~4s) — still well
     // inside the 30s window, so the entry must have survived cleanup.
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let still: Option<i64> =
-        sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 702")
+    let still: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM matchmaking_queue WHERE user_id = $1::uuid")
+            .bind(&auth.player_id)
             .fetch_optional(&h.pool)
             .await
             .unwrap();
@@ -1099,7 +1111,7 @@ async fn server_game_full_lifecycle(pool: sqlx::PgPool) {
     let (mock_url, recorded, base_slot) = spawn_mock_creator(true).await;
     let h = setup_temporal_with_creator(pool, Some(&mock_url)).await;
     *base_slot.lock().await = Some(h.base_url.clone());
-    let (mut p1, mut p2, token) = pair_up(&h, 300, 301, "server_arena").await;
+    let (mut p1, mut p2, token, _pid1, _pid2) = pair_up(&h, 300, 301, "server_arena").await;
 
     // Accept only — server matches reject start_match (mark_connected guard).
     p1.accept_match(&token).await.unwrap();
@@ -1211,7 +1223,7 @@ async fn server_game_full_lifecycle(pool: sqlx::PgPool) {
 async fn server_game_alloc_timeout(pool: sqlx::PgPool) {
     let mock_url = spawn_failing_mock_creator().await;
     let h = setup_temporal_with_creator(pool, Some(&mock_url)).await;
-    let (mut p1, mut p2, token) = pair_up(&h, 300, 301, "server_arena").await;
+    let (mut p1, mut p2, token, _pid1, _pid2) = pair_up(&h, 300, 301, "server_arena").await;
 
     p1.accept_match(&token).await.unwrap();
     p2.accept_match(&token).await.unwrap();
@@ -1271,7 +1283,7 @@ async fn server_game_alloc_timeout(pool: sqlx::PgPool) {
 async fn server_game_result_timeout(pool: sqlx::PgPool) {
     let (mock_url, _recorded, _base_slot) = spawn_mock_creator(false).await;
     let h = setup_temporal_with_creator(pool, Some(&mock_url)).await;
-    let (mut p1, mut p2, token) = pair_up(&h, 300, 301, "server_arena").await;
+    let (mut p1, mut p2, token, _pid1, _pid2) = pair_up(&h, 300, 301, "server_arena").await;
 
     p1.accept_match(&token).await.unwrap();
     p2.accept_match(&token).await.unwrap();
@@ -1340,7 +1352,7 @@ async fn game_result_callback_security(pool: sqlx::PgPool) {
     let (mock_url, _recorded, base_slot) = spawn_mock_creator(true).await;
     let h = setup_temporal_with_creator(pool, Some(&mock_url)).await;
     *base_slot.lock().await = Some(h.base_url.clone());
-    let (mut p1, mut p2, token) = pair_up(&h, 300, 301, "server_arena").await;
+    let (mut p1, mut p2, token, _pid1, _pid2) = pair_up(&h, 300, 301, "server_arena").await;
 
     p1.accept_match(&token).await.unwrap();
     p2.accept_match(&token).await.unwrap();
@@ -1414,7 +1426,7 @@ async fn game_result_callback_security(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn pong_auto_resolves_on_three_points(pool: sqlx::PgPool) {
     let h = setup_temporal_pong(pool).await;
-    let (mut p1, mut p2, token) = pair_up(&h, 110, 210, "ranked_1v1").await;
+    let (mut p1, mut p2, token, pid1, _pid2) = pair_up(&h, 110, 210, "ranked_1v1").await;
 
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
@@ -1436,10 +1448,10 @@ async fn pong_auto_resolves_on_three_points(pool: sqlx::PgPool) {
     // Step 11: the referee is playback-only — it exits at 3 points WITHOUT
     // resolving. The workflow resolves on the clients' who_won reports: 110
     // (serve line, scores every rally) claims the win and both report it.
-    p1.submit_report(&token, Some(110), Some("demo-a"))
+    p1.submit_report(&token, Some(&pid1), Some("demo-a"))
         .await
         .unwrap();
-    p2.submit_report(&token, Some(110), Some("demo-b"))
+    p2.submit_report(&token, Some(&pid1), Some("demo-b"))
         .await
         .unwrap();
 
@@ -1450,12 +1462,13 @@ async fn pong_auto_resolves_on_three_points(pool: sqlx::PgPool) {
         "the workflow must resolve the match after both players report"
     );
     // `outcome` is player_a-perspective and pairing order is racy.
-    let player_a: i64 = sqlx::query_scalar("SELECT player_a FROM matches WHERE match_token = $1")
-        .bind(&token)
-        .fetch_one(&h.pool)
-        .await
-        .unwrap();
-    let expected = if player_a as u64 == 110 {
+    let player_a: uuid::Uuid =
+        sqlx::query_scalar("SELECT player_a FROM matches WHERE match_token = $1")
+            .bind(&token)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    let expected = if player_a.to_string() == pid1 {
         "Win"
     } else {
         "Loss"
@@ -1472,13 +1485,13 @@ async fn pong_auto_resolves_on_three_points(pool: sqlx::PgPool) {
     );
 
     // Both players reset to the menus (resolve_agreed terminal reset).
-    let s110: String = sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = $1")
-        .bind(110i64)
+    let s110: String = sqlx::query_scalar("SELECT state FROM player_state WHERE user_id = $1::uuid")
+        .bind(&pid1)
         .fetch_one(&h.pool)
         .await
         .unwrap();
-    let s210: String = sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = $1")
-        .bind(210i64)
+    let s210: String = sqlx::query_scalar("SELECT state FROM player_state WHERE user_id = $1::uuid")
+        .bind(&_pid2)
         .fetch_one(&h.pool)
         .await
         .unwrap();
@@ -1497,7 +1510,7 @@ async fn pong_auto_resolves_on_three_points(pool: sqlx::PgPool) {
         _ => None,
     })
     .await;
-    assert_eq!(winner, 110, "110 must claim the victory");
+    assert_eq!(winner, pid1, "110 must claim the victory");
 
     drop(p1);
     drop(p2);
@@ -1511,14 +1524,14 @@ async fn queueing_survives_stale_sweep_after_reconnect(pool: sqlx::PgPool) {
     let h = setup_temporal(pool).await;
 
     let mut c1 = LobbyClient::connect(&h.ws_url).await.unwrap();
-    c1.authenticate_test_token(702, &h.base_url).await.unwrap();
+    let auth = c1.authenticate_test_token(702, &h.base_url).await.unwrap();
 
     // Age the player's liveness past the sweep cutoff (like a player who
     // reconnects after their last session's heartbeats went stale).
     sqlx::query(
-        "UPDATE player_state SET last_heartbeat = NOW() - INTERVAL '60 seconds' WHERE steam_id = $1",
+        "UPDATE player_state SET last_heartbeat = NOW() - INTERVAL '60 seconds' WHERE user_id = $1::uuid",
     )
-    .bind(702i64)
+    .bind(&auth.player_id)
     .execute(&h.pool)
     .await
     .unwrap();
@@ -1529,8 +1542,9 @@ async fn queueing_survives_stale_sweep_after_reconnect(pool: sqlx::PgPool) {
     // entry on the first tick after queueing.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    let queued: Option<i64> =
-        sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 702")
+    let queued: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM matchmaking_queue WHERE user_id = $1::uuid")
+            .bind(&auth.player_id)
             .fetch_optional(&h.pool)
             .await
             .unwrap();
@@ -1538,7 +1552,8 @@ async fn queueing_survives_stale_sweep_after_reconnect(pool: sqlx::PgPool) {
         queued.is_some(),
         "a just-queued player must survive the stale sweep"
     );
-    let state: String = sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = 702")
+    let state: String = sqlx::query_scalar("SELECT state FROM player_state WHERE user_id = $1::uuid")
+        .bind(&auth.player_id)
         .fetch_one(&h.pool)
         .await
         .unwrap();
@@ -1552,7 +1567,7 @@ async fn start_timeout_forfeits_non_starter(pool: sqlx::PgPool) {
     // Both players accept; only p1 (110) clicks START. After the 2s window,
     // the server must forfeit p2 and award the match to p1.
     let h = setup_temporal_pong_start_timeout(pool, 2).await;
-    let (mut p1, mut p2, token) = pair_up(&h, 110, 210, "ranked_1v1").await;
+    let (mut p1, mut p2, token, pid1, _pid2) = pair_up(&h, 110, 210, "ranked_1v1").await;
 
     p1.accept_match(&token).await.unwrap();
     p2.accept_match(&token).await.unwrap();
@@ -1570,12 +1585,13 @@ async fn start_timeout_forfeits_non_starter(pool: sqlx::PgPool) {
     );
     // outcome is player_a-perspective; pairing order is racy, so compute the
     // expected value from the starter's side.
-    let player_a: i64 = sqlx::query_scalar("SELECT player_a FROM matches WHERE match_token = $1")
-        .bind(&token)
-        .fetch_one(&h.pool)
-        .await
-        .unwrap();
-    let expected = if player_a as u64 == 110 {
+    let player_a: uuid::Uuid =
+        sqlx::query_scalar("SELECT player_a FROM matches WHERE match_token = $1")
+            .bind(&token)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    let expected = if player_a.to_string() == pid1 {
         "Win"
     } else {
         "Loss"
@@ -1593,16 +1609,16 @@ async fn start_timeout_forfeits_non_starter(pool: sqlx::PgPool) {
 
     // The starter's rating rises; the non-starter's falls.
     let mu110: f64 = sqlx::query_scalar(
-        "SELECT mu FROM ratings WHERE steam_id = $1 AND game_mode = 'ranked_1v1'",
+        "SELECT mu FROM ratings WHERE user_id = $1::uuid AND game_mode = 'ranked_1v1'",
     )
-    .bind(110i64)
+    .bind(&pid1)
     .fetch_one(&h.pool)
     .await
     .unwrap();
     let mu210: f64 = sqlx::query_scalar(
-        "SELECT mu FROM ratings WHERE steam_id = $1 AND game_mode = 'ranked_1v1'",
+        "SELECT mu FROM ratings WHERE user_id = $1::uuid AND game_mode = 'ranked_1v1'",
     )
-    .bind(210i64)
+    .bind(&_pid2)
     .fetch_one(&h.pool)
     .await
     .unwrap();
@@ -1621,7 +1637,7 @@ async fn start_timeout_forfeits_neither(pool: sqlx::PgPool) {
     // Both players accept but NEITHER clicks START → double loss (user
     // decision): outcome "Forfeit", both mu changes negative, both freed.
     let h = setup_temporal_pong_start_timeout(pool, 2).await;
-    let (mut p1, mut p2, token) = pair_up(&h, 110, 210, "ranked_1v1").await;
+    let (mut p1, mut p2, token, pid1, pid2) = pair_up(&h, 110, 210, "ranked_1v1").await;
 
     p1.accept_match(&token).await.unwrap();
     p2.accept_match(&token).await.unwrap();
@@ -1661,13 +1677,13 @@ async fn start_timeout_forfeits_neither(pool: sqlx::PgPool) {
     );
 
     // Terminal: both players return to the menus.
-    let s110: String = sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = $1")
-        .bind(110i64)
+    let s110: String = sqlx::query_scalar("SELECT state FROM player_state WHERE user_id = $1::uuid")
+        .bind(&pid1)
         .fetch_one(&h.pool)
         .await
         .unwrap();
-    let s210: String = sqlx::query_scalar("SELECT state FROM player_state WHERE steam_id = $1")
-        .bind(210i64)
+    let s210: String = sqlx::query_scalar("SELECT state FROM player_state WHERE user_id = $1::uuid")
+        .bind(&pid2)
         .fetch_one(&h.pool)
         .await
         .unwrap();
@@ -1695,7 +1711,7 @@ async fn pong_broadcasts_round_start_and_holds(pool: sqlx::PgPool) {
     // RoundStart and then hold the sim frozen (constant checksum) for exactly
     // 90 frames before any checksum changes.
     let h = setup_temporal_pong_countdown(pool).await;
-    let (mut p1, mut p2, token) = pair_up(&h, 110, 210, "ranked_1v1").await;
+    let (mut p1, mut p2, token, _pid1, _pid2) = pair_up(&h, 110, 210, "ranked_1v1").await;
 
     p1.accept_match(&token).await.unwrap();
     p2.accept_match(&token).await.unwrap();
@@ -1781,24 +1797,26 @@ async fn pair_next_match_atomicity(pool: sqlx::PgPool) {
 
     // Two queued players (Queueing state) for ranked_1v1, seeded directly.
     for sid in [1001u64, 1002u64] {
-        sqlx::query("INSERT INTO users (steam_id, display_name) VALUES ($1, 'atomic-test')")
+        let uid = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, steam_id, display_name) VALUES ($1, $2, 'atomic-test')")
+            .bind(uid)
             .bind(sid as i64)
             .execute(&h.pool)
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO player_state (steam_id, state, last_heartbeat) \
+            "INSERT INTO player_state (user_id, state, last_heartbeat) \
              VALUES ($1, 'Queueing', NOW())",
         )
-        .bind(sid as i64)
+        .bind(uid)
         .execute(&h.pool)
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO matchmaking_queue (steam_id, game_mode, match_difficulty, mu, queued_at) \
+            "INSERT INTO matchmaking_queue (user_id, game_mode, match_difficulty, mu, queued_at) \
              VALUES ($1, 'ranked_1v1', 'normal', 25.0, NOW())",
         )
-        .bind(sid as i64)
+        .bind(uid)
         .execute(&h.pool)
         .await
         .unwrap();
@@ -1833,14 +1851,15 @@ async fn requeue_after_unqueue_pairs(pool: sqlx::PgPool) {
     let h = setup_temporal(pool).await;
 
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
-    p1.authenticate_test_token(803, &h.base_url).await.unwrap();
+    let auth = p1.authenticate_test_token(803, &h.base_url).await.unwrap();
     p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
 
     // Wait for the entry, then unqueue.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let queued: Option<i64> =
-            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 803")
+        let queued: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM matchmaking_queue WHERE user_id = $1::uuid")
+                .bind(&auth.player_id)
                 .fetch_optional(&h.pool)
                 .await
                 .unwrap();
@@ -1858,8 +1877,9 @@ async fn requeue_after_unqueue_pairs(pool: sqlx::PgPool) {
     // The leave_queue activity removes the row asynchronously.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let queued: Option<i64> =
-            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 803")
+        let queued: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM matchmaking_queue WHERE user_id = $1::uuid")
+                .bind(&auth.player_id)
                 .fetch_optional(&h.pool)
                 .await
                 .unwrap();
@@ -1905,13 +1925,14 @@ async fn reconnect_then_unqueue_removes_entry(pool: sqlx::PgPool) {
     let h = setup_temporal(pool).await;
 
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
-    p1.authenticate_test_token(805, &h.base_url).await.unwrap();
+    let auth = p1.authenticate_test_token(805, &h.base_url).await.unwrap();
     p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let queued: Option<i64> =
-            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 805")
+        let queued: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM matchmaking_queue WHERE user_id = $1::uuid")
+                .bind(&auth.player_id)
                 .fetch_optional(&h.pool)
                 .await
                 .unwrap();
@@ -1936,8 +1957,9 @@ async fn reconnect_then_unqueue_removes_entry(pool: sqlx::PgPool) {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let queued: Option<i64> =
-            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 805")
+        let queued: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM matchmaking_queue WHERE user_id = $1::uuid")
+                .bind(&auth.player_id)
                 .fetch_optional(&h.pool)
                 .await
                 .unwrap();
@@ -1957,7 +1979,7 @@ async fn reconnect_then_unqueue_removes_entry(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn p2p_match_workflow_decline_completes(pool: sqlx::PgPool) {
     let h = setup_temporal(pool).await;
-    let (mut p1, mut p2, token) = pair_up(&h, 801, 802, "ranked_1v1").await;
+    let (mut p1, mut p2, token, _pid1, pid2) = pair_up(&h, 801, 802, "ranked_1v1").await;
 
     // p1 accepts first — the pre-fix code recorded the ACCEPTOR (p1) as the
     // decliner when one player accepted before the other declined.
@@ -1983,16 +2005,16 @@ async fn p2p_match_workflow_decline_completes(pool: sqlx::PgPool) {
     }
 
     // (b) The declined event records the REAL decliner (p2), not the acceptor.
-    let decliner: Option<i64> = sqlx::query_scalar(
-        "SELECT steam_id FROM match_events WHERE match_token = $1 AND event_type = 'declined'",
+    let decliner: Option<String> = sqlx::query_scalar(
+        "SELECT user_id::text FROM match_events WHERE match_token = $1 AND event_type = 'declined'",
     )
     .bind(&token)
     .fetch_optional(&h.pool)
     .await
     .unwrap();
     assert_eq!(
-        decliner,
-        Some(802),
+        decliner.as_deref(),
+        Some(pid2.as_str()),
         "declined event must record the real decliner"
     );
 
@@ -2005,14 +2027,15 @@ async fn queue_expired_allows_requeue(pool: sqlx::PgPool) {
     let h = setup_temporal(pool).await;
 
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
-    p1.authenticate_test_token(806, &h.base_url).await.unwrap();
+    let auth = p1.authenticate_test_token(806, &h.base_url).await.unwrap();
     p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
 
     // Wait for the entry, then age the heartbeat past the 30s stale window.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let queued: Option<i64> =
-            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 806")
+        let queued: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM matchmaking_queue WHERE user_id = $1::uuid")
+                .bind(&auth.player_id)
                 .fetch_optional(&h.pool)
                 .await
                 .unwrap();
@@ -2026,8 +2049,9 @@ async fn queue_expired_allows_requeue(pool: sqlx::PgPool) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     sqlx::query(
-        "UPDATE player_state SET last_heartbeat = NOW() - INTERVAL '40 seconds' WHERE steam_id = 806",
+        "UPDATE player_state SET last_heartbeat = NOW() - INTERVAL '40 seconds' WHERE user_id = $1::uuid",
     )
+    .bind(&auth.player_id)
     .execute(&h.pool)
     .await
     .unwrap();
@@ -2053,8 +2077,9 @@ async fn queue_expired_allows_requeue(pool: sqlx::PgPool) {
     p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let queued: Option<i64> =
-            sqlx::query_scalar("SELECT steam_id FROM matchmaking_queue WHERE steam_id = 806")
+        let queued: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM matchmaking_queue WHERE user_id = $1::uuid")
+                .bind(&auth.player_id)
                 .fetch_optional(&h.pool)
                 .await
                 .unwrap();
@@ -2069,4 +2094,360 @@ async fn queue_expired_allows_requeue(pool: sqlx::PgPool) {
     }
 
     drop(p1);
+}
+// ── OAuth2/OIDC provider tests (login-providers Step 9b) ──────────────────
+
+/// Shared mutable state the mock OAuth routes read/write: tests swap
+/// `userinfo` to simulate a changed group membership.
+pub struct MockSlots {
+    pub userinfo: tokio::sync::RwLock<serde_json::Value>,
+}
+
+/// Spawn a mock OAuth2/OIDC provider on an ephemeral port.
+/// Routes: /authorize (307 → redirect_uri&code=mock-code-{provider}),
+/// /token (→ {"access_token": "mock-token"}), /userinfo (→ slots.userinfo).
+async fn spawn_mock_oauth(provider: &str) -> (String, std::sync::Arc<MockSlots>) {
+    let base_userinfo = serde_json::json!({
+        "sub": format!("mock-uid-{provider}"),
+        "preferred_username": format!("Mock {provider}"),
+        "id": format!("mock-uid-{provider}"),
+        "global_name": format!("Mock {provider}"),
+    });
+    let mut userinfo = base_userinfo;
+    if provider == "au2143" {
+        userinfo["groups"] = serde_json::json!(["pvp_admin"]);
+    }
+    let slots = std::sync::Arc::new(MockSlots {
+        userinfo: tokio::sync::RwLock::new(userinfo),
+    });
+
+    let provider_owned = provider.to_string();
+    let slots_route = slots.clone();
+    let app = Router::new()
+        .route(
+            "/authorize",
+            axum::routing::get(move |axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>| {
+                let provider = provider_owned.clone();
+                async move {
+                    let redirect_uri = params.get("redirect_uri").cloned().unwrap_or_default();
+                    axum::response::Redirect::temporary(&format!(
+                        "{redirect_uri}?code=mock-code-{provider}&state={}",
+                        params.get("state").cloned().unwrap_or_default()
+                    ))
+                }
+            }),
+        )
+        .route(
+            "/token",
+            axum::routing::post(|| async { Json(serde_json::json!({"access_token": "mock-token"})) }),
+        )
+        .route(
+            "/userinfo",
+            axum::routing::get({
+                let slots = slots_route.clone();
+                move || {
+                    let slots = slots.clone();
+                    async move { Json(slots.userinfo.read().await.clone()) }
+                }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    (format!("http://{addr}"), slots)
+}
+
+/// Build a ProviderConfig pointing at the mock's endpoints.
+fn mock_provider_config(id: &str, base: &str) -> ProviderConfig {
+    ProviderConfig {
+        id: id.to_string(),
+        kind: if id == "discord" {
+            ProviderKind::OAuth2
+        } else {
+            ProviderKind::Oidc
+        },
+        client_id: format!("mock-client-{id}"),
+        client_secret: format!("mock-secret-{id}"),
+        authorization_endpoint: format!("{base}/authorize"),
+        token_endpoint: format!("{base}/token"),
+        userinfo_endpoint: format!("{base}/userinfo"),
+        scopes: vec!["openid".into(), "groups".into()],
+        id_field: if id == "discord" { "id".into() } else { "sub".into() },
+        name_field: if id == "discord" { "global_name".into() } else { "preferred_username".into() },
+        use_pkce: id != "discord",
+    }
+}
+
+/// Walk the full redirect chain manually (reqwest with redirects disabled):
+/// login → mock /authorize (307) → callback with the code.
+async fn walk_provider_login(h: &common::TestHarness, provider: &str) -> String {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let login_url = format!("{}/auth/{provider}/login?return_to=/", h.base_url);
+    let login_resp = client.get(&login_url).send().await.unwrap();
+    assert_eq!(login_resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    let authorize_url = login_resp
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    // The mock's /authorize 307 echoes the callback URL the server built from
+    // PUBLIC_URL (https://lobby.example.com — not resolvable in tests). Parse
+    // the code+state out of that location and re-target the callback at the
+    // live test server's base_url.
+    let auth_resp = client.get(&authorize_url).send().await.unwrap();
+    assert_eq!(auth_resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    let mock_loc = auth_resp
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let parsed = url::Url::parse(&mock_loc).unwrap();
+    let code = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default();
+    let state = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default();
+    let callback_url = format!(
+        "{}/auth/{provider}/callback?code={code}&state={state}&return_to=/",
+        h.base_url
+    );
+    // Follow the callback to the final #token= redirect.
+    let cb_resp = client.get(&callback_url).send().await.unwrap();
+    assert_eq!(cb_resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    let final_url = cb_resp
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    final_url
+        .split("#token=")
+        .nth(1)
+        .expect("callback redirect must carry #token=")
+        .to_string()
+}
+
+#[sqlx::test]
+async fn oauth_login_creates_account_and_plays_match(pool: sqlx::PgPool) {
+    let (mock_base, _slots) = spawn_mock_oauth("discord").await;
+    let h = setup_temporal_with_auth(
+        pool,
+        vec![mock_provider_config("discord", &mock_base)],
+    )
+    .await;
+
+    let token = walk_provider_login(&h, "discord").await;
+
+    // The JWT validates and the account exists with steam_id NULL + identity.
+    let ws_auth: lobby_client::AuthOk = {
+        let mut c = lobby_client::LobbyClient::connect(&h.ws_url).await.unwrap();
+        c.authenticate(&token).await.unwrap()
+    };
+    let user_id = ws_auth.player_id.clone();
+    assert!(!user_id.is_empty(), "player_id must be a non-empty UUID string");
+    let row = sqlx::query_as::<_, (Option<i64>, String)>(
+        "SELECT steam_id, primary_provider FROM users WHERE id = $1::uuid",
+    )
+    .bind(&user_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, None, "discord user must have steam_id NULL");
+    assert_eq!(row.1, "discord");
+    let identity = sqlx::query_as::<_, (String,)>(
+        "SELECT provider_uid FROM user_identities WHERE provider = 'discord' AND user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(identity.0, "mock-uid-discord");
+
+    // The discord player queues against a dev player and plays a full match.
+    let mut p1 = lobby_client::LobbyClient::connect(&h.ws_url).await.unwrap();
+    let _ = p1.authenticate(&token).await.unwrap();
+    let mut p2 = lobby_client::LobbyClient::connect(&h.ws_url).await.unwrap();
+    let a2 = p2
+        .authenticate_test_token(200, &h.base_url)
+        .await
+        .unwrap();
+    p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+    p2.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+    let m1 = timeout(Duration::from_secs(15), p1.wait_for_match())
+        .await
+        .expect("p1 match")
+        .unwrap()
+        .unwrap();
+    let m2 = timeout(Duration::from_secs(15), p2.wait_for_match())
+        .await
+        .expect("p2 match")
+        .unwrap()
+        .unwrap();
+    assert_eq!(m1.match_token, m2.match_token);
+    p1.accept_match(&m1.match_token).await.unwrap();
+    p2.accept_match(&m1.match_token).await.unwrap();
+    assert!(wait_for_status(&h.pool, &m1.match_token, "InProgress").await);
+    p1.start_match(&m1.match_token).await.unwrap();
+    p2.start_match(&m1.match_token).await.unwrap();
+    assert!(wait_for_status(&h.pool, &m1.match_token, "Reporting").await);
+    p1.submit_report(&m1.match_token, Some(&user_id), None)
+        .await
+        .unwrap();
+    p2.submit_report(&m1.match_token, Some(&user_id), None)
+        .await
+        .unwrap();
+    assert!(
+        wait_for_row(
+            &h.pool,
+            &m1.match_token,
+            "SELECT match_token, mu_change_a FROM match_results WHERE match_token = $1",
+        )
+        .await
+        .is_some(),
+        "match must resolve for a non-Steam player"
+    );
+    let _ = a2.player_id;
+}
+
+#[sqlx::test]
+async fn auth_config_advertises_configured_providers(pool: sqlx::PgPool) {
+    let (mock_base, _slots) = spawn_mock_oauth("discord").await;
+    let h = setup_temporal_with_auth(
+        pool,
+        vec![mock_provider_config("discord", &mock_base)],
+    )
+    .await;
+    let cfg: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/auth/config", h.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let providers = cfg["providers"].as_array().unwrap();
+    assert!(
+        providers.iter().any(|p| p.as_str() == Some("discord")),
+        "providers must contain discord"
+    );
+    assert!(
+        !providers.iter().any(|p| p.as_str() == Some("au2143")),
+        "providers must NOT contain au2143 (not configured)"
+    );
+    assert!(
+        providers.iter().any(|p| p.as_str() == Some("steam")),
+        "public_url is set, so steam must be listed"
+    );
+}
+
+#[sqlx::test]
+async fn unknown_provider_404s(pool: sqlx::PgPool) {
+    let h = setup_temporal(pool).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{}/auth/nope/login", h.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn au2143_discovery_failure_disables_provider() {
+    // Build a registry with au2143_client_id set + an unreachable issuer and
+    // no overrides → the registry must contain NO au2143 provider.
+    let http = reqwest::Client::new();
+    let registry = lobby_server::auth_providers::build(
+        None,
+        None,
+        Some("au2143-client".into()),
+        Some("au2143-secret".into()),
+        "http://127.0.0.1:1".into(), // nothing listens here — discovery fails fast
+        None,
+        &http,
+    )
+    .await;
+    assert!(
+        registry.get("au2143").is_none(),
+        "discovery failure must disable the au2143 provider, never a boot error"
+    );
+    assert!(registry.providers.is_empty());
+}
+
+#[sqlx::test]
+async fn au2143_group_controls_admin_flag(pool: sqlx::PgPool) {
+    let (mock_base, slots) = spawn_mock_oauth("au2143").await;
+    let h = setup_temporal_with_auth(
+        pool,
+        vec![mock_provider_config("au2143", &mock_base)],
+    )
+    .await;
+
+    // First login: the mock userinfo carries groups: ["pvp_admin"].
+    let token = walk_provider_login(&h, "au2143").await;
+    let mut c = lobby_client::LobbyClient::connect(&h.ws_url).await.unwrap();
+    let auth = c.authenticate(&token).await.unwrap();
+    let user_id = auth.player_id.clone();
+    let is_admin: bool = sqlx::query_scalar("SELECT is_admin FROM users WHERE id = $1::uuid")
+        .bind(&user_id)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert!(is_admin, "pvp_admin group must set is_admin = true");
+
+    // Group removed → re-login clears the flag (self-healing revocation).
+    {
+        let mut ui = slots.userinfo.write().await;
+        ui["groups"] = serde_json::json!(["pvp_regular"]);
+    }
+    let token2 = walk_provider_login(&h, "au2143").await;
+    let mut c2 = lobby_client::LobbyClient::connect(&h.ws_url).await.unwrap();
+    let auth2 = c2.authenticate(&token2).await.unwrap();
+    assert_eq!(auth2.player_id, user_id, "same sub → same account");
+    let is_admin2: bool = sqlx::query_scalar("SELECT is_admin FROM users WHERE id = $1::uuid")
+        .bind(&user_id)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert!(!is_admin2, "group removal must clear the flag on the next login");
+
+    // A discord login (no groups claim) stays false on its own row.
+    let (mock2_base, _s2) = spawn_mock_oauth("discord").await;
+    let h2 = setup_temporal_with_auth(
+        h.pool.clone(),
+        vec![
+            mock_provider_config("au2143", &mock_base),
+            mock_provider_config("discord", &mock2_base),
+        ],
+    )
+    .await;
+    let dtoken = walk_provider_login(&h2, "discord").await;
+    let mut dc = lobby_client::LobbyClient::connect(&h2.ws_url).await.unwrap();
+    let dauth = dc.authenticate(&dtoken).await.unwrap();
+    let is_admin3: bool = sqlx::query_scalar("SELECT is_admin FROM users WHERE id = $1::uuid")
+        .bind(&dauth.player_id)
+        .fetch_one(&h2.pool)
+        .await
+        .unwrap();
+    assert!(!is_admin3, "discord login (no groups claim) must leave is_admin false");
 }

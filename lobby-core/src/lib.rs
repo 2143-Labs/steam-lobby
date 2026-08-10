@@ -7,7 +7,7 @@
 //! - `player` — `PlayerManager`'s `PlayerState` machine.
 //! - `queue` — matchmaking + expanding `search_band`.
 //! - `traits` — the storage/callback traits the core depends on.
-//! - `types` — wire types + Steam-ID serde helpers.
+//! - `types` — wire types (player_id-keyed).
 pub mod error;
 mod match_expiry;
 pub mod match_lifecycle;

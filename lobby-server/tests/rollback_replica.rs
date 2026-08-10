@@ -135,14 +135,14 @@ impl ReplicaDriver {
 async fn drive_client(
     p: &mut LobbyClient,
     token: &str,
-    my_id: u64,
+    pid: &str,
     diverge_at: Option<u32>,
     deadline: Instant,
-) -> (Option<u64>, PongSide, bool) {
+) -> (Option<String>, PongSide, bool) {
     let mut driver: Option<ReplicaDriver> = None;
     let mut server_checksums: HashMap<u32, u64> = HashMap::new();
     let mut last_state_frame: Option<u32> = None;
-    let mut winner: Option<u64> = None;
+    let mut winner: Option<String> = None;
     let mut resynced = false;
 
     while Instant::now() < deadline {
@@ -154,7 +154,7 @@ async fn drive_client(
                 ..
             }))) => {
                 if driver.is_none() {
-                    let side = if my_id == player_a {
+                    let side = if pid == player_a {
                         PongSide::Left
                     } else {
                         PongSide::Right
@@ -190,13 +190,13 @@ async fn drive_client(
                         if d.diverged {
                             assert_ne!(
                                 local, srv,
-                                "diverged replica must NOT match the referee at frame {frame} (id {my_id}, side {:?})",
+                                "diverged replica must NOT match the referee at frame {frame} (id {pid}, side {:?})",
                                 d.side
                             );
                         } else {
                             assert_eq!(
                                 local, srv,
-                                "replica diverged from the referee at frame {frame} (id {my_id}, side {:?})",
+                                "replica diverged from the referee at frame {frame} (id {pid}, side {:?})",
                                 d.side
                             );
                         }
@@ -227,7 +227,7 @@ async fn drive_client(
 
 /// After both clients report the same winner, the workflow's finish_match
 /// broadcasts GameOver — wait for it.
-async fn wait_game_over(p: &mut LobbyClient, deadline: std::time::Instant) -> u64 {
+async fn wait_game_over(p: &mut LobbyClient, deadline: std::time::Instant) -> String {
     while std::time::Instant::now() < deadline {
         match timeout(Duration::from_secs(5), p.next_event()).await {
             Ok(Some(Ok(ServerEvent::GameOver { winner, .. }))) => return winner,
@@ -242,7 +242,7 @@ async fn wait_game_over(p: &mut LobbyClient, deadline: std::time::Instant) -> u6
 #[sqlx::test]
 async fn pong_three_replicas_converge(pool: sqlx::PgPool) {
     let h = setup_temporal_pong(pool).await;
-    let (mut p1, mut p2, token) = pair_up(&h, 915, 916, "ranked_1v1").await;
+    let (mut p1, mut p2, token, pid1, pid2) = pair_up(&h, 915, 916, "ranked_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
     // Both clients must drive CONCURRENTLY: the referee only advances when
@@ -253,16 +253,16 @@ async fn pong_three_replicas_converge(pool: sqlx::PgPool) {
     // so both clients report the Left player after the drive.
     let deadline = Instant::now() + Duration::from_secs(10);
     let ((_, side1, _), (_, side2, _)) = tokio::join!(
-        drive_client(&mut p1, &token, 915, None, deadline),
-        drive_client(&mut p2, &token, 916, None, deadline),
+        drive_client(&mut p1, &token, &pid1, None, deadline),
+        drive_client(&mut p2, &token, &pid2, None, deadline),
     );
     assert_ne!(side1, side2, "the two clients must be on opposite sides");
 
-    let left_player = if side1 == PongSide::Left { 915 } else { 916 };
-    p1.submit_report(&token, Some(left_player), Some("demo-a"))
+    let left_player = if side1 == PongSide::Left { pid1 } else { pid2 };
+    p1.submit_report(&token, Some(&left_player), Some("demo-a"))
         .await
         .unwrap();
-    p2.submit_report(&token, Some(left_player), Some("demo-b"))
+    p2.submit_report(&token, Some(&left_player), Some("demo-b"))
         .await
         .unwrap();
 
@@ -282,7 +282,7 @@ async fn pong_three_replicas_converge(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn pong_divergence_detected_and_resynced(pool: sqlx::PgPool) {
     let h = setup_temporal_pong(pool).await;
-    let (mut p1, mut p2, token) = pair_up(&h, 913, 914, "ranked_1v1").await;
+    let (mut p1, mut p2, token, pid1, pid2) = pair_up(&h, 913, 914, "ranked_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
     // p1 diverges at frame 25 (well before the winner at ~51); both drives
@@ -290,8 +290,8 @@ async fn pong_divergence_detected_and_resynced(pool: sqlx::PgPool) {
     // Same report-driven GameOver as pong_three_replicas_converge.
     let deadline = Instant::now() + Duration::from_secs(10);
     let ((_, side1, resynced), (_, side2, _)) = tokio::join!(
-        drive_client(&mut p1, &token, 913, Some(25), deadline),
-        drive_client(&mut p2, &token, 914, None, deadline),
+        drive_client(&mut p1, &token, &pid1, Some(25), deadline),
+        drive_client(&mut p2, &token, &pid2, None, deadline),
     );
     assert_ne!(side1, side2, "the two clients must be on opposite sides");
 
@@ -299,11 +299,11 @@ async fn pong_divergence_detected_and_resynced(pool: sqlx::PgPool) {
         resynced,
         "the referee must detect p1's divergence and resync it"
     );
-    let left_player = if side1 == PongSide::Left { 913 } else { 914 };
-    p1.submit_report(&token, Some(left_player), Some("demo-a"))
+    let left_player = if side1 == PongSide::Left { pid1 } else { pid2 };
+    p1.submit_report(&token, Some(&left_player), Some("demo-a"))
         .await
         .unwrap();
-    p2.submit_report(&token, Some(left_player), Some("demo-b"))
+    p2.submit_report(&token, Some(&left_player), Some("demo-b"))
         .await
         .unwrap();
 
@@ -329,15 +329,11 @@ async fn pair_up(
     p1_id: u64,
     p2_id: u64,
     mode: &str,
-) -> (LobbyClient, LobbyClient, String) {
+) -> (LobbyClient, LobbyClient, String, String, String) {
     let mut p1 = LobbyClient::connect(&h.ws_url).await.unwrap();
     let mut p2 = LobbyClient::connect(&h.ws_url).await.unwrap();
-    p1.authenticate_test_token(p1_id, &h.base_url)
-        .await
-        .unwrap();
-    p2.authenticate_test_token(p2_id, &h.base_url)
-        .await
-        .unwrap();
+    let a1 = p1.authenticate_test_token(p1_id, &h.base_url).await.unwrap();
+    let a2 = p2.authenticate_test_token(p2_id, &h.base_url).await.unwrap();
 
     p1.begin_matchmaking(mode, "normal").await.unwrap();
     p2.begin_matchmaking(mode, "normal").await.unwrap();
@@ -357,7 +353,7 @@ async fn pair_up(
         m1.match_token, m2.match_token,
         "both players must get the same match"
     );
-    (p1, p2, m1.match_token)
+    (p1, p2, m1.match_token, a1.player_id, a2.player_id)
 }
 
 async fn accept_and_connect(

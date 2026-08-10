@@ -79,12 +79,12 @@ need a POSIX shell. Use WSL2 or Git Bash, or run the server directly:
 | GET | `/health` | Health check, returns `"ok"` |
 | GET | `/auth/steam/login` | Steam OpenID login redirect |
 | GET | `/auth/steam/callback` | Steam OpenID callback |
-| GET | `/ws` | WebSocket upgrade (game protocol) |
+| GET | `/auth/{provider}/login` | Generic OAuth2/OIDC login redirect (`discord`, `au2143`) |
+| GET | `/auth/{provider}/callback` | Generic OAuth2/OIDC callback (PKCE for au2143) |
 | POST | `/auth/ticket` | Steam ticket auth -> JWT (rate-limited 10/min per IP) |
 | POST | `/auth/test-token` | Dev-only: JWT for any steam_id (only when `AUTH_DEV_MODE=true`) |
 | POST | `/auth/logout` | Revoke the current session token (all earlier tokens die) |
-| GET | `/modes` | Configured matchmaking modes + their game types (the demo dropdown) |
-| GET | `/auth/config` | Auth surface capabilities `{ steam_login, dev_mode }` — the demo gates its login UI on this |
+| GET | `/auth/config` | Auth surface capabilities `{ providers, dev_mode }` — the demo gates its login UI on this |
 | POST | `/internal/game-result/{token}/{secret}` | Gameserver result webhook; the URL itself is the auth |
 
 | Variable | Default | Description |
@@ -122,17 +122,18 @@ The server logs the active mode at startup:
 INFO lobby_server: auth mode: TEST  — /auth/test-token enabled
 INFO lobby_server: auth mode: STEAM — ticket + OpenID verification against Steam (appid 480)
 ```
-
-Or probe `GET /auth/config` — it returns `{ "steam_login": …, "dev_mode": … }`
-(`steam_login` = `PUBLIC_URL` is set, so the Steam button is offered; `dev_mode`
-= `/auth/test-token` is exposed). `POST /auth/test-token` returns a JWT when
-`AUTH_DEV_MODE=true` and `404` otherwise. The web demo (`web/index.html`) fetches
-`/auth/config` on load and shows only the login surfaces the server actually
-offers: the Steam button, the dev steam-ID field, or both. Offline (e.g. opened
-from `file://`) it shows both so the dev flow still works. Its Connect button
-uses the test-token endpoint (or a `#token=` fragment from a Steam login, if
-present); when dev mode is off and no fragment token exists, Connect shows an
-error — only genuine Steam logins work in production.
+Or probe `GET /auth/config` — it returns `{ "providers": […], "dev_mode": … }`
+(`providers` lists the registered login providers: `"steam"` when `PUBLIC_URL`
+is set, plus `"discord"`/`"au2143"` when their client credentials are
+configured; `dev_mode` = `/auth/test-token` is exposed). `POST /auth/test-token`
+returns a JWT when `AUTH_DEV_MODE=true` and `404` otherwise. The web demo
+(`web/index.html`) fetches `/auth/config` on load and shows only the login
+surfaces the server actually offers: a button per listed provider, the dev
+steam-ID field, or both. Offline (e.g. opened from `file://`) it shows the dev
+field so the dev flow still works. Its Connect button uses the test-token
+endpoint (or a `#token=` fragment from a provider login, if present); when dev
+mode is off and no fragment token exists, Connect shows an error — only genuine
+provider logins work in production.
 
 ## WebSocket Quick Test
 
@@ -220,7 +221,7 @@ no separate worker pod). The worker connects to the Temporal frontend at
 |----------|----|-----|
 | **Schedule** (per P2P mode) | `matchmaker-{mode}-{queue}` | Fires a short `PairOnceWorkflow` every 2s (`ScheduleOverlapPolicy::Skip` = single writer); **pauses when the queue is idle** (fewer than 2 players), unpauses on enqueue; deleted on worker shutdown so tests don't accumulate schedules. |
 | `PairOnceWorkflow` | `pair-{mode}-{queue}-{timestamp}` | One `pair_matches` activity (a single `FOR UPDATE` transaction: MMR-band pair, create match, signal both sessions, start the P2P workflow), then returns. Replaces the old infinite `MatchmakerWorkflow` loop. |
-| `UserSessionWorkflow` | `user-session-{steam_id}-{session_id}` | Per **WS connection** (session UUID). Recovers queue/match state from the DB on start; driven by `queue`/`unqueue`/`match_found`/`queue_expired`/`disconnect` signals; ends on disconnect or the 24h TTL. |
+| `UserSessionWorkflow` | `user-session-{player_id}-{session_id}` | Per **WS connection** (session UUID). Recovers queue/match state from the DB on start; driven by `queue`/`unqueue`/`match_found`/`queue_expired`/`disconnect` signals; ends on disconnect or the 24h TTL. |
 | `P2PMatchWorkflow` | `match-{match_token}` | The coordinator: accept window (30s) → START window (15s, forfeit) → report window (300s) — each a workflow timer racing the clients' signals. Sole lifecycle writer. |
 
 The queue is the `matchmaking_queue` DB row — there is **no queue workflow**.
@@ -241,24 +242,24 @@ See `docs/temporal.md` for the full design.
 
 ## How It Works
 
-Players connect over WebSocket and authenticate with a JWT (obtained via Steam OpenID or the dev token endpoint). Once authenticated, a player enters the queue with a difficulty (Easy/Normal/Hard) at their current MMR.
+Players connect over WebSocket and authenticate with a JWT (obtained via Steam OpenID, Discord, au.2143.me, or the dev token endpoint). Once authenticated, a player enters the queue with a difficulty (Easy/Normal/Hard) at their current MMR.
 
 When a match is found, both players receive a `MatchFound` message. Both must accept before the match transitions to `InProgress`. After the match, each player submits a report (winner + optional demo hash). If both agree, ratings update via the Weng-Lin algorithm (a modern Bayesian system with uncertainty tracking). If they disagree or demo hashes mismatch, the match is disputed.
 
-Every pairing, accept, and decline is appended to the `match_events` audit table (`event_type` `paired`/`accepted`/`declined`, actor `steam_id`, timestamp), and a declined match is immediately marked `Disputed`.
+Every pairing, accept, and decline is appended to the `match_events` audit table (`event_type` `paired`/`accepted`/`declined`, actor `player_id`, timestamp), and a declined match is immediately marked `Disputed`.
 
 ## Codebase Map
 
 | Crate | File | Responsibility |
 |-------|------|----------------|
-| lobby-core | `types.rs` | Wire types + Steam-ID serde helpers |
+| lobby-core | `types.rs` | Wire types (player_id-keyed) |
 | lobby-core | `traits.rs` | Storage/callback traits |
 | lobby-core | `player.rs` | `PlayerManager` state machine |
 | lobby-core | `queue.rs` | Matchmaking + expanding search band |
 | lobby-core | `match_lifecycle.rs` / `match_expiry.rs` | MatchManager player actions / expiry |
 | lobby-core | `mmr.rs` | Weng-Lin rating math |
 | lobby-core | `error.rs` | `LobbyError` + `Result` |
-| lobby-server | `steam_auth.rs` | Steam ticket/OpenID auth + JWT (claims: `sub` = account UUID, `sid` = SteamID64) |
+| lobby-server | `steam_auth.rs` | Steam ticket/OpenID auth + JWT (claims: `sub` = player_id UUID) |
 | lobby-server | `db/players.rs` | `PlayerStore` impl + `find_or_create_user` (find-or-create identity attach) |
 | lobby-server | `migrations/` | Schema; `users.id` (UUID) is the provider-agnostic account key, `user_identities` maps `(provider, provider_uid)` → account |
 | lobby-server | `db/` | Other `PostgresStore` impls (one file per store trait) |
@@ -276,43 +277,49 @@ Every pairing, accept, and decline is appended to the `match_events` audit table
 ## Adding another login provider (Discord / au.2143.me — blueprint)
 
 Steam login is implemented directly (OpenID 2.0 against `steamcommunity.com`).
-Discord, au.2143.me (Pocket ID OIDC), and any future provider follow the
-registry pattern proven by john2143.com — a declarative provider registry plus
-generic login/callback dispatch, **not** per-provider route copies. Nothing in
-the schema or JWT changes when a second provider lands: the JWT `sub` is
-already the abstract `users.id`, and `user_identities` maps
-`(provider, provider_uid)` → account.
+**Discord and au.2143.me (Pocket ID OIDC) are implemented** on a declarative
+provider registry (`lobby-server/src/auth_providers.rs`) plus generic
+login/callback dispatch (`/auth/{provider}/login`, `/auth/{provider}/callback`).
+Nothing in the schema or JWT changes between providers: the JWT `sub` is the
+abstract `users.id` player key, and `user_identities` maps
+`(provider, provider_uid)` → account. Discord users and Pocket ID users get
+`steam_id NULL`; their identity lives only in `user_identities`.
 
 **Provider config** (new `lobby-server/src/auth_providers.rs`; mirror
 `john2143.com/src/auth/providers.ts`):
-
 ```rust
-struct Provider {
-    id: String,                                   // "discord", "au2143", …
-    kind: ProviderKind,                           // openid2 | oauth2 | oidc
-    authorization_endpoint: Option<String>,       // oauth2/oidc
-    issuer: Option<String>,                       // oidc: discovery well-known
-    token_endpoint: Option<String>,
-    userinfo_endpoint: Option<String>,
+struct ProviderConfig {
+    id: String,                    // "discord", "au2143", …
+    kind: ProviderKind,            // oauth2 | oidc (Steam stays bespoke)
+    authorization_endpoint: String,
+    token_endpoint: String,
+    userinfo_endpoint: String,
     client_id: String,
     client_secret: String,
     scopes: Vec<String>,
-    id_field: String,                             // claim holding provider_uid
-    map_user: fn(userinfo) -> (String, String),   // (provider_uid, display_name)
+    id_field: String,              // "id" (discord) | "sub" (au2143)
+    name_field: String,            // "global_name" (discord) | "preferred_username" (au2143)
+    use_pkce: bool,                // false for discord (no PKCE support)
 }
 ```
 
-Steam is `kind: openid2` (no token endpoint or code; the existing
-`openid_redirect_url`/`verify_openid`). Discord is `oauth2`: `identify` scope,
-`state` for CSRF, token exchange at `discord.com/api/oauth2/token`
-(form-urlencoded, Basic auth), identity from `GET /users/@me`, `id_field: "id"`.
-Pocket ID is `oidc`: discovery at `https://au.2143.me/.well-known/openid-configuration`,
-scopes `openid profile email groups`, `id_field: "sub"`.
+Discord is `oauth2`: `identify` scope, `state` for CSRF (no PKCE — Discord's
+OAuth2 does not support it), token exchange at `discord.com/api/oauth2/token`
+(form-urlencoded, client_id + client_secret in the body), identity from
+`GET /users/@me`, `id_field: "id"`, `name_field: "global_name"`. Pocket ID is
+`oidc`: runtime discovery at
+`https://au.2143.me/.well-known/openid-configuration` (a browser-like
+User-Agent is required — the site's bot protection 403s default UAs), scopes
+`openid profile email groups`, S256 PKCE, `id_field: "sub"`, `name_field:
+"preferred_username"`. If discovery is unreachable from the server, set
+`AU2143_AUTHORIZE_URL`/`AU2143_TOKEN_URL`/`AU2143_USERINFO_URL` — otherwise the
+au2143 provider logs a disabled warning and Discord + Steam still work
+(discovery failure is a provider disable, never a boot error).
 
 **Generic routes:** `GET /auth/{provider}/login` issues a one-time `state` (and,
-for `oauth2`/`oidc`, a PKCE S256 `code_verifier` stored beside it);
-`GET /auth/{provider}/callback` consumes the state, exchanges/verifies, then
-calls `find_or_create_user` generalized to `(provider, provider_uid,
+for providers with `use_pkce`, an S256 `code_verifier` stored beside it);
+`GET /auth/{provider}/callback` consumes the state, exchanges the code, fetches
+userinfo, calls `find_or_create_user` generalized to `(provider, provider_uid,
 display_name, verified)` and mints the same JWT. The `UNIQUE (user_id, provider)`
 constraint enforces one identity per provider per account.
 
@@ -330,9 +337,16 @@ find-or-create. `UNIQUE (user_id, provider)` rejects linking a second identity
 of the same provider; the `(provider, provider_uid)` PK makes an identity
 already owned by another user an error (never silently re-attach).
 
-**Display names:** future providers supply one via `map_user` (Discord
-`global_name`/`username`, Pocket ID `preferred_username`/`name`); Steam keeps
-`GetPlayerSummaries`.
+**Display names:** providers supply one from userinfo (`name_field` fallback
+`username` fallback `name`, via `userinfo_name`; Discord `global_name`, Pocket
+ID `preferred_username`); Steam keeps `GetPlayerSummaries` for its display
+name at login.
+
+**Admin flag (au.2143.me):** the callback records `users.is_admin` from the
+Pocket ID `groups` claim (`true` when it contains `pvp_admin`, written on every
+au2143 login so group removal self-heals at the next login). **Storage only —
+no endpoint, JWT claim, or UI consumes the flag yet.** Discord/Steam logins
+never write it (default `false`).
 
 **Out of scope by design:** Steam's partner-gated Web API OAuth
 (`ISteamUserOAuth` — Client ID granted only for Cloud/Workshop delegation) is
@@ -355,20 +369,20 @@ All communication happens over a single WebSocket connection at `/ws`. Messages 
 | `accept_match` | `match_token: String` | Accept a found match |
 | `decline_match` | `match_token: String` | Decline a found match (rare — acceptance is the default) |
 | `start_match` | `match_token: String` | Click START = the P2P connection to the opponent is established; begin the match. Sent within the START window opened once both players accept (`match_started`); if a player doesn't start in time they forfeit (or both do — double loss — if neither does) |
-| `match_report` | `match_token: String`, `winner: u64?`, `demo_hash: String?` | Submit match result (winner is the victor's steam_id; `null` for draw) |
+| `match_report` | `match_token: String`, `winner: player_id?`, `demo_hash: String?` | Submit match result (winner is the victor's player_id UUID string; `null` for draw) |
 | `heartbeat` | — | Client liveness signal. Send every ~10s for as long as you're connected — the server drops the connection 30s after the last heartbeat, and while queueing the queue entry is dropped 30s after the last heartbeat too (so a 10s cadence keeps both alive indefinitely) |
 
 ### Server → Client
 
 | Type | Fields | Description |
 |------|--------|-------------|
-| `auth_ok` | `steam_id: u64`, `display_name: String`, `state: string` | Authentication succeeded; `state` is the player's persisted status (`in_menus`/`queueing`/`match_accepted`/`in_match`/`reporting`) so a reconnect knows where it left off |
-| `match_found` | `match_token: String`, `opponent: { steam_id, display_name }`, `timeout_ms: u64`, `game_type: "p2p" \| "server"` | A match is ready — accept or it expires; `game_type` tells the client which lifecycle to run |
-| `queue_status` | `elapsed_ms`, `band_lo/hi`, `candidates`, `queue_size`, `my_mu/sigma/rating`, `leaderboard: [{steam_id, mu, sigma, rating}]` | Live queue stats pushed every ~2s while queueing (wait time, expanding MMR band, opponents available, your rating, full MMR leaderboard) |
+| `auth_ok` | `player_id: String`, `display_name: String`, `state: string` | Authentication succeeded; `state` is the player's persisted status (`in_menus`/`queueing`/`match_accepted`/`in_match`/`reporting`) so a reconnect knows where it left off |
+| `match_found` | `match_token: String`, `opponent: { player_id, display_name }`, `timeout_ms: u64`, `game_type: "p2p" \| "server"` | A match is ready — accept or it expires; `game_type` tells the client which lifecycle to run |
+| `queue_status` | `elapsed_ms`, `band_lo/hi`, `candidates`, `queue_size`, `my_mu/sigma/rating`, `leaderboard: [{player_id, mu, sigma, rating}]` | Live queue stats pushed every ~2s while queueing (wait time, expanding MMR band, opponents available, your rating, full MMR leaderboard) |
 | `opponent_connected` | `match_token` | The opponent's `start_match` signal was accepted — the opponent is ready to begin |
 | `match_started` | `match_token: String`, `start_timeout_secs: u64` | Both players accepted — the START window is open; each must send `start_match` within `start_timeout_secs` or forfeit (double loss if neither does) |
 | `round_start` | `match_token: String`, `frame: u32`, `round: u32`, `countdown_ticks: u32` | A pong round begins: the referee holds the sim frozen for `countdown_ticks` 33ms ticks (3-2-1); the ball launches at `frame + countdown_ticks` |
-| `report_received` | `match_token`, `reporting_player`, `winner: Option<steam_id>`, `demo_hash` | A player submitted a match report — sent to both players before resolution |
+| `report_received` | `match_token`, `reporting_player`, `winner: Option<player_id>`, `demo_hash` | A player submitted a match report — sent to both players before resolution |
 | `error` | `message: String` | An error occurred processing a message |
 | `match_result` | `match_token: String`, `outcome: Value` | The reports agreed and the match resolved (`Win`/`Loss`/`Draw`/`Disputed` with mu change) — sent to **both** players |
 | `match_declined` | `match_token: String` | A player declined the found match — sent to **both** players (the decliner's ack + the opponent's notification) |
@@ -411,7 +425,7 @@ reports the result via webhook:
    on the server. The match status is now `Playing`; the p2p signal is rejected
    for server matches.
 4. The gameserver reports the outcome by POSTing to the callback URL
-   (`/internal/game-result/{token}/{secret}`, body `{ winner: steam_id | null }`).
+   (`/internal/game-result/{token}/{secret}`, body `{ winner: player_id | null }`).
    **The unguessable URL is the authentication** — possession of the secret is
    proof. The coordinator resolves ratings exactly as for agreed player reports
    and sends `match_result` to both players.

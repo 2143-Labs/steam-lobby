@@ -26,7 +26,7 @@ lifecycle timer is inspectable in the Temporal UI (`localhost:8233` locally).
                                                      ▼
 ┌────────────────────────────────────────┐   ┌──────────────────────┐
 │  UserSessionWorkflow                   │   │ P2PMatchWorkflow     │
-│  id: user-session-{steam_id}-          │   │ id: match-{token}    │
+│  id: user-session-{player_id}-          │   │ id: match-{token}    │
 │       {session_id}  (per connection)   │   │ accept → start →     │
 │  queue/unqueue/match_found/            │   │ report (timers)      │
 │  queue_expired/disconnect signals      │   └──────────┬───────────┘

@@ -10,7 +10,7 @@ use crate::error::{LobbyError, Result};
 use crate::mmr;
 use crate::traits::{GameCallbacks, MatchStore, PlayerStore, RatingStore};
 use crate::types::{
-    MatchEvent, MatchOutcome, MatchReport, MatchStatus, OpenSkillRating, PlayerState, SteamId,
+    MatchEvent, MatchOutcome, MatchReport, MatchStatus, OpenSkillRating, PlayerId, PlayerState,
 };
 
 pub struct MatchManager<CB: GameCallbacks> {
@@ -25,7 +25,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
     pub async fn accept_match(
         &self,
         token: &str,
-        steam_id: SteamId,
+        user_id: PlayerId,
         match_store: &dyn MatchStore,
     ) -> Result<()> {
         let m = match_store
@@ -35,15 +35,15 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         if m.status != MatchStatus::PendingAccept {
             return Err(LobbyError::MatchStateMismatch(token.to_string()));
         }
-        if steam_id != m.player_a && steam_id != m.player_b {
+        if user_id != m.player_a && user_id != m.player_b {
             return Err(LobbyError::NotParticipant(token.to_string()));
         }
-        let first_accept = if steam_id == m.player_a {
+        let first_accept = if user_id == m.player_a {
             !m.accepted_a
         } else {
             !m.accepted_b
         };
-        if match_store.mark_accepted(token, steam_id).await? {
+        if match_store.mark_accepted(token, user_id).await? {
             // Both players have now accepted — transition to InProgress.
             tracing::info!(
                 "match {} both players accepted -> InProgress ({}, {})",
@@ -58,7 +58,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         }
         if first_accept {
             match_store
-                .record_match_event(token, MatchEvent::Accepted, Some(steam_id))
+                .record_match_event(token, MatchEvent::Accepted, Some(user_id))
                 .await?;
         }
         Ok(())
@@ -67,7 +67,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
     pub async fn mark_connected(
         &self,
         token: &str,
-        steam_id: SteamId,
+        user_id: PlayerId,
         match_store: &dyn MatchStore,
     ) -> Result<()> {
         let m = match_store
@@ -80,10 +80,10 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         if m.game_type == crate::types::GameType::Server {
             return Err(LobbyError::MatchStateMismatch(token.to_string()));
         }
-        if steam_id != m.player_a && steam_id != m.player_b {
+        if user_id != m.player_a && user_id != m.player_b {
             return Err(LobbyError::NotParticipant(token.to_string()));
         }
-        if match_store.mark_started(token, steam_id).await? {
+        if match_store.mark_started(token, user_id).await? {
             // Both players have now connected — transition to Reporting.
             // Use update_match (sets ended_at) so the report-timeout expiry path is reachable.
             tracing::info!(
@@ -194,7 +194,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
     pub(crate) async fn resolve_agreed(
         &self,
         m: &crate::types::MatchInfo,
-        winner: Option<SteamId>,
+        winner: Option<PlayerId>,
         match_store: &dyn MatchStore,
         rating_store: &dyn RatingStore,
         player_store: &dyn PlayerStore,
@@ -256,12 +256,12 @@ impl<CB: GameCallbacks> MatchManager<CB> {
     }
 
     /// Resolve a server-authoritative match from the gameserver's webhook result.
-    /// `winner` is the victor's Steam ID (or None for a draw). Validates the
+    /// `winner` is the victor's player_id (or None for a draw). Validates the
     /// match is Playing and the winner is a participant, then resolves.
     pub async fn resolve_from_gameserver(
         &self,
         token: &str,
-        winner: Option<SteamId>,
+        winner: Option<PlayerId>,
         match_store: &dyn MatchStore,
         rating_store: &dyn RatingStore,
         player_store: &dyn PlayerStore,
@@ -287,7 +287,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
     pub async fn resolve_pong(
         &self,
         token: &str,
-        winner: SteamId,
+        winner: PlayerId,
         match_store: &dyn MatchStore,
         rating_store: &dyn RatingStore,
         player_store: &dyn PlayerStore,

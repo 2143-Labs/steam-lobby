@@ -8,8 +8,8 @@ use std::sync::Arc;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 
 use lobby_core::types::{
-    GameType, MatchDifficulty, MatchEvent, MatchInfo, MatchStatus, PlayerState, QueueEntry,
-    SteamId,
+    GameType, MatchDifficulty, MatchEvent, MatchInfo, MatchStatus, PlayerId, PlayerState,
+    QueueEntry,
 };
 
 use lobby_core::traits::{MatchStore, PlayerStore, QueueStore};
@@ -18,7 +18,7 @@ use crate::state::AppState;
 use crate::ws::{ServerMessage, notify_match_players};
 
 /// All activity args/returns must be `Serialize + Deserialize + Send + Sync`
-/// (Temporal payload boundary). Steam IDs are u64, tokens/demos are Strings.
+/// (Temporal payload boundary). Player IDs are UUIDs, tokens/demos are Strings.
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct MatchStateArgs {
@@ -27,7 +27,7 @@ pub struct MatchStateArgs {
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct QueueArgs {
-    pub steam_id: SteamId,
+    pub user_id: PlayerId,
     pub mode: String,
     pub difficulty: MatchDifficulty,
 }
@@ -35,7 +35,7 @@ pub struct QueueArgs {
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct FinishMatchArgs {
     pub match_token: String,
-    pub winner: Option<SteamId>,
+    pub winner: Option<PlayerId>,
     pub demo_hashes: Vec<String>,
 }
 
@@ -43,7 +43,7 @@ pub struct FinishMatchArgs {
 pub struct StartForfeitArgs {
     pub match_token: String,
     /// Some(starter) → starter wins; None → neither started (double loss).
-    pub winner: Option<SteamId>,
+    pub winner: Option<PlayerId>,
 }
 
 /// The ticker's pairing body for one mode: scan queue, MMR-band pair, create
@@ -75,11 +75,11 @@ impl LobbyActivities {
         self: Arc<Self>,
         _ctx: ActivityContext,
         args: MatchStateArgs,
-        steam_id: SteamId,
+        user_id: PlayerId,
     ) -> Result<(), ActivityError> {
         self.state
             .match_manager
-            .accept_match(&args.match_token, steam_id, &self.state.store)
+            .accept_match(&args.match_token, user_id, &self.state.store)
             .await?;
         Ok(())
     }
@@ -92,11 +92,11 @@ impl LobbyActivities {
         self: Arc<Self>,
         _ctx: ActivityContext,
         args: MatchStateArgs,
-        steam_id: SteamId,
+        user_id: PlayerId,
     ) -> Result<(), ActivityError> {
         self.state
             .match_manager
-            .mark_connected(&args.match_token, steam_id, &self.state.store)
+            .mark_connected(&args.match_token, user_id, &self.state.store)
             .await?;
         // After the SECOND player connects the match flips to Reporting: spawn
         // the server-authoritative pong referee for PLAYBACK (Step 11 — it
@@ -108,7 +108,7 @@ impl LobbyActivities {
             {
                 crate::pong::spawn_game(&self.state, &m);
             }
-            let other = if steam_id == m.player_a {
+            let other = if user_id == m.player_a {
                 m.player_b
             } else {
                 m.player_a
@@ -165,7 +165,7 @@ impl LobbyActivities {
         self: Arc<Self>,
         _ctx: ActivityContext,
         args: MatchStateArgs,
-        declined_by: Option<SteamId>,
+        declined_by: Option<PlayerId>,
     ) -> Result<(), ActivityError> {
         let state = self.state.clone();
         let token = args.match_token;
@@ -216,7 +216,7 @@ impl LobbyActivities {
                 &token,
                 ServerMessage::GameOver {
                     match_token: token.clone(),
-                    winner,
+                    winner: winner.to_string(),
                 },
             )
             .await;
@@ -273,7 +273,7 @@ impl LobbyActivities {
                 &args.match_token,
                 ServerMessage::GameOver {
                     match_token: args.match_token.clone(),
-                    winner,
+                    winner: winner.to_string(),
                 },
             )
             .await;
@@ -418,26 +418,21 @@ impl LobbyActivities {
                 } else {
                     m.player_a
                 };
+                // The opponent's display name comes from the users table (set
+                // at login from the provider userinfo) — no Steam API call in
+                // the pairing path.
                 let opponent_name = self
                     .state
-                    .steam_auth
-                    .get_player_summary(opponent)
-                    .await
-                    .unwrap_or_else(|_| "Unknown".into());
-                let opponent_player_id = self
-                    .state
                     .store
-                    .get_user_id(opponent)
+                    .get_display_name(opponent)
                     .await
                     .ok()
                     .flatten()
-                    .map(|u| u.to_string())
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| "Unknown".into());
                 let msg = ServerMessage::MatchFound {
                     match_token: m.match_token.clone(),
                     opponent: crate::ws::OpponentInfo {
-                        player_id: opponent_player_id,
-                        steam_id: opponent,
+                        player_id: opponent.to_string(),
                         display_name: opponent_name,
                     },
                     timeout_ms: 30_000,
@@ -465,13 +460,13 @@ impl LobbyActivities {
         args: QueueArgs,
     ) -> Result<(), ActivityError> {
         tracing::info!(
-            "enter_queue activity: steam_id={} mode={}",
-            args.steam_id,
+            "enter_queue activity: user_id={} mode={}",
+            args.user_id,
             args.mode
         );
         let rating = <dyn lobby_core::traits::RatingStore>::get_rating(
             &self.state.store,
-            args.steam_id,
+            args.user_id,
             &args.mode,
         )
         .await
@@ -481,7 +476,7 @@ impl LobbyActivities {
             last_updated: chrono::Utc::now(),
         });
         let entry = lobby_core::types::QueueEntry {
-            steam_id: args.steam_id,
+            user_id: args.user_id,
             game_mode: args.mode.clone(),
             difficulty: args.difficulty,
             mu: rating.mu,
@@ -492,12 +487,12 @@ impl LobbyActivities {
         // sweep (30s since last_heartbeat) never evicts a just-queued entry
         // whose previous heartbeat predates the queue click (mirrors the
         // in-process begin_matchmaking).
-        let _ = self.state.store.update_heartbeat(args.steam_id).await;
+        let _ = self.state.store.update_heartbeat(args.user_id).await;
         // The pairing schedule may be paused (idle). A fresh queue entry
         // means a pair may be possible again — unpause it so the next tick
         // pairs. Best-effort; the in-process ticker re-checks too.
         crate::temporal::schedule::ensure_running(&self.state, &args.mode).await;
-        tracing::info!("enter_queue activity done: steam_id={}", args.steam_id);
+        tracing::info!("enter_queue activity done: user_id={}", args.user_id);
         Ok(())
     }
 
@@ -508,7 +503,7 @@ impl LobbyActivities {
         _ctx: ActivityContext,
         args: QueueArgs,
     ) -> Result<(), ActivityError> {
-        self.state.store.dequeue(args.steam_id, &args.mode).await?;
+        self.state.store.dequeue(args.user_id, &args.mode).await?;
         Ok(())
     }
 
@@ -517,10 +512,10 @@ impl LobbyActivities {
     pub async fn set_player_state(
         self: Arc<Self>,
         _ctx: ActivityContext,
-        steam_id: SteamId,
+        user_id: PlayerId,
         state: PlayerState,
     ) -> Result<(), ActivityError> {
-        self.state.store.set_player_state(steam_id, state).await?;
+        self.state.store.set_player_state(user_id, state).await?;
         Ok(())
     }
 
@@ -545,10 +540,10 @@ impl LobbyActivities {
     pub async fn sync_session(
         self: Arc<Self>,
         _ctx: ActivityContext,
-        steam_id: SteamId,
+        user_id: PlayerId,
     ) -> Result<SessionSync, ActivityError> {
-        let state = self.state.store.get_player_state(steam_id).await?;
-        let queued = self.state.store.get_queued_entry(steam_id).await?;
+        let state = self.state.store.get_player_state(user_id).await?;
+        let queued = self.state.store.get_queued_entry(user_id).await?;
         Ok(SessionSync {
             state: state.map(|p| p.state).unwrap_or(PlayerState::InMenus),
             queued,

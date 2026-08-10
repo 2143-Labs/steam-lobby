@@ -119,9 +119,8 @@ async fn signaling_relay(pool: sqlx::PgPool) {
     )
     .await;
 
-    // Negative: non-participant
     let mut p3 = LobbyClient::connect(&h.ws_url).await.unwrap();
-    p3.authenticate_test_token(9992, &h.base_url).await.unwrap();
+    let auth3 = p3.authenticate_test_token(9992, &h.base_url).await.unwrap();
     p3.send_webrtc_offer(&token, "spoofed-offer".into())
         .await
         .unwrap();
@@ -144,8 +143,10 @@ async fn signaling_relay(pool: sqlx::PgPool) {
     let mut p1_ok = true;
     while tokio::time::Instant::now() < end {
         match timeout(Duration::from_millis(100), p1.next_event()).await {
-            Ok(Some(Ok(ServerEvent::WebrtcOffer { from: 9992, .. }))) => {
-                p1_ok = false;
+            Ok(Some(Ok(ServerEvent::WebrtcOffer { from, .. }))) => {
+                if from == auth3.player_id {
+                    p1_ok = false;
+                }
             }
             Ok(Some(Ok(_))) => {}
             _ => {}

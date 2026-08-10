@@ -5,7 +5,7 @@
 //! in-memory queue object.
 use crate::error::Result;
 use crate::traits::QueueStore;
-use crate::types::SteamId;
+use crate::types::PlayerId;
 
 /// Expanding search band: 50 at t=0, +25 every 10s of wait, capped at 400.
 /// Returns `(lo, hi)` in MMR terms, both shifted by the difficulty offset.
@@ -15,9 +15,9 @@ pub fn search_band(wait_secs: f64, mu: f64, offset: f64) -> (f64, f64) {
 }
 
 /// Remove queue entries for players with no heartbeat in the last 30 seconds.
-/// Returns the steam_ids that were removed. Runs in the server's maintenance
+/// Returns the user_ids that were removed. Runs in the server's maintenance
 /// ticker (out of Temporal — the cleanup is not durable workflow state).
-pub async fn cleanup_stale(queue_store: &dyn QueueStore) -> Result<Vec<SteamId>> {
+pub async fn cleanup_stale(queue_store: &dyn QueueStore) -> Result<Vec<PlayerId>> {
     queue_store
         .remove_stale_queue_entries(chrono::Duration::seconds(30))
         .await

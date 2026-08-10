@@ -9,7 +9,7 @@ use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use lobby_core::pong::PongSide;
 use lobby_core::traits::{MatchStore, PlayerStore, QueueStore};
-use lobby_core::types::{MatchDifficulty, SteamId};
+use lobby_core::types::MatchDifficulty;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
@@ -70,11 +70,7 @@ pub enum ClientMessage {
     /// Submit a match report (`winner` None = draw).
     MatchReport {
         match_token: String,
-        #[serde(
-            default,
-            deserialize_with = "lobby_core::types::deserialize_optional_steam_id"
-        )]
-        winner: Option<u64>,
+        winner: Option<String>,
         demo_hash: Option<String>,
     },
     /// Keepalive; refreshes queue liveness.
@@ -87,11 +83,9 @@ pub enum ClientMessage {
 #[allow(dead_code)] // reserved variants: none sent yet
 pub enum ServerMessage {
     /// Authentication succeeded; carries the abstract account id (users.id,
-    /// what the UI shows as "player id") plus the Steam ID and state.
+    /// what the UI shows as "player id") plus the display name and state.
     AuthOk {
         player_id: String,
-        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
-        steam_id: u64,
         display_name: String,
         state: lobby_core::types::PlayerState,
     },
@@ -112,10 +106,8 @@ pub enum ServerMessage {
     /// A match report was stored (broadcast to both players).
     ReportReceived {
         match_token: String,
-        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
-        reporting_player: u64,
-        #[serde(serialize_with = "lobby_core::types::serialize_optional_steam_id")]
-        winner: Option<u64>,
+        reporting_player: String,
+        winner: Option<String>,
         demo_hash: Option<String>,
     },
     /// A match was found; the player must accept within `timeout_ms`.
@@ -149,10 +141,8 @@ pub enum ServerMessage {
     GameState {
         match_token: String,
         frame: u32,
-        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
-        player_a: u64,
-        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
-        player_b: u64,
+        player_a: String,
+        player_b: String,
         left_y: f64,
         right_y: f64,
         ball_x: f64,
@@ -182,8 +172,7 @@ pub enum ServerMessage {
     /// is not correctly rounded).
     PeerInput {
         match_token: String,
-        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
-        from: u64,
+        from: String,
         frame: u32,
         target: String,
     },
@@ -198,29 +187,25 @@ pub enum ServerMessage {
     /// WebRTC signaling: offer SDP relayed from the offerer to the answerer.
     WebrtcOffer {
         match_token: String,
-        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
-        from: u64,
+        from: String,
         sdp: String,
     },
     /// WebRTC signaling: answer SDP relayed back to the offerer.
     WebrtcAnswer {
         match_token: String,
-        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
-        from: u64,
+        from: String,
         sdp: String,
     },
     /// WebRTC signaling: ICE candidate relayed to the peer.
     WebrtcIce {
         match_token: String,
-        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
-        from: u64,
+        from: String,
         candidate: String,
     },
     /// The pong match ended (first to 3, or forfeit on disconnect).
     GameOver {
         match_token: String,
-        #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
-        winner: u64,
+        winner: String,
     },
     /// Final outcome of a match.
     MatchResult {
@@ -240,8 +225,6 @@ pub enum ServerMessage {
 #[derive(Debug, Serialize, Clone)]
 pub struct OpponentInfo {
     pub player_id: String,
-    #[serde(serialize_with = "lobby_core::types::serialize_steam_id")]
-    pub steam_id: u64,
     pub display_name: String,
 }
 
@@ -281,22 +264,22 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
     // Auth phase
-    let (user_id, steam_id) = match authenticate(&mut receiver, &mut sender, &state, peer_ip).await
-    {
-        Ok(pair) => pair,
+    let user_id = match authenticate(&mut receiver, &mut sender, &state, peer_ip).await {
+        Ok(user_id) => user_id,
         Err(_) => return,
     };
 
     // Send auth ok — include the player's persisted state so a reconnecting
     // client knows it was in the queue, mid-match, etc.
     let display_name = state
-        .steam_auth
-        .get_player_summary(steam_id)
+        .store
+        .get_display_name(user_id)
         .await
-        .unwrap_or_else(|_| "Unknown".into());
+        .unwrap_or_else(|_| None)
+        .unwrap_or_else(|| "Unknown".into());
     let player_state = state
         .store
-        .get_player_state(steam_id)
+        .get_player_state(user_id)
         .await
         .ok()
         .flatten()
@@ -306,7 +289,6 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
         .send(Message::Text(
             serde_json::to_string(&ServerMessage::AuthOk {
                 player_id: user_id.to_string(),
-                steam_id,
                 display_name: display_name.clone(),
                 state: player_state,
             })
@@ -315,12 +297,12 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
         ))
         .await;
 
-    tracing::info!("player {steam_id} connected from {peer_ip} ({display_name})");
+    tracing::info!("player {user_id} connected from {peer_ip} ({display_name})");
 
     // Enter menus
     let _ = state
         .player_manager
-        .enter_menus(steam_id, &state.store)
+        .enter_menus(user_id, &state.store)
         .await;
 
     // Temporal path: start THIS connection's UserSessionWorkflow — a fresh
@@ -328,7 +310,7 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
     // replaced connection starts a new workflow instead of colliding with the
     // old one. Best-effort; None while Temporal is down.
     let session_id = uuid::Uuid::new_v4().to_string();
-    crate::temporal::signals::start_user_session(&state, steam_id, &session_id).await;
+    crate::temporal::signals::start_user_session(&state, user_id, &session_id).await;
 
     // Spawn the outbound message forwarder FIRST so the map entry can hold an
     // abort handle and kill a ghosted connection.
@@ -349,7 +331,7 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
     {
         let mut connections = state.connections.lock().await;
         if let Some(old) = connections.insert(
-            steam_id,
+            user_id,
             ConnectionEntry {
                 tx: tx.clone(),
                 generation: my_gen,
@@ -385,7 +367,7 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
                         };
                         handle_client_message(
                             cm,
-                            steam_id,
+                            user_id,
                             &session_id,
                             &state,
                             &tx,
@@ -397,7 +379,7 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
                         break;
                     }
                     Ok(Some(Err(e))) => {
-                        tracing::debug!("ws read error from {steam_id}: {e}");
+                        tracing::debug!("ws read error from {user_id}: {e}");
                         disconnect_reason = "socket error";
                         break;
                     }
@@ -424,7 +406,7 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
     let is_current = {
         let connections = state.connections.lock().await;
         connections
-            .get(&steam_id)
+            .get(&user_id)
             .map(|e| e.generation == my_gen)
             .unwrap_or(false)
     };
@@ -433,24 +415,24 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
     // one replaced by a newer connection for the same player) must end its own
     // workflow. The `is_current` guard below still decides the player-state
     // reset (only the current connection's death resets the player).
-    crate::temporal::signals::signal_disconnect(&state, steam_id, &session_id).await;
+    crate::temporal::signals::signal_disconnect(&state, user_id, &session_id).await;
     if is_current {
         // A brief drop keeps the player queued: the queue entry lives until
         // the stale sweep evicts it (30s without heartbeat), so a reconnect
         // within that window must still report "queueing". Only a disconnect
         // with no queue entry resets the player to the menus.
-        let still_queued = state.store.is_queued(steam_id).await.unwrap_or(false);
+        let still_queued = state.store.is_queued(user_id).await.unwrap_or(false);
         if !still_queued {
             let _ = state
                 .player_manager
-                .handle_disconnect(steam_id, &state.store)
+                .handle_disconnect(user_id, &state.store)
                 .await;
         }
-        state.connections.lock().await.remove(&steam_id);
+        state.connections.lock().await.remove(&user_id);
     } else {
         disconnect_reason = "replaced by newer connection";
     }
-    tracing::info!("player {steam_id} disconnected ({disconnect_reason})");
+    tracing::info!("player {user_id} disconnected ({disconnect_reason})");
     outbound_task.abort();
 }
 
@@ -459,7 +441,7 @@ async fn authenticate(
     sender: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
     state: &Arc<AppState>,
     peer_ip: std::net::SocketAddr,
-) -> Result<(uuid::Uuid, SteamId), ()> {
+) -> Result<uuid::Uuid, ()> {
     let first_msg = timeout(Duration::from_secs(10), receiver.next()).await;
     let text = match first_msg {
         Ok(Some(Ok(Message::Text(t)))) => t.to_string(),
@@ -500,8 +482,7 @@ async fn authenticate(
     // ── Auth ──
     match cm {
         ClientMessage::Auth { session_token } => {
-            let (_user_id, id, ver) = match state.steam_auth.validate_session_token(&session_token)
-            {
+            let (user_id, ver) = match state.steam_auth.validate_session_token(&session_token) {
                 Ok(v) => v,
                 Err(_) => {
                     tracing::warn!("auth failed (invalid session token) from {peer_ip}");
@@ -509,7 +490,7 @@ async fn authenticate(
                 }
             };
             // A token minted before a logout (or a DB error) is rejected.
-            let db_ver = match state.store.get_token_version(id).await {
+            let db_ver = match state.store.get_token_version(user_id).await {
                 Ok(v) => v,
                 Err(_) => {
                     tracing::warn!("auth failed (token version lookup error) from {peer_ip}");
@@ -520,7 +501,7 @@ async fn authenticate(
                 tracing::warn!("auth failed (revoked or outdated token) from {peer_ip}");
                 return Err(());
             }
-            Ok((_user_id, id))
+            Ok(user_id)
         }
         ClientMessage::AuthTicket { ticket } => {
             if !state.ticket_limiter.check(peer_ip.ip()) {
@@ -542,8 +523,12 @@ async fn authenticate(
                     // Same semantics as the HTTP ticket path: a verified
                     // ticket is a genuine login, so the account + identity
                     // row are attached and the player_id comes from it.
-                    match state.store.find_or_create_user(steam_id, "", true).await {
-                        Ok(user_id) => Ok((user_id, steam_id)),
+                    match state
+                        .store
+                        .find_or_create_user("steam", &steam_id.to_string(), "", true)
+                        .await
+                    {
+                        Ok(user_id) => Ok(user_id),
                         Err(_) => {
                             tracing::warn!("auth failed (user lookup error) from {peer_ip}");
                             Err(())
@@ -575,7 +560,7 @@ async fn authenticate(
 
 async fn handle_client_message(
     cm: ClientMessage,
-    steam_id: SteamId,
+    user_id: uuid::Uuid,
     session_id: &str,
     state: &Arc<AppState>,
     _tx: &mpsc::UnboundedSender<ServerMessage>,
@@ -588,21 +573,21 @@ async fn handle_client_message(
                 "hard" => MatchDifficulty::Hard,
                 _ => MatchDifficulty::Normal,
             };
-            tracing::info!("player {steam_id} entered queue ({mode}, {difficulty})");
+            tracing::info!("player {user_id} entered queue ({mode}, {difficulty})");
             // The UserSessionWorkflow's queue signal runs the enter_queue
             // activity (player state + queue entry); the pairing Schedule
             // pairs from there. Cutover: no in-process fallback — if Temporal
             // is down, the signal helper no-ops and the client is told nothing
             // (the server is considered unavailable for matchmaking).
-            crate::temporal::signals::signal_queue(state, steam_id, session_id, mode, diff).await;
+            crate::temporal::signals::signal_queue(state, user_id, session_id, mode, diff).await;
         }
         ClientMessage::CancelMatchmaking => {
-            crate::temporal::signals::signal_unqueue(state, steam_id, session_id).await;
-            tracing::info!("player {steam_id} left queue (cancelled)");
+            crate::temporal::signals::signal_unqueue(state, user_id, session_id).await;
+            tracing::info!("player {user_id} left queue (cancelled)");
         }
         // ── Match lifecycle ──
         ClientMessage::AcceptMatch { match_token } => {
-            tracing::info!("player {steam_id} accepted match {match_token}");
+            tracing::info!("player {user_id} accepted match {match_token}");
             // P2p matches are owned by the P2PMatchWorkflow (match_choice
             // signal). Server matches stay in-process — the Temporal migration
             // is p2p-only; they have no START phase and resolve via the
@@ -614,38 +599,38 @@ async fn handle_client_message(
             if is_server {
                 match state
                     .match_manager
-                    .accept_match(&match_token, steam_id, &state.store)
+                    .accept_match(&match_token, user_id, &state.store)
                     .await
                 {
                     Ok(()) => {}
                     Err(e) => tracing::warn!(
-                        "player {steam_id} accept rejected for match {match_token}: {e}"
+                        "player {user_id} accept rejected for match {match_token}: {e}"
                     ),
                 }
             } else {
-                crate::temporal::signals::signal_match_choice(state, &match_token, steam_id, true)
+                crate::temporal::signals::signal_match_choice(state, &match_token, user_id, true)
                     .await;
             }
         }
         ClientMessage::DeclineMatch { match_token } => {
-            tracing::info!("player {steam_id} declined match {match_token}");
+            tracing::info!("player {user_id} declined match {match_token}");
             // The workflow's handle_decline activity notifies both players
             // and flips Disputed (the DeclineMatch handler body, moved).
-            crate::temporal::signals::signal_match_choice(state, &match_token, steam_id, false)
+            crate::temporal::signals::signal_match_choice(state, &match_token, user_id, false)
                 .await;
         }
         ClientMessage::StartMatch { match_token } => {
-            tracing::info!("player {steam_id} started match {match_token}");
+            tracing::info!("player {user_id} started match {match_token}");
             // The P2PMatchWorkflow's start signal runs mark_connected (DB
             // Reporting + opponent_connected + spawn_game for playback) and
             // its start-window timer owns the forfeit. Cutover: no in-process
             // fallback — the workflow is the sole lifecycle writer.
-            crate::temporal::signals::signal_start(state, &match_token, steam_id).await;
+            crate::temporal::signals::signal_start(state, &match_token, user_id).await;
         }
         ClientMessage::WebrtcOffer { match_token, sdp } => {
-            let other = match state.store.get_match(&match_token).await {
-                Ok(Some(ref m)) if m.player_a == steam_id => Some(m.player_b),
-                Ok(Some(ref m)) if m.player_b == steam_id => Some(m.player_a),
+            let other = match &state.store.get_match(&match_token).await {
+                Ok(Some(m)) if m.player_a == user_id => Some(m.player_b),
+                Ok(Some(m)) if m.player_b == user_id => Some(m.player_a),
                 _ => None,
             };
             if let Some(other) = other {
@@ -653,16 +638,16 @@ async fn handle_client_message(
                 if let Some(e) = connections.get(&other) {
                     let _ = e.tx.send(ServerMessage::WebrtcOffer {
                         match_token,
-                        from: steam_id,
+                        from: user_id.to_string(),
                         sdp,
                     });
                 }
             }
         }
         ClientMessage::WebrtcAnswer { match_token, sdp } => {
-            let other = match state.store.get_match(&match_token).await {
-                Ok(Some(ref m)) if m.player_a == steam_id => Some(m.player_b),
-                Ok(Some(ref m)) if m.player_b == steam_id => Some(m.player_a),
+            let other = match &state.store.get_match(&match_token).await {
+                Ok(Some(m)) if m.player_a == user_id => Some(m.player_b),
+                Ok(Some(m)) if m.player_b == user_id => Some(m.player_a),
                 _ => None,
             };
             if let Some(other) = other {
@@ -670,7 +655,7 @@ async fn handle_client_message(
                 if let Some(e) = connections.get(&other) {
                     let _ = e.tx.send(ServerMessage::WebrtcAnswer {
                         match_token,
-                        from: steam_id,
+                        from: user_id.to_string(),
                         sdp,
                     });
                 }
@@ -680,9 +665,9 @@ async fn handle_client_message(
             match_token,
             candidate,
         } => {
-            let other = match state.store.get_match(&match_token).await {
-                Ok(Some(ref m)) if m.player_a == steam_id => Some(m.player_b),
-                Ok(Some(ref m)) if m.player_b == steam_id => Some(m.player_a),
+            let other = match &state.store.get_match(&match_token).await {
+                Ok(Some(m)) if m.player_a == user_id => Some(m.player_b),
+                Ok(Some(m)) if m.player_b == user_id => Some(m.player_a),
                 _ => None,
             };
             if let Some(other) = other {
@@ -690,7 +675,7 @@ async fn handle_client_message(
                 if let Some(e) = connections.get(&other) {
                     let _ = e.tx.send(ServerMessage::WebrtcIce {
                         match_token,
-                        from: steam_id,
+                        from: user_id.to_string(),
                         candidate,
                     });
                 }
@@ -710,8 +695,8 @@ async fn handle_client_message(
             // Resolve the side BEFORE taking the parking_lot Mutex (the guard
             // is !Send and must not be held across an await).
             let side_and_other = match state.store.get_match(&match_token).await {
-                Ok(Some(m)) if m.player_a == steam_id => Some((PongSide::Left, m.player_b)),
-                Ok(Some(m)) if m.player_b == steam_id => Some((PongSide::Right, m.player_a)),
+                Ok(Some(m)) if m.player_a == user_id => Some((PongSide::Left, m.player_b)),
+                Ok(Some(m)) if m.player_b == user_id => Some((PongSide::Right, m.player_a)),
                 _ => None,
             };
             if let Some((side, other)) = side_and_other {
@@ -723,7 +708,7 @@ async fn handle_client_message(
                     if let Some(e) = connections.get(&other) {
                         let _ = e.tx.send(ServerMessage::PeerInput {
                             match_token: match_token.clone(),
-                            from: steam_id,
+                            from: user_id.to_string(),
                             frame,
                             target: target.to_string(), // shortest round-trip decimal
                         });
@@ -750,7 +735,7 @@ async fn handle_client_message(
                 let games = state.pong_games.lock();
                 if let Some(g) = games.get(&match_token) {
                     let _ = g.health_tx.send(RollbackHealth {
-                        from: steam_id,
+                        from: user_id,
                         frame,
                         checksum,
                     });
@@ -764,24 +749,27 @@ async fn handle_client_message(
             demo_hash,
         } => {
             tracing::info!(
-                "report from {steam_id} for match {match_token}: winner {:?}",
+                "report from {user_id} for match {match_token}: winner {:?}",
                 winner
             );
             // The P2PMatchWorkflow's who_won + submit_demo signals drive
             // finish_match / resolve_dispute — the workflow is the sole
             // lifecycle writer. Cutover: no in-process submit_report.
             if let Some(w) = winner {
-                crate::temporal::signals::signal_who_won(state, &match_token, steam_id, w).await;
+                if let Ok(w) = uuid::Uuid::parse_str(&w) {
+                    crate::temporal::signals::signal_who_won(state, &match_token, user_id, w)
+                        .await;
+                }
             }
             if let Some(h) = demo_hash {
-                crate::temporal::signals::signal_submit_demo(state, &match_token, steam_id, h)
+                crate::temporal::signals::signal_submit_demo(state, &match_token, user_id, h)
                     .await;
             }
         }
         // ── Liveness ──
         ClientMessage::Heartbeat => {
-            tracing::trace!("heartbeat from {steam_id}");
-            let _ = state.player_manager.heartbeat(steam_id, &state.store).await;
+            tracing::trace!("heartbeat from {user_id}");
+            let _ = state.player_manager.heartbeat(user_id, &state.store).await;
         }
         _ => {}
     }

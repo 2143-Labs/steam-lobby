@@ -1,7 +1,7 @@
 mod common;
 
 use chrono::{Duration, Utc};
-use common::{queued_player, MockStore, TestCallbacks};
+use common::{pid, queued_player, MockStore, TestCallbacks};
 use lobby_core::error::LobbyError;
 use lobby_core::traits::{MatchStore, QueueStore};
 use lobby_core::types::{
@@ -16,13 +16,13 @@ async fn full_match_lifecycle() {
     let store = MockStore::new();
 
     // Insert queueing players
-    store.players.lock().insert(100, queued_player(100, 25.0));
-    store.players.lock().insert(200, queued_player(200, 25.0));
+    store.players.lock().insert(pid(100), queued_player(pid(100), 25.0));
+    store.players.lock().insert(pid(200), queued_player(pid(200), 25.0));
 
     // Enqueue both
     store
         .enqueue(&QueueEntry {
-            steam_id: 100,
+            user_id: pid(100),
             game_mode: "ranked_1v1".into(),
             difficulty: MatchDifficulty::Normal,
             mu: 25.0,
@@ -32,7 +32,7 @@ async fn full_match_lifecycle() {
         .unwrap();
     store
         .enqueue(&QueueEntry {
-            steam_id: 200,
+            user_id: pid(200),
             game_mode: "ranked_1v1".into(),
             difficulty: MatchDifficulty::Normal,
             mu: 25.0,
@@ -46,9 +46,9 @@ async fn full_match_lifecycle() {
     // lifecycle under test starts at the formed match.
     let m = MatchInfo {
         match_token: "lifecycle-token".into(),
-        player_a: 100,
+        player_a: pid(100),
         player_a_difficulty: MatchDifficulty::Normal,
-        player_b: 200,
+        player_b: pid(200),
         player_b_difficulty: MatchDifficulty::Normal,
         game_mode: "ranked_1v1".into(),
         game_type: GameType::P2p,
@@ -73,14 +73,14 @@ async fn full_match_lifecycle() {
 
     // Accept
     let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks);
-    mgr.accept_match(&m.match_token, 100, &store).await.unwrap();
-    mgr.accept_match(&m.match_token, 200, &store).await.unwrap();
+    mgr.accept_match(&m.match_token, pid(100), &store).await.unwrap();
+    mgr.accept_match(&m.match_token, pid(200), &store).await.unwrap();
 
     // Connect both players via P2P — real two-phase flow
-    mgr.mark_connected(&m.match_token, 100, &store)
+    mgr.mark_connected(&m.match_token, pid(100), &store)
         .await
         .unwrap();
-    mgr.mark_connected(&m.match_token, 200, &store)
+    mgr.mark_connected(&m.match_token, pid(200), &store)
         .await
         .unwrap();
 
@@ -93,8 +93,8 @@ async fn full_match_lifecycle() {
         .submit_report(
             MatchReport {
                 match_token: m.match_token.clone(),
-                reporting_player: 100,
-                winner: Some(100),
+                reporting_player: pid(100),
+                winner: Some(pid(100)),
                 demo_hash: Some("abc".into()),
             },
             &store,
@@ -110,8 +110,8 @@ async fn full_match_lifecycle() {
         .submit_report(
             MatchReport {
                 match_token: m.match_token.clone(),
-                reporting_player: 200,
-                winner: Some(100),
+                reporting_player: pid(200),
+                winner: Some(pid(100)),
                 demo_hash: Some("abc".into()),
             },
             &store,
@@ -128,11 +128,11 @@ async fn full_match_lifecycle() {
 
     // Terminal: both players must be back in the menus so they can re-queue.
     assert_eq!(
-        store.players.lock().get(&100).unwrap().state,
+        store.players.lock().get(&pid(100)).unwrap().state,
         PlayerState::InMenus
     );
     assert_eq!(
-        store.players.lock().get(&200).unwrap().state,
+        store.players.lock().get(&pid(200)).unwrap().state,
         PlayerState::InMenus
     );
 }
@@ -141,14 +141,14 @@ async fn full_match_lifecycle() {
 async fn dispute_on_winner_mismatch() {
     let store = MockStore::new();
     let token = "dispute-test".to_string();
-    store.players.lock().insert(100, queued_player(100, 25.0));
-    store.players.lock().insert(200, queued_player(200, 25.0));
+    store.players.lock().insert(pid(100), queued_player(pid(100), 25.0));
+    store.players.lock().insert(pid(200), queued_player(pid(200), 25.0));
     store
         .create_match(&MatchInfo {
             match_token: token.clone(),
-            player_a: 100,
+            player_a: pid(100),
             player_a_difficulty: MatchDifficulty::Normal,
-            player_b: 200,
+            player_b: pid(200),
             player_b_difficulty: MatchDifficulty::Normal,
             game_mode: "ranked_1v1".into(),
             game_type: GameType::P2p,
@@ -173,8 +173,8 @@ async fn dispute_on_winner_mismatch() {
     mgr.submit_report(
         MatchReport {
             match_token: token.clone(),
-            reporting_player: 100,
-            winner: Some(100),
+            reporting_player: pid(100),
+            winner: Some(pid(100)),
             demo_hash: Some("h1".into()),
         },
         &store,
@@ -187,8 +187,8 @@ async fn dispute_on_winner_mismatch() {
         .submit_report(
             MatchReport {
                 match_token: token.clone(),
-                reporting_player: 200,
-                winner: Some(200),
+                reporting_player: pid(200),
+                winner: Some(pid(200)),
                 demo_hash: Some("h2".into()),
             },
             &store,
@@ -201,11 +201,11 @@ async fn dispute_on_winner_mismatch() {
     assert!(matches!(outcome, lobby_core::types::MatchOutcome::Disputed));
     // Terminal: both players must be back in the menus so they can re-queue.
     assert_eq!(
-        store.players.lock().get(&100).unwrap().state,
+        store.players.lock().get(&pid(100)).unwrap().state,
         PlayerState::InMenus
     );
     assert_eq!(
-        store.players.lock().get(&200).unwrap().state,
+        store.players.lock().get(&pid(200)).unwrap().state,
         PlayerState::InMenus
     );
 }
@@ -217,9 +217,9 @@ async fn winner_must_be_participant() {
     store
         .create_match(&MatchInfo {
             match_token: token.clone(),
-            player_a: 100,
+            player_a: pid(100),
             player_a_difficulty: MatchDifficulty::Normal,
-            player_b: 200,
+            player_b: pid(200),
             player_b_difficulty: MatchDifficulty::Normal,
             game_mode: "ranked_1v1".into(),
             game_type: GameType::P2p,
@@ -244,8 +244,8 @@ async fn winner_must_be_participant() {
         .submit_report(
             MatchReport {
                 match_token: token.clone(),
-                reporting_player: 100,
-                winner: Some(999), // a third steam_id — not a participant
+                reporting_player: pid(100),
+                winner: Some(pid(999)), // a third steam_id — not a participant
                 demo_hash: None,
             },
             &store,
@@ -268,9 +268,9 @@ async fn double_accept_requires_both() {
     store
         .create_match(&MatchInfo {
             match_token: token.clone(),
-            player_a: 100,
+            player_a: pid(100),
             player_a_difficulty: MatchDifficulty::Normal,
-            player_b: 200,
+            player_b: pid(200),
             player_b_difficulty: MatchDifficulty::Normal,
             game_mode: "ranked_1v1".into(),
             game_type: GameType::P2p,
@@ -292,13 +292,13 @@ async fn double_accept_requires_both() {
 
     let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks);
     // Player A accepts — match must still be PendingAccept.
-    mgr.accept_match(&token, 100, &store).await.unwrap();
+    mgr.accept_match(&token, pid(100), &store).await.unwrap();
     // Player A accepts again — a double-accept must NOT advance the match.
-    mgr.accept_match(&token, 100, &store).await.unwrap();
+    mgr.accept_match(&token, pid(100), &store).await.unwrap();
     let m = store.get_match(&token).await.unwrap().unwrap();
     assert_eq!(m.status, MatchStatus::PendingAccept);
     // Only once B accepts does the match transition.
-    mgr.accept_match(&token, 200, &store).await.unwrap();
+    mgr.accept_match(&token, pid(200), &store).await.unwrap();
     let m = store.get_match(&token).await.unwrap().unwrap();
     assert_eq!(m.status, MatchStatus::InProgress);
 }
@@ -310,9 +310,9 @@ async fn server_result_resolves() {
     store
         .create_match(&MatchInfo {
             match_token: token.clone(),
-            player_a: 100,
+            player_a: pid(100),
             player_a_difficulty: MatchDifficulty::Normal,
-            player_b: 200,
+            player_b: pid(200),
             player_b_difficulty: MatchDifficulty::Normal,
             game_mode: "server_arena".into(),
             game_type: GameType::Server,
@@ -334,7 +334,7 @@ async fn server_result_resolves() {
 
     let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks);
     let outcome = mgr
-        .resolve_from_gameserver(&token, Some(100), &store, &store, &store)
+        .resolve_from_gameserver(&token, Some(pid(100)), &store, &store, &store)
         .await
         .unwrap();
     match outcome {
@@ -346,7 +346,7 @@ async fn server_result_resolves() {
     let rating_100 = store
         .ratings
         .lock()
-        .get(&(100, "server_arena".into()))
+        .get(&(pid(100), "server_arena".into()))
         .cloned()
         .unwrap();
     assert!(
@@ -360,14 +360,14 @@ async fn server_result_resolves() {
 async fn pong_resolve_declares_winner() {
     let store = MockStore::new();
     let token = "pong-resolve".to_string();
-    store.players.lock().insert(100, queued_player(100, 25.0));
-    store.players.lock().insert(200, queued_player(200, 25.0));
+    store.players.lock().insert(pid(100), queued_player(pid(100), 25.0));
+    store.players.lock().insert(pid(200), queued_player(pid(200), 25.0));
     store
         .create_match(&MatchInfo {
             match_token: token.clone(),
-            player_a: 100,
+            player_a: pid(100),
             player_a_difficulty: MatchDifficulty::Normal,
-            player_b: 200,
+            player_b: pid(200),
             player_b_difficulty: MatchDifficulty::Normal,
             game_mode: "ranked_1v1".into(),
             game_type: GameType::P2p,
@@ -389,7 +389,7 @@ async fn pong_resolve_declares_winner() {
 
     let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks);
     let outcome = mgr
-        .resolve_pong(&token, 100, &store, &store, &store)
+        .resolve_pong(&token, pid(100), &store, &store, &store)
         .await
         .unwrap();
     match outcome {
@@ -401,7 +401,7 @@ async fn pong_resolve_declares_winner() {
     let rating_100 = store
         .ratings
         .lock()
-        .get(&(100, "ranked_1v1".into()))
+        .get(&(pid(100), "ranked_1v1".into()))
         .cloned()
         .unwrap();
     assert!(
@@ -410,12 +410,12 @@ async fn pong_resolve_declares_winner() {
         rating_100.mu
     );
     assert_eq!(
-        store.players.lock().get(&100).unwrap().state,
+        store.players.lock().get(&pid(100)).unwrap().state,
         PlayerState::InMenus,
         "winner reset to InMenus"
     );
     assert_eq!(
-        store.players.lock().get(&200).unwrap().state,
+        store.players.lock().get(&pid(200)).unwrap().state,
         PlayerState::InMenus,
         "loser reset to InMenus"
     );
@@ -428,9 +428,9 @@ async fn playing_match_expires() {
     store
         .create_match(&MatchInfo {
             match_token: token.clone(),
-            player_a: 100,
+            player_a: pid(100),
             player_a_difficulty: MatchDifficulty::Normal,
-            player_b: 200,
+            player_b: pid(200),
             player_b_difficulty: MatchDifficulty::Normal,
             game_mode: "server_arena".into(),
             game_type: GameType::Server,
@@ -461,14 +461,14 @@ async fn playing_match_expires() {
 async fn duplicate_report_rejected() {
     let store = MockStore::new();
     let token = "dup-report".to_string();
-    store.players.lock().insert(100, queued_player(100, 25.0));
-    store.players.lock().insert(200, queued_player(200, 25.0));
+    store.players.lock().insert(pid(100), queued_player(pid(100), 25.0));
+    store.players.lock().insert(pid(200), queued_player(pid(200), 25.0));
     store
         .create_match(&MatchInfo {
             match_token: token.clone(),
-            player_a: 100,
+            player_a: pid(100),
             player_a_difficulty: MatchDifficulty::Normal,
-            player_b: 200,
+            player_b: pid(200),
             player_b_difficulty: MatchDifficulty::Normal,
             game_mode: "ranked_1v1".into(),
             game_type: GameType::P2p,
@@ -491,14 +491,14 @@ async fn duplicate_report_rejected() {
     let mgr = lobby_core::match_lifecycle::MatchManager::new(TestCallbacks);
     let report_a = MatchReport {
         match_token: token.clone(),
-        reporting_player: 100,
-        winner: Some(100),
+        reporting_player: pid(100),
+        winner: Some(pid(100)),
         demo_hash: Some("demo-a".into()),
     };
     let report_b = MatchReport {
         match_token: token.clone(),
-        reporting_player: 200,
-        winner: Some(100),
+        reporting_player: pid(200),
+        winner: Some(pid(100)),
         demo_hash: Some("demo-a".into()),
     };
 
@@ -524,11 +524,11 @@ async fn duplicate_report_rejected() {
         lobby_core::types::MatchOutcome::Win { .. }
     ));
     assert_eq!(
-        store.players.lock().get(&100).unwrap().state,
+        store.players.lock().get(&pid(100)).unwrap().state,
         PlayerState::InMenus
     );
     assert_eq!(
-        store.players.lock().get(&200).unwrap().state,
+        store.players.lock().get(&pid(200)).unwrap().state,
         PlayerState::InMenus
     );
 }

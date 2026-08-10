@@ -10,9 +10,9 @@ impl MatchStore for PostgresStore {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PendingAccept', NOW())",
         )
         .bind(&match_info.match_token)
-        .bind(match_info.player_a as i64)
+        .bind(match_info.player_a)
         .bind(format!("{:?}", match_info.player_a_difficulty).to_lowercase())
-        .bind(match_info.player_b as i64)
+        .bind(match_info.player_b)
         .bind(format!("{:?}", match_info.player_b_difficulty).to_lowercase())
         .bind(&match_info.game_mode)
         .bind(format!("{:?}", match_info.game_type).to_lowercase())
@@ -48,15 +48,14 @@ impl MatchStore for PostgresStore {
     }
 
     async fn submit_report(&self, report: &MatchReport) -> Result<()> {
-        let winner_val: Option<i64> = report.winner.map(|w| w as i64);
         sqlx::query(
             "INSERT INTO match_reports (match_token, reporting_player, winner, demo_hash) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (match_token, reporting_player) DO NOTHING",
         )
         .bind(&report.match_token)
-        .bind(report.reporting_player as i64)
-        .bind(winner_val)
+        .bind(report.reporting_player)
+        .bind(report.winner)
         .bind(&report.demo_hash)
         .execute(&self.pool)
         .await
@@ -65,7 +64,7 @@ impl MatchStore for PostgresStore {
     }
 
     async fn get_reports(&self, token: &str) -> Result<Vec<MatchReport>> {
-        let rows = sqlx::query_as::<_, (String, i64, Option<i64>, Option<String>)>(
+        let rows = sqlx::query_as::<_, (String, uuid::Uuid, Option<uuid::Uuid>, Option<String>)>(
             "SELECT match_token, reporting_player, winner, demo_hash \
              FROM match_reports WHERE match_token = $1",
         )
@@ -78,8 +77,8 @@ impl MatchStore for PostgresStore {
             .into_iter()
             .map(|(mt, rp, w, dh)| MatchReport {
                 match_token: mt,
-                reporting_player: rp as u64,
-                winner: w.map(|v| v as u64),
+                reporting_player: rp,
+                winner: w,
                 demo_hash: dh,
             })
             .collect())
@@ -116,13 +115,13 @@ impl MatchStore for PostgresStore {
         Ok(())
     }
 
-    async fn mark_accepted(&self, token: &str, steam_id: SteamId) -> Result<bool> {
+    async fn mark_accepted(&self, token: &str, user_id: uuid::Uuid) -> Result<bool> {
         sqlx::query(
             "UPDATE matches SET accepted_a = TRUE, accepted_at = NOW() \
              WHERE match_token = $1 AND player_a = $2",
         )
         .bind(token)
-        .bind(steam_id as i64)
+        .bind(user_id)
         .execute(&self.pool)
         .await
         .map_err(map_db_error)?;
@@ -131,7 +130,7 @@ impl MatchStore for PostgresStore {
              WHERE match_token = $1 AND player_b = $2",
         )
         .bind(token)
-        .bind(steam_id as i64)
+        .bind(user_id)
         .execute(&self.pool)
         .await
         .map_err(map_db_error)?;
@@ -145,13 +144,13 @@ impl MatchStore for PostgresStore {
         Ok(row.0)
     }
 
-    async fn mark_started(&self, token: &str, steam_id: SteamId) -> Result<bool> {
+    async fn mark_started(&self, token: &str, user_id: uuid::Uuid) -> Result<bool> {
         sqlx::query(
             "UPDATE matches SET connected_a = TRUE, started_at = NOW() \
              WHERE match_token = $1 AND player_a = $2",
         )
         .bind(token)
-        .bind(steam_id as i64)
+        .bind(user_id)
         .execute(&self.pool)
         .await
         .map_err(map_db_error)?;
@@ -160,7 +159,7 @@ impl MatchStore for PostgresStore {
              WHERE match_token = $1 AND player_b = $2",
         )
         .bind(token)
-        .bind(steam_id as i64)
+        .bind(user_id)
         .execute(&self.pool)
         .await
         .map_err(map_db_error)?;
@@ -197,14 +196,14 @@ impl MatchStore for PostgresStore {
         &self,
         match_token: &str,
         event: MatchEvent,
-        steam_id: Option<SteamId>,
+        actor: Option<uuid::Uuid>,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO match_events (match_token, event_type, steam_id) VALUES ($1, $2, $3)",
+            "INSERT INTO match_events (match_token, event_type, user_id) VALUES ($1, $2, $3)",
         )
         .bind(match_token)
         .bind(format!("{:?}", event).to_lowercase())
-        .bind(steam_id.map(|s| s as i64))
+        .bind(actor)
         .execute(&self.pool)
         .await
         .map_err(map_db_error)?;
@@ -234,8 +233,8 @@ impl MatchStore for PostgresStore {
 
     async fn recent_match_between(
         &self,
-        a: SteamId,
-        b: SteamId,
+        a: uuid::Uuid,
+        b: uuid::Uuid,
         since: DateTime<Utc>,
     ) -> Result<bool> {
         let row = sqlx::query_as::<_, (bool,)>(
@@ -243,8 +242,8 @@ impl MatchStore for PostgresStore {
              WHERE ((player_a = $1 AND player_b = $2) OR (player_a = $2 AND player_b = $1)) \
                AND status = 'Resolved' AND ended_at >= $3)",
         )
-        .bind(a as i64)
-        .bind(b as i64)
+        .bind(a)
+        .bind(b)
         .bind(since)
         .fetch_one(&self.pool)
         .await
@@ -257,8 +256,8 @@ impl MatchStore for PostgresStore {
         &self,
         token: &str,
         game_mode: &str,
-        player_a: SteamId,
-        player_b: SteamId,
+        player_a: uuid::Uuid,
+        player_b: uuid::Uuid,
         outcome: &str,
         mu_change_a: Option<f64>,
         mu_change_b: Option<f64>,
@@ -268,22 +267,22 @@ impl MatchStore for PostgresStore {
         let mut tx = self.pool.begin().await.map_err(map_db_error)?;
         sqlx::query(
             "UPDATE ratings SET mu = $1, sigma = $2, last_updated = NOW() \
-             WHERE steam_id = $3 AND game_mode = $4",
+             WHERE user_id = $3 AND game_mode = $4",
         )
         .bind(rating_a.mu)
         .bind(rating_a.sigma)
-        .bind(player_a as i64)
+        .bind(player_a)
         .bind(game_mode)
         .execute(&mut *tx)
         .await
         .map_err(map_db_error)?;
         sqlx::query(
             "UPDATE ratings SET mu = $1, sigma = $2, last_updated = NOW() \
-             WHERE steam_id = $3 AND game_mode = $4",
+             WHERE user_id = $3 AND game_mode = $4",
         )
         .bind(rating_b.mu)
         .bind(rating_b.sigma)
-        .bind(player_b as i64)
+        .bind(player_b)
         .bind(game_mode)
         .execute(&mut *tx)
         .await

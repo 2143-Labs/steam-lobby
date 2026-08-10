@@ -107,7 +107,7 @@ pub async fn steam_login(
     // Issue a one-time login state bound to this return_to.
     let login_state = uuid::Uuid::new_v4().to_string();
     {
-        let mut states = state.openid_states.lock().unwrap();
+        let mut states = state.openid_states.lock();
         states.retain(|_, s| s.created_at.elapsed() < Duration::from_secs(600));
         if states.len() >= 4096 {
             return (
@@ -121,6 +121,8 @@ pub async fn steam_login(
             OpenIdState {
                 return_to: return_to.clone(),
                 created_at: Instant::now(),
+                provider: "steam".to_string(),
+                code_verifier: None,
             },
         );
     }
@@ -143,7 +145,7 @@ pub async fn steam_callback(
 
     // Consume the one-time login state (prevents replay of a callback).
     let stored = {
-        let mut states = state.openid_states.lock().unwrap();
+        let mut states = state.openid_states.lock();
         states.remove(&state_param)
     };
     let Some(stored) = stored else {
@@ -197,7 +199,7 @@ pub async fn steam_callback(
     // the ('steam', steam_id) identity row is attached. DB error fails closed.
     let user_id = match state
         .store
-        .find_or_create_user(steam_id, &display_name, true)
+        .find_or_create_user("steam", &steam_id.to_string(), &display_name, true)
         .await
     {
         Ok(uid) => uid,
@@ -211,7 +213,7 @@ pub async fn steam_callback(
     };
 
     // Generate JWT bound to the current token_version (DB error fails closed).
-    let version = match state.store.get_token_version(steam_id).await {
+    let version = match state.store.get_token_version(user_id).await {
         Ok(v) => v,
         Err(_) => {
             return (
@@ -223,10 +225,294 @@ pub async fn steam_callback(
     };
     let token = match state.steam_auth.generate_session_token(
         user_id,
-        steam_id,
         version,
         state.config.jwt_ttl_secs,
     ) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("JWT generation failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response();
+        }
+    };
+
+    Redirect::temporary(&build_token_redirect(&return_to, &token)).into_response()
+}
+
+/// Generic OAuth2/OIDC login start: 307 to the provider's authorization
+/// endpoint with a one-time state (and, for PKCE providers, a code challenge).
+pub async fn auth_login(
+    State(state): State<Arc<AppState>>,
+    Path(provider): Path<String>,
+    Query(query): Query<LoginQuery>,
+) -> impl IntoResponse {
+    let Some(cfg) = state.auth_providers.get(&provider) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "provider_not_found"})),
+        )
+            .into_response();
+    };
+    let return_to = query.return_to.unwrap_or_else(|| "/".to_string());
+    if !validate_return_to(&return_to, state.config.public_url.as_deref()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid_return_to"})),
+        )
+            .into_response();
+    }
+    let Some(public_url) = state.config.public_url.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "public_url_required"})),
+        )
+            .into_response();
+    };
+
+    let (verifier, challenge) = if cfg.use_pkce {
+        let (v, c) = crate::auth_providers::pkce_pair();
+        (Some(v), c)
+    } else {
+        (None, String::new())
+    };
+
+    // Issue a one-time login state bound to this return_to + provider.
+    let login_state = uuid::Uuid::new_v4().to_string();
+    {
+        let mut states = state.openid_states.lock();
+        states.retain(|_, s| s.created_at.elapsed() < Duration::from_secs(600));
+        if states.len() >= 4096 {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "state_limit"})),
+            )
+                .into_response();
+        }
+        states.insert(
+            login_state.clone(),
+            OpenIdState {
+                return_to: return_to.clone(),
+                created_at: Instant::now(),
+                provider: provider.clone(),
+                code_verifier: verifier.clone(),
+            },
+        );
+    }
+
+    let callback_url = format!("{public_url}/auth/{provider}/callback");
+    let redirect_url = crate::auth_providers::authorization_url(
+        cfg,
+        &callback_url,
+        &login_state,
+        verifier.as_deref(),
+        &challenge,
+    );
+    Redirect::temporary(&redirect_url).into_response()
+}
+
+/// Generic OAuth2/OIDC callback: consume the state, exchange the code,
+/// fetch userinfo, find-or-create the account, mint the JWT, and 307 to
+/// `return_to#token=...`. All failures fail closed with 401 auth_failed.
+pub async fn auth_callback(
+    State(state): State<Arc<AppState>>,
+    Path(provider): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(cfg) = state.auth_providers.get(&provider) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "provider_not_found"})),
+        )
+            .into_response();
+    };
+    let return_to = query
+        .get("return_to")
+        .cloned()
+        .unwrap_or_else(|| "/".to_string());
+    let state_param = query.get("state").cloned().unwrap_or_default();
+    let code = query.get("code").cloned().unwrap_or_default();
+
+    // Consume the one-time login state (prevents replay of a callback).
+    let stored = {
+        let mut states = state.openid_states.lock();
+        states.remove(&state_param)
+    };
+    let Some(stored) = stored else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "auth_failed"})),
+        )
+            .into_response();
+    };
+    if stored.created_at.elapsed() >= Duration::from_secs(600) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "auth_failed"})),
+        )
+            .into_response();
+    }
+    if stored.provider != provider {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "auth_failed"})),
+        )
+            .into_response();
+    }
+    if stored.return_to != return_to {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "auth_failed"})),
+        )
+            .into_response();
+    }
+    if !validate_return_to(&return_to, state.config.public_url.as_deref()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "auth_failed"})),
+        )
+            .into_response();
+    }
+    let Some(public_url) = state.config.public_url.as_deref() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "auth_failed"})),
+        )
+            .into_response();
+    };
+
+    // Exchange the authorization code for an access token.
+    let callback_url = format!("{public_url}/auth/{provider}/callback");
+    let mut form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", &callback_url),
+        ("client_id", &cfg.client_id),
+        ("client_secret", &cfg.client_secret),
+    ];
+    if let Some(verifier) = &stored.code_verifier {
+        form.push(("code_verifier", verifier));
+    }
+    let token_resp = state
+        .http
+        .post(&cfg.token_endpoint)
+        .form(&form)
+        .send()
+        .await;
+    let token_json: serde_json::Value = match token_resp {
+        Ok(r) if r.status().is_success() => match r.json().await {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "auth_failed"})),
+                )
+                    .into_response();
+            }
+        },
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "auth_failed"})),
+            )
+                .into_response();
+        }
+    };
+    let access_token = token_json["access_token"]
+        .as_str()
+        .ok_or_else(|| ())
+        .map(|s| s.to_string());
+    let Ok(access_token) = access_token else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "auth_failed"})),
+        )
+            .into_response();
+    };
+
+    // Fetch the userinfo document with the access token.
+    let userinfo_resp = state
+        .http
+        .get(&cfg.userinfo_endpoint)
+        .bearer_auth(&access_token)
+        .send()
+        .await;
+    let userinfo: serde_json::Value = match userinfo_resp {
+        Ok(r) if r.status().is_success() => match r.json().await {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "auth_failed"})),
+                )
+                    .into_response();
+            }
+        },
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "auth_failed"})),
+            )
+                .into_response();
+        }
+    };
+    let Some(provider_uid) = userinfo[&cfg.id_field].as_str() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "auth_failed"})),
+        )
+            .into_response();
+    };
+    let display_name = crate::auth_providers::userinfo_name(&userinfo, cfg);
+
+    // Find or create the account; the provider genuinely verified the uid, so
+    // the identity row is attached. DB error fails closed.
+    let user_id = match state
+        .store
+        .find_or_create_user(&provider, provider_uid, &display_name, true)
+        .await
+    {
+        Ok(uid) => uid,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "auth_failed"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Admin flag (au.2143.me only, storage-only): record whether the Pocket ID
+    // `groups` claim contains `pvp_admin`. Written true or false on every
+    // au2143 login so group removal self-heals at the next login; a missing
+    // claim reads as false. Best-effort — a DB error logs and the login still
+    // succeeds. No endpoint/JWT/UI consumes the flag yet.
+    if provider == "au2143" {
+        let is_admin = userinfo["groups"]
+            .as_array()
+            .is_some_and(|g| g.iter().any(|v| v.as_str() == Some("pvp_admin")));
+        if let Err(e) = state.store.set_admin_flag(user_id, is_admin).await {
+            tracing::warn!("failed to record admin flag for {user_id}: {e}");
+        }
+    }
+
+    // Mint JWT bound to the current token_version (DB error fails closed).
+    let version = match state.store.get_token_version(user_id).await {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "auth_failed"})),
+            )
+                .into_response();
+        }
+    };
+    let token = match state
+        .steam_auth
+        .generate_session_token(user_id, version, state.config.jwt_ttl_secs)
+    {
         Ok(t) => t,
         Err(e) => {
             tracing::error!("JWT generation failed: {e}");
@@ -278,7 +564,7 @@ pub async fn ticket_auth(
 
     // Find or create the account; the ticket is genuinely verified, so the
     // ('steam', steam_id) identity row is attached. DB error fails closed.
-    let user_id = match state.store.find_or_create_user(steam_id, "", true).await {
+    let user_id = match state.store.find_or_create_user("steam", &steam_id.to_string(), "", true).await {
         Ok(uid) => uid,
         Err(_) => {
             return (
@@ -290,7 +576,7 @@ pub async fn ticket_auth(
     };
 
     // DB error fails closed — never mint with version 0.
-    let version = match state.store.get_token_version(steam_id).await {
+    let version = match state.store.get_token_version(user_id).await {
         Ok(v) => v,
         Err(_) => {
             return (
@@ -302,7 +588,6 @@ pub async fn ticket_auth(
     };
     let token = match state.steam_auth.generate_session_token(
         user_id,
-        steam_id,
         version,
         state.config.jwt_ttl_secs,
     ) {
@@ -322,8 +607,8 @@ pub async fn ticket_auth(
 
 #[derive(Deserialize)]
 pub struct TestTokenBody {
-    // Browser clients send 17-digit IDs as strings; Rust clients as numbers.
-    #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
+    // Dev-only: a numeric Steam ID, supplied directly. Plain u64 field — the
+    // old string/number-tolerant serde helper no longer exists.
     steam_id: u64,
 }
 
@@ -344,7 +629,7 @@ pub async fn test_token(
     // no identity row is attached). DB error fails closed.
     let user_id = match state
         .store
-        .find_or_create_user(body.steam_id, "", false)
+        .find_or_create_user("steam", &body.steam_id.to_string(), "", false)
         .await
     {
         Ok(uid) => uid,
@@ -357,7 +642,7 @@ pub async fn test_token(
         }
     };
 
-    let version = match state.store.get_token_version(body.steam_id).await {
+    let version = match state.store.get_token_version(user_id).await {
         Ok(v) => v,
         Err(_) => {
             return (
@@ -367,10 +652,8 @@ pub async fn test_token(
                 .into_response();
         }
     };
-
     let token = match state.steam_auth.generate_session_token(
         user_id,
-        body.steam_id,
         version,
         state.config.jwt_ttl_secs,
     ) {
@@ -408,8 +691,8 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
         )
             .into_response();
     };
-    let (_user_id, steam_id, _) = match state.steam_auth.validate_session_token(token) {
-        Ok(triple) => triple,
+    let (user_id, _) = match state.steam_auth.validate_session_token(token) {
+        Ok(pair) => pair,
         Err(_) => {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -418,7 +701,7 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
                 .into_response();
         }
     };
-    match state.store.bump_token_version(steam_id).await {
+    match state.store.bump_token_version(user_id).await {
         Ok(()) => (),
         Err(_) => {
             return (
@@ -497,11 +780,8 @@ mod tests {
 
 #[derive(Deserialize)]
 pub struct GameResultBody {
-    #[serde(
-        default,
-        deserialize_with = "lobby_core::types::deserialize_optional_steam_id"
-    )]
-    pub winner: Option<u64>, // None = draw
+    #[serde(default)]
+    pub winner: Option<uuid::Uuid>, // None = draw
 }
 
 /// The gameserver reports the match outcome. The URL itself is the
@@ -568,11 +848,18 @@ pub async fn modes(State(state): State<Arc<AppState>>) -> Json<serde_json::Value
 }
 
 /// Auth surface capabilities the demo uses to gate its login UI:
-/// `steam_login` is on when a public origin is configured (OpenID needs an
-/// absolute callback), `dev_mode` when the test-token endpoint is exposed.
+/// `providers` lists the registered login providers ("steam" when a public
+/// origin is configured — OpenID needs an absolute callback — plus the
+/// registry's provider ids), `dev_mode` when the test-token endpoint is
+/// exposed.
 pub async fn auth_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let mut providers = Vec::new();
+    if state.config.public_url.is_some() {
+        providers.push("steam");
+    }
+    providers.extend(state.auth_providers.ids());
     Json(serde_json::json!({
-        "steam_login": state.config.public_url.is_some(),
+        "providers": providers,
         "dev_mode": state.config.auth_dev_mode,
     }))
 }

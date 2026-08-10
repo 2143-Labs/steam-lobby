@@ -96,6 +96,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ticker_shutdown: None,
         temporal_disabled: false,
         pool: None,
+        discord_client_id: std::env::var("DISCORD_CLIENT_ID").ok().filter(|s| !s.is_empty()),
+        discord_client_secret: std::env::var("DISCORD_CLIENT_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        au2143_client_id: std::env::var("AU2143_CLIENT_ID").ok().filter(|s| !s.is_empty()),
+        au2143_client_secret: std::env::var("AU2143_CLIENT_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        au2143_issuer: std::env::var("AU2143_ISSUER").unwrap_or_else(|_| "https://au.2143.me".into()),
+        au2143_authorize_url: std::env::var("AU2143_AUTHORIZE_URL")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        au2143_token_url: std::env::var("AU2143_TOKEN_URL")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        au2143_userinfo_url: std::env::var("AU2143_USERINFO_URL")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        provider_overrides: vec![],
     };
 
     let (app, _state) = build_app(config).await;

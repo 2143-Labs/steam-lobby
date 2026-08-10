@@ -9,6 +9,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
+pub mod auth_providers;
 mod db;
 mod gameserver;
 mod pong;
@@ -60,6 +61,18 @@ pub struct AppConfig {
     pub ticker_shutdown: Option<tokio::sync::watch::Receiver<bool>>, // test-only: stop the maintenance loop
     pub temporal_disabled: bool, // test-only: skip spawning the in-process Temporal worker
     pub pool: Option<sqlx::PgPool>, // test-only: inject the per-test pool so sqlx's post-test close() tears down the server's connections
+    // OAuth2/OIDC login providers (Step 8).
+    pub discord_client_id: Option<String>,   // DISCORD_CLIENT_ID
+    pub discord_client_secret: Option<String>, // DISCORD_CLIENT_SECRET
+    pub au2143_client_id: Option<String>,    // AU2143_CLIENT_ID
+    pub au2143_client_secret: Option<String>, // AU2143_CLIENT_SECRET
+    pub au2143_issuer: String,               // AU2143_ISSUER, default https://au.2143.me
+    pub au2143_authorize_url: Option<String>, // AU2143_AUTHORIZE_URL (discovery-failure override)
+    pub au2143_token_url: Option<String>,    // AU2143_TOKEN_URL
+    pub au2143_userinfo_url: Option<String>, // AU2143_USERINFO_URL
+    /// Test-only: replace the env-built registry with these configs verbatim
+    /// (the provider tests point them at a mock OAuth server).
+    pub provider_overrides: Vec<crate::auth_providers::ProviderConfig>,
 }
 
 /// Build the full axum Router + shared state.
@@ -165,10 +178,36 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         config.app_id,
         config.jwt_secret,
     );
+
     let callbacks = DefaultCallbacks;
     let player_manager = lobby_core::player::PlayerManager::new(callbacks.clone());
     let match_manager = lobby_core::match_lifecycle::MatchManager::new(callbacks);
     let http = reqwest::Client::new();
+    let auth_providers = if !config.provider_overrides.is_empty() {
+        std::sync::Arc::new(crate::auth_providers::AuthProviderRegistry {
+            providers: config.provider_overrides.clone(),
+        })
+    } else {
+        std::sync::Arc::new(
+            crate::auth_providers::build(
+                config.discord_client_id.clone(),
+                config.discord_client_secret.clone(),
+                config.au2143_client_id.clone(),
+                config.au2143_client_secret.clone(),
+                config.au2143_issuer.clone(),
+                match (
+                    &config.au2143_authorize_url,
+                    &config.au2143_token_url,
+                    &config.au2143_userinfo_url,
+                ) {
+                    (Some(a), Some(t), Some(u)) => Some((a.clone(), t.clone(), u.clone())),
+                    _ => None,
+                },
+                &http,
+            )
+            .await,
+        )
+    };
     let state = Arc::new(AppState {
         player_manager,
         match_manager,
@@ -181,6 +220,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
             callback_base,
             client: http,
         },
+        auth_providers,
         gameserver_alloc_timeout_secs: config.gameserver_alloc_timeout_secs,
         gameserver_result_timeout_secs: config.gameserver_result_timeout_secs,
         connections: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -201,7 +241,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
             temporal_namespace: config.temporal_namespace.clone(),
             temporal_task_queue: config.temporal_task_queue.clone(),
         },
-        openid_states: std::sync::Mutex::new(std::collections::HashMap::new()),
+        openid_states: parking_lot::Mutex::new(std::collections::HashMap::new()),
         pong_games: parking_lot::Mutex::new(std::collections::HashMap::new()),
         ticket_limiter: RateLimiter::new(10, std::time::Duration::from_secs(60)),
         test_token_limiter: RateLimiter::new(20, std::time::Duration::from_secs(60)),
@@ -231,6 +271,14 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
     }
 
     let mut router = Router::new()
+        .route(
+            "/auth/{provider}/login",
+            get(routes::auth_login),
+        )
+        .route(
+            "/auth/{provider}/callback",
+            get(routes::auth_callback),
+        )
         .route("/pong-wrtc.mjs", get(routes::pong_wrtc))
         .route("/", get(routes::index))
         .route("/pong-sim.mjs", get(routes::pong_sim))

@@ -7,30 +7,34 @@ use std::sync::Arc;
 
 use temporalio_client::{WorkflowSignalOptions, WorkflowStartOptions};
 
-use lobby_core::types::{MatchDifficulty, SteamId};
+use lobby_core::types::{MatchDifficulty, PlayerId};
 
 use crate::state::AppState;
 use crate::temporal::activities::QueueArgs;
 use crate::temporal::workflows::{self, ChoiceArgs, DemoArgs, SessionArgs, StartArgs, WhoWonArgs};
 
-/// The session workflow ID is per CONNECTION (`user-session-{steam_id}-{session_id}`):
+/// The session workflow ID is per CONNECTION (`user-session-{player_id}-{session_id}`):
 /// each WS connection owns its own session workflow, so a crash-then-reconnect
 /// or a replaced connection never collides with (or kills) a sibling session.
 /// The session UUID, not the task queue, provides isolation.
-fn session_workflow_id(steam_id: SteamId, session_id: &str) -> String {
-    format!("user-session-{steam_id}-{session_id}")
+fn session_workflow_id(user_id: uuid::Uuid, session_id: &str) -> String {
+    format!("user-session-{user_id}-{session_id}")
 }
-pub(crate) async fn start_user_session(state: &Arc<AppState>, steam_id: SteamId, session_id: &str) {
+pub(crate) async fn start_user_session(
+    state: &Arc<AppState>,
+    user_id: uuid::Uuid,
+    session_id: &str,
+) {
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
     };
     let _ = client
         .start_workflow(
             workflows::UserSessionWorkflow::run,
-            SessionArgs { steam_id },
+            SessionArgs { user_id },
             WorkflowStartOptions::new(
                 &state.config.temporal_task_queue,
-                session_workflow_id(steam_id, session_id),
+                session_workflow_id(user_id, session_id),
             )
             .build(),
         )
@@ -40,7 +44,7 @@ pub(crate) async fn start_user_session(state: &Arc<AppState>, steam_id: SteamId,
 /// Signal the session to enter the queue (BeginMatchmaking).
 pub(crate) async fn signal_queue(
     state: &Arc<AppState>,
-    steam_id: SteamId,
+    user_id: uuid::Uuid,
     session_id: &str,
     mode: String,
     difficulty: MatchDifficulty,
@@ -49,13 +53,13 @@ pub(crate) async fn signal_queue(
         return;
     };
     let handle = client.get_workflow_handle::<workflows::UserSessionWorkflow>(
-        session_workflow_id(steam_id, session_id),
+        session_workflow_id(user_id, session_id),
     );
     let _ = handle
         .signal(
             workflows::UserSessionWorkflow::queue,
             QueueArgs {
-                steam_id,
+                user_id,
                 mode,
                 difficulty,
             },
@@ -65,12 +69,12 @@ pub(crate) async fn signal_queue(
 }
 
 /// Signal the session to leave the queue (CancelMatchmaking).
-pub(crate) async fn signal_unqueue(state: &Arc<AppState>, steam_id: SteamId, session_id: &str) {
+pub(crate) async fn signal_unqueue(state: &Arc<AppState>, user_id: uuid::Uuid, session_id: &str) {
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
     };
     let handle = client.get_workflow_handle::<workflows::UserSessionWorkflow>(
-        session_workflow_id(steam_id, session_id),
+        session_workflow_id(user_id, session_id),
     );
     let _ = handle
         .signal(
@@ -87,7 +91,7 @@ pub(crate) async fn signal_unqueue(state: &Arc<AppState>, steam_id: SteamId, ses
 pub(crate) async fn signal_match_choice(
     state: &Arc<AppState>,
     token: &str,
-    steam_id: SteamId,
+    user_id: uuid::Uuid,
     accept: bool,
 ) {
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
@@ -98,7 +102,7 @@ pub(crate) async fn signal_match_choice(
     if let Err(e) = handle
         .signal(
             workflows::P2PMatchWorkflow::match_choice,
-            ChoiceArgs { steam_id, accept },
+            ChoiceArgs { user_id, accept },
             WorkflowSignalOptions::default(),
         )
         .await
@@ -108,7 +112,7 @@ pub(crate) async fn signal_match_choice(
 }
 
 /// Signal the match workflow that a player clicked START (StartMatch).
-pub(crate) async fn signal_start(state: &Arc<AppState>, token: &str, steam_id: SteamId) {
+pub(crate) async fn signal_start(state: &Arc<AppState>, token: &str, user_id: uuid::Uuid) {
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
     };
@@ -117,7 +121,7 @@ pub(crate) async fn signal_start(state: &Arc<AppState>, token: &str, steam_id: S
     let _ = handle
         .signal(
             workflows::P2PMatchWorkflow::start,
-            StartArgs { steam_id },
+            StartArgs { user_id },
             WorkflowSignalOptions::default(),
         )
         .await;
@@ -127,8 +131,8 @@ pub(crate) async fn signal_start(state: &Arc<AppState>, token: &str, steam_id: S
 pub(crate) async fn signal_who_won(
     state: &Arc<AppState>,
     token: &str,
-    steam_id: SteamId,
-    winner: SteamId,
+    user_id: uuid::Uuid,
+    winner: PlayerId,
 ) {
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
@@ -138,7 +142,7 @@ pub(crate) async fn signal_who_won(
     let _ = handle
         .signal(
             workflows::P2PMatchWorkflow::who_won,
-            WhoWonArgs { steam_id, winner },
+            WhoWonArgs { user_id, winner },
             WorkflowSignalOptions::default(),
         )
         .await;
@@ -146,12 +150,16 @@ pub(crate) async fn signal_who_won(
 /// Signal the session that the player disconnected (the disconnect block).
 /// Unconditional per connection: a connection that ends — including one
 /// replaced by a newer connection for the same player — ends ITS OWN session.
-pub(crate) async fn signal_disconnect(state: &Arc<AppState>, steam_id: SteamId, session_id: &str) {
+pub(crate) async fn signal_disconnect(
+    state: &Arc<AppState>,
+    user_id: uuid::Uuid,
+    session_id: &str,
+) {
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
     };
     let handle = client.get_workflow_handle::<workflows::UserSessionWorkflow>(
-        session_workflow_id(steam_id, session_id),
+        session_workflow_id(user_id, session_id),
     );
     let _ = handle
         .signal(
@@ -166,7 +174,7 @@ pub(crate) async fn signal_disconnect(state: &Arc<AppState>, steam_id: SteamId, 
 /// Temporal — the sweep runs in-process). Tell the CURRENT connection's
 /// session so its `queued` copy clears and the player can re-queue. No
 /// connection -> no live session to notify.
-pub(crate) async fn signal_queue_expired(state: &Arc<AppState>, steam_id: SteamId) {
+pub(crate) async fn signal_queue_expired(state: &Arc<AppState>, user_id: uuid::Uuid) {
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
         return;
     };
@@ -174,13 +182,13 @@ pub(crate) async fn signal_queue_expired(state: &Arc<AppState>, steam_id: SteamI
         .connections
         .lock()
         .await
-        .get(&steam_id)
+        .get(&user_id)
         .map(|e| e.session_id.clone())
     else {
         return;
     };
     let handle = client.get_workflow_handle::<workflows::UserSessionWorkflow>(
-        session_workflow_id(steam_id, &session_id),
+        session_workflow_id(user_id, &session_id),
     );
     let _ = handle
         .signal(
@@ -195,7 +203,7 @@ pub(crate) async fn signal_queue_expired(state: &Arc<AppState>, steam_id: SteamI
 pub(crate) async fn signal_submit_demo(
     state: &Arc<AppState>,
     token: &str,
-    steam_id: SteamId,
+    user_id: uuid::Uuid,
     demo_hash: String,
 ) {
     let Some(client) = state.temporal.read().ok().and_then(|g| g.clone()) else {
@@ -207,11 +215,10 @@ pub(crate) async fn signal_submit_demo(
         .signal(
             workflows::P2PMatchWorkflow::submit_demo,
             DemoArgs {
-                steam_id,
+                user_id,
                 demo_hash,
             },
             WorkflowSignalOptions::default(),
         )
         .await;
 }
-

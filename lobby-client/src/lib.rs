@@ -8,7 +8,7 @@
 //!
 //! // Authenticate
 //! let auth = client.authenticate("your-jwt-token").await?;
-//! println!("Logged in as {} ({})", auth.display_name, auth.steam_id);
+//! println!("Logged in as {} ({})", auth.display_name, auth.player_id);
 //!
 //! // Enter queue
 //! client.begin_matchmaking("ranked_1v1", "normal").await?;
@@ -19,7 +19,7 @@
 //!     client.accept_match(&m.match_token).await?;
 //!     client.start_match(&m.match_token).await?;
 //!     // ... play the game ...
-//!     client.submit_report(&m.match_token, Some(auth.steam_id), None).await?;
+//!     client.submit_report(&m.match_token, Some(&auth.player_id), None).await?;
 //! }
 //! # Ok(())
 //! # }
@@ -65,7 +65,7 @@ enum ClientMsg {
     },
     MatchReport {
         match_token: String,
-        winner: Option<u64>,
+        winner: Option<String>,
         demo_hash: Option<String>,
     },
     Heartbeat,
@@ -175,9 +175,6 @@ pub enum ServerEvent {
     #[serde(rename = "auth_ok")]
     AuthOk {
         player_id: String,
-        // The server serializes 17-digit Steam IDs as strings (JS-safe).
-        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
-        steam_id: u64,
         display_name: String,
         state: lobby_core::types::PlayerState,
     },
@@ -202,10 +199,8 @@ pub enum ServerEvent {
     GameState {
         match_token: String,
         frame: u32,
-        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
-        player_a: u64,
-        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
-        player_b: u64,
+        player_a: String,
+        player_b: String,
         left_y: f64,
         right_y: f64,
         ball_x: f64,
@@ -235,8 +230,7 @@ pub enum ServerEvent {
     #[serde(rename = "peer_input")]
     PeerInput {
         match_token: String,
-        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
-        from: u64,
+        from: String,
         frame: u32,
         target: String,
     },
@@ -248,8 +242,7 @@ pub enum ServerEvent {
     },
     GameOver {
         match_token: String,
-        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
-        winner: u64,
+        winner: String,
     },
     QueueStatus {
         elapsed_ms: u64,
@@ -268,13 +261,9 @@ pub enum ServerEvent {
     },
     ReportReceived {
         match_token: String,
-        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
-        reporting_player: u64,
-        #[serde(
-            default,
-            deserialize_with = "lobby_core::types::deserialize_optional_steam_id"
-        )]
-        winner: Option<u64>,
+        reporting_player: String,
+        #[serde(default)]
+        winner: Option<String>,
         demo_hash: Option<String>,
     },
     #[serde(rename = "match_declined")]
@@ -298,37 +287,31 @@ pub enum ServerEvent {
     #[serde(rename = "webrtc_offer")]
     WebrtcOffer {
         match_token: String,
-        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
-        from: u64,
+        from: String,
         sdp: String,
     },
     #[serde(rename = "webrtc_answer")]
     WebrtcAnswer {
         match_token: String,
-        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
-        from: u64,
+        from: String,
         sdp: String,
     },
     #[serde(rename = "webrtc_ice")]
     WebrtcIce {
         match_token: String,
-        #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
-        from: u64,
+        from: String,
         candidate: String,
     },
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct OpponentInfo {
     pub player_id: String,
-    #[serde(deserialize_with = "lobby_core::types::deserialize_steam_id")]
-    pub steam_id: u64,
     pub display_name: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct AuthOk {
     pub player_id: String,
-    pub steam_id: u64,
     pub display_name: String,
     pub state: lobby_core::types::PlayerState,
 }
@@ -467,12 +450,10 @@ impl LobbyClient {
         match self.rx.recv().await.ok_or(ClientError::NoResponse)? {
             Ok(ServerEvent::AuthOk {
                 player_id,
-                steam_id,
                 display_name,
                 state,
             }) => Ok(AuthOk {
                 player_id,
-                steam_id,
                 display_name,
                 state,
             }),
@@ -622,16 +603,17 @@ impl LobbyClient {
         })
     }
 
-    /// Submit a match result. `winner` is the victor's steam_id; `None` for a draw.
+    /// Submit a match result. `winner` is the victor's player_id (UUID
+    /// string); `None` for a draw.
     pub async fn submit_report(
         &mut self,
         match_token: &str,
-        winner: Option<u64>,
+        winner: Option<&str>,
         demo_hash: Option<&str>,
     ) -> Result<(), ClientError> {
         self.send(ClientMsg::MatchReport {
             match_token: match_token.to_string(),
-            winner,
+            winner: winner.map(|s| s.to_string()),
             demo_hash: demo_hash.map(|s| s.to_string()),
         })
     }

@@ -3,8 +3,8 @@ use chrono::{DateTime, Duration, Utc};
 use lobby_core::error::Result;
 use lobby_core::traits::{GameCallbacks, MatchStore, PlayerStore, QueueStore, RatingStore};
 use lobby_core::types::{
-    MatchEvent, MatchInfo, MatchReport, MatchStatus, OpenSkillRating, PlayerInfo, PlayerState,
-    QueueEntry, SteamId,
+    MatchEvent, MatchInfo, MatchReport, MatchStatus, OpenSkillRating, PlayerId, PlayerInfo,
+    PlayerState, QueueEntry,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -14,14 +14,14 @@ use std::collections::HashMap;
 pub type StoredResult = (String, Option<f64>, Option<f64>);
 
 pub struct MockStore {
-    pub players: Mutex<HashMap<SteamId, PlayerInfo>>,
-    pub ratings: Mutex<HashMap<(SteamId, String), OpenSkillRating>>,
+    pub players: Mutex<HashMap<PlayerId, PlayerInfo>>,
+    pub ratings: Mutex<HashMap<(PlayerId, String), OpenSkillRating>>,
     pub matches: Mutex<HashMap<String, MatchInfo>>,
     pub reports: Mutex<HashMap<String, Vec<MatchReport>>>,
-    pub queue: Mutex<HashMap<(SteamId, String), QueueEntry>>,
+    pub queue: Mutex<HashMap<(PlayerId, String), QueueEntry>>,
     pub results: Mutex<HashMap<String, StoredResult>>,
-    pub token_versions: Mutex<HashMap<SteamId, u32>>,
-    pub events: Mutex<Vec<(String, MatchEvent, Option<SteamId>)>>,
+    pub token_versions: Mutex<HashMap<PlayerId, u32>>,
+    pub events: Mutex<Vec<(String, MatchEvent, Option<PlayerId>)>>,
 }
 
 impl MockStore {
@@ -41,14 +41,14 @@ impl MockStore {
 
 #[async_trait]
 impl PlayerStore for MockStore {
-    async fn upsert_player(&self, steam_id: SteamId, display_name: &str) -> Result<()> {
+    async fn upsert_player(&self, user_id: PlayerId, display_name: &str) -> Result<()> {
         let mut p = self.players.lock();
-        p.entry(steam_id)
+        p.entry(user_id)
             .and_modify(|pi| {
                 pi.display_name = display_name.to_string();
             })
             .or_insert_with(|| PlayerInfo {
-                steam_id,
+                user_id,
                 display_name: display_name.to_string(),
                 state: PlayerState::InMenus,
                 last_heartbeat: Utc::now(),
@@ -56,13 +56,13 @@ impl PlayerStore for MockStore {
         Ok(())
     }
 
-    async fn get_player_state(&self, steam_id: SteamId) -> Result<Option<PlayerInfo>> {
-        Ok(self.players.lock().get(&steam_id).cloned())
+    async fn get_player_state(&self, user_id: PlayerId) -> Result<Option<PlayerInfo>> {
+        Ok(self.players.lock().get(&user_id).cloned())
     }
 
-    async fn get_rating(&self, steam_id: SteamId, mode: &str) -> Result<OpenSkillRating> {
+    async fn get_rating(&self, user_id: PlayerId, mode: &str) -> Result<OpenSkillRating> {
         let r = self.ratings.lock();
-        Ok(r.get(&(steam_id, mode.to_string()))
+        Ok(r.get(&(user_id, mode.to_string()))
             .cloned()
             .unwrap_or(OpenSkillRating {
                 mu: 25.0,
@@ -73,44 +73,44 @@ impl PlayerStore for MockStore {
 
     async fn update_rating(
         &self,
-        steam_id: SteamId,
+        user_id: PlayerId,
         mode: &str,
         rating: &OpenSkillRating,
     ) -> Result<()> {
         self.ratings
             .lock()
-            .insert((steam_id, mode.to_string()), rating.clone());
+            .insert((user_id, mode.to_string()), rating.clone());
         Ok(())
     }
 
-    async fn set_player_state(&self, steam_id: SteamId, state: PlayerState) -> Result<()> {
+    async fn set_player_state(&self, user_id: PlayerId, state: PlayerState) -> Result<()> {
         let mut p = self.players.lock();
-        if let Some(info) = p.get_mut(&steam_id) {
+        if let Some(info) = p.get_mut(&user_id) {
             info.state = state;
         }
         Ok(())
     }
 
-    async fn update_heartbeat(&self, steam_id: SteamId) -> Result<()> {
+    async fn update_heartbeat(&self, user_id: PlayerId) -> Result<()> {
         let mut p = self.players.lock();
-        if let Some(info) = p.get_mut(&steam_id) {
+        if let Some(info) = p.get_mut(&user_id) {
             info.last_heartbeat = Utc::now();
         }
         Ok(())
     }
 
-    async fn get_token_version(&self, steam_id: SteamId) -> Result<u32> {
+    async fn get_token_version(&self, user_id: PlayerId) -> Result<u32> {
         Ok(self
             .token_versions
             .lock()
-            .get(&steam_id)
+            .get(&user_id)
             .copied()
             .unwrap_or(0))
     }
 
-    async fn bump_token_version(&self, steam_id: SteamId) -> Result<()> {
+    async fn bump_token_version(&self, user_id: PlayerId) -> Result<()> {
         let mut v = self.token_versions.lock();
-        *v.entry(steam_id).or_insert(0) += 1;
+        *v.entry(user_id).or_insert(0) += 1;
         Ok(())
     }
 }
@@ -179,12 +179,12 @@ impl MatchStore for MockStore {
         Ok(())
     }
 
-    async fn mark_accepted(&self, token: &str, steam_id: SteamId) -> Result<bool> {
+    async fn mark_accepted(&self, token: &str, user_id: PlayerId) -> Result<bool> {
         let mut m = self.matches.lock();
         if let Some(mi) = m.get_mut(token) {
-            if mi.player_a == steam_id {
+            if mi.player_a == user_id {
                 mi.accepted_a = true;
-            } else if mi.player_b == steam_id {
+            } else if mi.player_b == user_id {
                 mi.accepted_b = true;
             }
             if mi.accepted_a && mi.accepted_b {
@@ -195,12 +195,12 @@ impl MatchStore for MockStore {
         Ok(false)
     }
 
-    async fn mark_started(&self, token: &str, steam_id: SteamId) -> Result<bool> {
+    async fn mark_started(&self, token: &str, user_id: PlayerId) -> Result<bool> {
         let mut m = self.matches.lock();
         if let Some(mi) = m.get_mut(token) {
-            if mi.player_a == steam_id {
+            if mi.player_a == user_id {
                 mi.connected_a = true;
-            } else if mi.player_b == steam_id {
+            } else if mi.player_b == user_id {
                 mi.connected_b = true;
             }
             if mi.connected_a && mi.connected_b {
@@ -231,11 +231,11 @@ impl MatchStore for MockStore {
         &self,
         match_token: &str,
         event: MatchEvent,
-        steam_id: Option<SteamId>,
+        actor: Option<PlayerId>,
     ) -> Result<()> {
         self.events
             .lock()
-            .push((match_token.to_string(), event, steam_id));
+            .push((match_token.to_string(), event, actor));
         Ok(())
     }
 
@@ -255,8 +255,8 @@ impl MatchStore for MockStore {
 
     async fn recent_match_between(
         &self,
-        a: SteamId,
-        b: SteamId,
+        a: PlayerId,
+        b: PlayerId,
         since: DateTime<Utc>,
     ) -> Result<bool> {
         Ok(self.matches.lock().values().any(|m| {
@@ -270,8 +270,8 @@ impl MatchStore for MockStore {
         &self,
         token: &str,
         game_mode: &str,
-        player_a: SteamId,
-        player_b: SteamId,
+        player_a: PlayerId,
+        player_b: PlayerId,
         outcome: &str,
         mu_change_a: Option<f64>,
         mu_change_b: Option<f64>,
@@ -301,12 +301,12 @@ impl QueueStore for MockStore {
     async fn enqueue(&self, entry: &QueueEntry) -> Result<()> {
         self.queue
             .lock()
-            .insert((entry.steam_id, entry.game_mode.clone()), entry.clone());
+            .insert((entry.user_id, entry.game_mode.clone()), entry.clone());
         Ok(())
     }
 
-    async fn dequeue(&self, steam_id: SteamId, mode: &str) -> Result<()> {
-        self.queue.lock().remove(&(steam_id, mode.to_string()));
+    async fn dequeue(&self, user_id: PlayerId, mode: &str) -> Result<()> {
+        self.queue.lock().remove(&(user_id, mode.to_string()));
         Ok(())
     }
 
@@ -320,45 +320,44 @@ impl QueueStore for MockStore {
             .collect())
     }
 
-    async fn remove_stale_queue_entries(&self, timeout: Duration) -> Result<Vec<SteamId>> {
+    async fn remove_stale_queue_entries(&self, timeout: Duration) -> Result<Vec<PlayerId>> {
         let cutoff = Utc::now() - timeout;
         let mut queue = self.queue.lock();
-        let stale: Vec<SteamId> = queue
+        let stale: Vec<PlayerId> = queue
             .values()
             .filter(|e| e.queued_at < cutoff)
-            .map(|e| e.steam_id)
+            .map(|e| e.user_id)
             .collect();
         for id in &stale {
-            queue.retain(|(sid, _mode), _e| sid != id);
+            queue.retain(|(uid, _mode), _e| uid != id);
         }
         Ok(stale)
     }
 
-    async fn is_queued(&self, steam_id: SteamId) -> Result<bool> {
-        Ok(self.queue.lock().keys().any(|(sid, _)| *sid == steam_id))
+    async fn is_queued(&self, user_id: PlayerId) -> Result<bool> {
+        Ok(self.queue.lock().keys().any(|(uid, _)| *uid == user_id))
     }
 
-    async fn get_queued_entry(&self, steam_id: SteamId) -> Result<Option<QueueEntry>> {
+    async fn get_queued_entry(&self, user_id: PlayerId) -> Result<Option<QueueEntry>> {
         Ok(self
             .queue
             .lock()
             .values()
-            .filter(|e| e.steam_id == steam_id)
+            .filter(|e| e.user_id == user_id)
             .max_by_key(|e| e.queued_at)
             .cloned())
     }
 }
 
-
 #[async_trait]
 impl RatingStore for MockStore {
-    async fn get_rating(&self, steam_id: SteamId, mode: &str) -> Result<OpenSkillRating> {
-        <Self as PlayerStore>::get_rating(self, steam_id, mode).await
+    async fn get_rating(&self, user_id: PlayerId, mode: &str) -> Result<OpenSkillRating> {
+        <Self as PlayerStore>::get_rating(self, user_id, mode).await
     }
 
-    async fn list_ratings(&self, mode: &str) -> Result<Vec<(SteamId, OpenSkillRating)>> {
+    async fn list_ratings(&self, mode: &str) -> Result<Vec<(PlayerId, OpenSkillRating)>> {
         let r = self.ratings.lock();
-        let mut all: Vec<(SteamId, OpenSkillRating)> = r
+        let mut all: Vec<(PlayerId, OpenSkillRating)> = r
             .iter()
             .filter(|((_id, m), _r)| m == mode)
             .map(|((id, _mode), rating)| (*id, rating.clone()))
@@ -373,13 +372,13 @@ impl RatingStore for MockStore {
 
     async fn update_rating(
         &self,
-        steam_id: SteamId,
+        user_id: PlayerId,
         mode: &str,
         rating: &OpenSkillRating,
     ) -> Result<()> {
         self.ratings
             .lock()
-            .insert((steam_id, mode.to_string()), rating.clone());
+            .insert((user_id, mode.to_string()), rating.clone());
         Ok(())
     }
 }
@@ -390,10 +389,15 @@ impl GameCallbacks for TestCallbacks {}
 
 // ── Helpers ──────────────────────────────────────────────
 
+/// Deterministic small UUIDs for tests: n=0 → 0x1, n=1 → 0x2, …
+pub fn pid(n: u64) -> PlayerId {
+    uuid::Uuid::from_u128(n as u128 + 1)
+}
+
 #[allow(dead_code)] // only some test binaries use it
-pub fn queued_player(id: SteamId, _mu: f64) -> PlayerInfo {
+pub fn queued_player(id: PlayerId, _mu: f64) -> PlayerInfo {
     PlayerInfo {
-        steam_id: id,
+        user_id: id,
         display_name: format!("P{id}"),
         state: PlayerState::Queueing,
         last_heartbeat: Utc::now(),

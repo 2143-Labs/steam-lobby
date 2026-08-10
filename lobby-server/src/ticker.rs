@@ -54,25 +54,19 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                     let info_a = match_info.clone();
                     tokio::spawn(async move {
                         let opponent_name = state_a
-                            .steam_auth
-                            .get_player_summary(info_a.player_b)
-                            .await
-                            .unwrap_or_else(|_| "Unknown".into());
-                        let opponent_player_id = state_a
                             .store
-                            .get_user_id(info_a.player_b)
+                            .get_display_name(info_a.player_b)
                             .await
                             .ok()
                             .flatten()
-                            .map(|u| u.to_string())
-                            .unwrap_or_default();
+                            .unwrap_or_else(|| "Unknown".into());
+                        let opponent_player_id = info_a.player_b.to_string();
                         let connections = state_a.connections.lock().await;
                         if let Some(tx_a) = connections.get(&info_a.player_a).map(|e| &e.tx) {
                             let _ = tx_a.send(ServerMessage::MatchFound {
                                 match_token: info_a.match_token.clone(),
                                 opponent: OpponentInfo {
                                     player_id: opponent_player_id,
-                                    steam_id: info_a.player_b,
                                     display_name: opponent_name,
                                 },
                                 timeout_ms: 30_000,
@@ -85,25 +79,19 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                     let info_b = match_info;
                     tokio::spawn(async move {
                         let opponent_name = state_b
-                            .steam_auth
-                            .get_player_summary(info_b.player_a)
-                            .await
-                            .unwrap_or_else(|_| "Unknown".into());
-                        let opponent_player_id = state_b
                             .store
-                            .get_user_id(info_b.player_a)
+                            .get_display_name(info_b.player_a)
                             .await
                             .ok()
                             .flatten()
-                            .map(|u| u.to_string())
-                            .unwrap_or_default();
+                            .unwrap_or_else(|| "Unknown".into());
+                        let opponent_player_id = info_b.player_a.to_string();
                         let connections = state_b.connections.lock().await;
                         if let Some(tx_b) = connections.get(&info_b.player_b).map(|e| &e.tx) {
                             let _ = tx_b.send(ServerMessage::MatchFound {
                                 match_token: info_b.match_token.clone(),
                                 opponent: OpponentInfo {
                                     player_id: opponent_player_id,
-                                    steam_id: info_b.player_a,
                                     display_name: opponent_name,
                                 },
                                 timeout_ms: 30_000,
@@ -124,24 +112,15 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                 let ratings = state.store.list_ratings(mode).await.unwrap_or_default();
                 let mut leaderboard: Vec<LeaderboardEntry> = Vec::with_capacity(ratings.len());
                 for (id, r) in ratings {
-                    let player_id = state
-                        .store
-                        .get_user_id(id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|u| u.to_string())
-                        .unwrap_or_default();
                     leaderboard.push(LeaderboardEntry {
-                        player_id,
-                        steam_id: id,
+                        player_id: id.to_string(),
                         mu: r.mu,
                         sigma: r.sigma,
                         rating: r.mu - 3.0 * r.sigma,
                     });
                 }
                 let now = chrono::Utc::now();
-                let mut sends: Vec<(u64, ServerMessage)> = Vec::new();
+                let mut sends: Vec<(uuid::Uuid, ServerMessage)> = Vec::new();
                 for entry in &queue {
                     let wait_s = (now - entry.queued_at).num_seconds().max(0) as f64;
                     let (lo, hi) = lobby_core::queue::search_band(
@@ -151,11 +130,11 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                     );
                     let candidates = queue
                         .iter()
-                        .filter(|o| o.steam_id != entry.steam_id && o.mu >= lo && o.mu <= hi)
+                        .filter(|o| o.user_id != entry.user_id && o.mu >= lo && o.mu <= hi)
                         .count() as u32;
                     let rating = state
                         .store
-                        .get_rating(entry.steam_id, mode)
+                        .get_rating(entry.user_id, mode)
                         .await
                         .unwrap_or(lobby_core::types::OpenSkillRating {
                             mu: entry.mu,
@@ -163,7 +142,7 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                             last_updated: now,
                         });
                     sends.push((
-                        entry.steam_id,
+                        entry.user_id,
                         ServerMessage::QueueStatus {
                             elapsed_ms: (wait_s * 1000.0) as u64,
                             band_lo: lo,

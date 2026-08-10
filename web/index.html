@@ -55,6 +55,7 @@ then start matchmaking in each.</p>
     </div>
     <button id="btn-signout" style="display:none">Sign out</button>
   </div>
+  <div id="extra-login" style="display:none"></div>
   <div id="dev-panel" style="display:none">
     <label>Steam ID (dev test-token; server must run with AUTH_DEV_MODE=true)</label>
     <input id="steam-id" value="76561198000000001" size="20">
@@ -136,7 +137,7 @@ function playerLabel(p) {
     ? p.display_name + " · " + id
     : "Player " + id;
 }
-const state = { ws: null, steamId: null, matchToken: null, opponentId: null, gameType: null,
+const state = { ws: null, playerId: null, matchToken: null, opponentId: null, gameType: null,
   inputTarget: 0.5, gameMode: "off", game: null,
   sim: null, session: null, stalled: false, lastPongAt: 0, pongAcc: 0, lastPracticeAt: 0,
   practiceTimer: null, pongTimer: null, iAmPlayerA: undefined,
@@ -160,14 +161,32 @@ if (location.protocol.startsWith("http")) {
 // unreachable (offline / file://), show only the dev-panel — the Steam
 // button navigates to an HTTP endpoint that doesn't exist offline, and the
 // browser's security policy blocks cross-scheme redirects (file:// → http://).
-const cfgUrl = $("server-url").value.trim().replace(/\/+$/, "") + "/auth/config";
 fetch(cfgUrl).then(r => r.ok ? r.json() : null).then(cfg => {
   if (!cfg) {
     $("dev-panel").style.display = "";
     return;
   }
-  $("steam-login").style.display = cfg.steam_login ? "" : "none";
+  const providers = cfg.providers || [];
+  $("steam-login").style.display = providers.includes("steam") ? "" : "none";
   $("dev-panel").style.display = cfg.dev_mode ? "" : "none";
+  // Render every non-Steam provider as a "Sign in with {label}" button.
+  const labels = { discord: "Discord", au2143: "au.2143.me" };
+  const extra = providers.filter(p => p !== "steam");
+  const box = $("extra-login");
+  box.innerHTML = "";
+  for (const p of extra) {
+    const a = document.createElement("a");
+    a.className = "primary";
+    a.href = "#";
+    a.textContent = "Sign in with " + (labels[p] || p);
+    a.addEventListener("click", ev => {
+      ev.preventDefault();
+      const base = $("server-url").value.trim().replace(/\/+$/, "");
+      location.href = base + "/auth/" + encodeURIComponent(p) + "/login?return_to=/";
+    });
+    box.appendChild(a);
+  }
+  box.style.display = extra.length ? "" : "none";
 }).catch(() => {
   $("dev-panel").style.display = "";
 });
@@ -182,8 +201,8 @@ function log(kind, text) {
   const el = $("log");
   const line = document.createElement("div");
   line.className = kind;
-  // Mask raw Steam IDs (17 digits) in the protocol dump — the UI is
-  // player-id-only; the wire still carries steam_id for gameplay.
+  // Mask raw Steam IDs (17 digits) in the protocol dump — the UI and wire
+  // are player-id-only, so this only guards against stray legacy values.
   const masked = text.replace(/\b7\d{16}\b/g, "…");
   line.textContent = new Date().toISOString().slice(11, 23) + "  " + masked;
   el.appendChild(line);
@@ -261,7 +280,7 @@ $("btn-connect").addEventListener("click", async () => {
       const resp = await fetch(base + "/auth/test-token", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ steam_id: steamId }), // string: 17-digit IDs lose precision as JS numbers
+        body: JSON.stringify({ steam_id: Number(steamId) }), // dev-only: test-token body is a plain u64
       });
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       const body = await resp.json();
@@ -308,7 +327,6 @@ $("btn-connect").addEventListener("click", async () => {
 
   state.ws.onopen = () => {
     log("sys", "WS open: " + wsUrl);
-    state.steamId = steamId;
     $("btn-connect").disabled = true;
     $("btn-disconnect").disabled = false;
     state.token = token; // keep for sign-out
@@ -337,7 +355,7 @@ $("btn-disconnect").addEventListener("click", () => {
   // the server cleans up (handle_disconnect, queue sweep) on the close frame.
   if (state.ws) { state.ws.close(); }
   // Clear session state so a reconnect can't inherit a stale match.
-  state.steamId = null;
+  state.playerId = null;
   state.matchToken = null;
   state.opponentId = null;
   state.gameType = null;
@@ -360,6 +378,7 @@ $("btn-signout").addEventListener("click", async () => {
   if (state.ws) { state.ws.close(); } // onclose resets the panel
   $("player-id-box").style.display = "none";
   $("btn-steam-login").style.display = "";
+  $("extra-login").style.display = $("extra-login").childElementCount ? "" : "none";
   $("btn-signout").style.display = "none";
 });
 async function handleServer(raw) {
@@ -381,18 +400,20 @@ async function handleServer(raw) {
       // every provider's session will share — never the per-provider steam_id.
       // Shown after any successful login (Steam button or dev Connect).
       const sub = msg.player_id || jwtSub(state.token);
+      state.playerId = sub || null;
       if (sub) {
         $("player-id").value = sub;
         $("player-id-box").style.display = "";
       }
       $("btn-steam-login").style.display = "none";
+      $("extra-login").style.display = "none";
       $("btn-signout").style.display = "";
       break;
     case "match_found":
       stopGame(); // the match replaces the practice game
       setStatus("MatchFound", "ok");
       state.matchToken = msg.match_token;
-      state.opponentId = msg.opponent.steam_id;
+      state.opponentId = msg.opponent.player_id;
       state.gameType = msg.game_type;
       $("opponent").textContent = playerLabel(msg.opponent);
       $("match-token").textContent = msg.match_token;
@@ -445,12 +466,12 @@ async function handleServer(raw) {
       log("sys", "opponent started");
       break;
     case "report_received":
-      const who = msg.reporting_player === state.steamId ? "You" : "Opponent";
+      const who = msg.reporting_player === state.playerId ? "You" : "Opponent";
       const w = msg.winner === null ? "Draw"
-        : (msg.winner === state.steamId ? "Win (you)" : "Win (opponent)");
+        : (msg.winner === state.playerId ? "Win (you)" : "Win (opponent)");
       $("report-status").textContent = who + " reported: " + w;
       log("sys", who + " reported: " + w);
-      if (msg.reporting_player === state.steamId) {
+      if (msg.reporting_player === state.playerId) {
         // The server stores one report per player per match — once ours is in,
         // hide the buttons so a repeat can't be submitted from the UI.
         $("btn-report-win").style.display = "none";
@@ -556,7 +577,7 @@ async function handleServer(raw) {
       // local rollback sim (responsive to your input immediately); the score
       // and speed displays come from the server (authoritative).
       state.gameMode = "pong";
-      state.iAmPlayerA = state.steamId === msg.player_a;
+      state.iAmPlayerA = state.playerId === msg.player_a;
       if (!state.session) {
         // First frame: create the local bit-exact sim + rollback session.
         state.sim = new PongSim();
@@ -645,7 +666,7 @@ async function handleServer(raw) {
       break;
     case "game_over":
       stopGame(); // stop both rAF loops; the canvas keeps the final frame
-      $("game-status").textContent = msg.winner === state.steamId ? "You win!" : "You lose";
+      $("game-status").textContent = msg.winner === state.playerId ? "You win!" : "You lose";
       break;
     case "error":
       if (msg.code === "invalid_report") {
@@ -835,7 +856,7 @@ $("btn-start").addEventListener("click", () => {
   // remain the fallback if the server runs with LOBBY_PONG=false.)
 });
 $("btn-report-win").addEventListener("click", () => {
-  send({ type: "match_report", match_token: state.matchToken, winner: state.steamId, demo_hash: "web-demo" });
+  send({ type: "match_report", match_token: state.matchToken, winner: state.playerId, demo_hash: "web-demo" });
 });
 $("btn-report-loss").addEventListener("click", () => {
   // Winner is the opponent.
