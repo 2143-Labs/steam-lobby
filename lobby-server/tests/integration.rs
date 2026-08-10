@@ -1383,7 +1383,7 @@ async fn game_result_callback_security(pool: sqlx::PgPool) {
             "{}/internal/game-result/{token}/wrong-secret",
             h.base_url
         ))
-        .json(&serde_json::json!({ "winner": "300" }))
+        .json(&serde_json::json!({ "winner": null }))
         .send()
         .await
         .unwrap();
@@ -1401,7 +1401,7 @@ async fn game_result_callback_security(pool: sqlx::PgPool) {
             "{}/internal/game-result/{token}/{secret}",
             h.base_url
         ))
-        .json(&serde_json::json!({ "winner": "300" }))
+        .json(&serde_json::json!({ "winner": null }))
         .send()
         .await
         .unwrap();
@@ -1413,7 +1413,7 @@ async fn game_result_callback_security(pool: sqlx::PgPool) {
             "{}/internal/game-result/nonexistent-token/some-secret",
             h.base_url
         ))
-        .json(&serde_json::json!({ "winner": "300" }))
+        .json(&serde_json::json!({ "winner": null }))
         .send()
         .await
         .unwrap();
@@ -2276,7 +2276,7 @@ async fn oauth_login_creates_account_and_plays_match(pool: sqlx::PgPool) {
     assert_eq!(row.0, None, "discord user must have steam_id NULL");
     assert_eq!(row.1, "discord");
     let identity = sqlx::query_as::<_, (String,)>(
-        "SELECT provider_uid FROM user_identities WHERE provider = 'discord' AND user_id = $1",
+        "SELECT provider_uid FROM user_identities WHERE provider = 'discord' AND user_id = $1::uuid",
     )
     .bind(&user_id)
     .fetch_one(&h.pool)
