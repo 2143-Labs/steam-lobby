@@ -45,6 +45,10 @@ browser tabs (the server serves the demo page itself; `web/index.html` in the
 repo is the same file). Give each tab a distinct steam ID, connect both, and
 start matchmaking in each — the demo talks to the dev-only `/auth/test-token`
 endpoint, no real Steam API calls involved.
+No account? Hit the **"No account"** button instead — the server mints a fresh
+ephemeral guest account (a `Guest-xxxx` name, `steam_id NULL`, no identity) and
+connects immediately. A guest queues against provider or dev players like any
+other account; guest accounts are unrecoverable after the JWT expires.
 
 For a **genuine** Steam login, click the "Sign in through Steam" button in the
 demo instead. It redirects to `steamcommunity.com/openid/login` and back with
@@ -83,8 +87,9 @@ need a POSIX shell. Use WSL2 or Git Bash, or run the server directly:
 | GET | `/auth/{provider}/callback` | Generic OAuth2/OIDC callback (PKCE for au2143) |
 | POST | `/auth/ticket` | Steam ticket auth -> JWT (rate-limited 10/min per IP) |
 | POST | `/auth/test-token` | Dev-only: JWT for any steam_id (only when `AUTH_DEV_MODE=true`) |
+| POST | `/auth/guest` | Fresh identity-less account -> JWT (rate-limited 20/min per IP); always on |
 | POST | `/auth/logout` | Revoke the current session token (all earlier tokens die) |
-| GET | `/auth/config` | Auth surface capabilities `{ providers, dev_mode }` — the demo gates its login UI on this |
+| GET | `/auth/config` | Auth surface capabilities `{ providers, dev_mode, guest_login }` — the demo gates its login UI on this |
 | POST | `/internal/game-result/{token}/{secret}` | Gameserver result webhook; the URL itself is the auth |
 
 | Variable | Default | Description |
@@ -121,19 +126,24 @@ The server logs the active mode at startup:
 ```
 INFO lobby_server: auth mode: TEST  — /auth/test-token enabled
 INFO lobby_server: auth mode: STEAM — ticket + OpenID verification against Steam (appid 480)
-```
-Or probe `GET /auth/config` — it returns `{ "providers": […], "dev_mode": … }`
+Or probe `GET /auth/config` — it returns `{ "providers": […], "dev_mode": …, "guest_login": … }`
 (`providers` lists the registered login providers: `"steam"` when `PUBLIC_URL`
 is set, plus `"discord"`/`"au2143"` when their client credentials are
-configured; `dev_mode` = `/auth/test-token` is exposed). `POST /auth/test-token`
-returns a JWT when `AUTH_DEV_MODE=true` and `404` otherwise. The web demo
+configured; `dev_mode` = `/auth/test-token` is exposed; `guest_login` is true
+whenever the server is reachable — the guest flow is always on). `POST
+/auth/test-token` returns a JWT when `AUTH_DEV_MODE=true` and `404` otherwise.
+`POST /auth/guest` mints a brand-new identity-less account (a `users` row with
+`steam_id NULL`, `primary_provider 'guest'`, no `user_identities` row) and
+returns a JWT; it is rate-limited to 20/min per IP. The web demo
 (`web/index.html`) fetches `/auth/config` on load and shows only the login
 surfaces the server actually offers: a button per listed provider, the dev
-steam-ID field, or both. Offline (e.g. opened from `file://`) it shows the dev
-field so the dev flow still works. Its Connect button uses the test-token
-endpoint (or a `#token=` fragment from a provider login, if present); when dev
-mode is off and no fragment token exists, Connect shows an error — only genuine
-provider logins work in production.
+steam-ID field, or both — plus a "No account" button when `guest_login` is
+true. Offline (e.g. opened from `file://`) it shows the dev field so the dev
+flow still works. Its Connect button uses the test-token endpoint (or a
+`#token=` fragment from a provider login, if present); when dev mode is off
+and no fragment token exists, Connect shows an error — only genuine provider
+logins work in production. A guest can queue against provider or dev players;
+guest accounts are unrecoverable after the JWT expires.
 
 ## WebSocket Quick Test
 

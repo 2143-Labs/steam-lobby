@@ -245,6 +245,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         pong_games: parking_lot::Mutex::new(std::collections::HashMap::new()),
         ticket_limiter: RateLimiter::new(10, std::time::Duration::from_secs(60)),
         test_token_limiter: RateLimiter::new(20, std::time::Duration::from_secs(60)),
+        guest_token_limiter: RateLimiter::new(20, std::time::Duration::from_secs(60)),
         next_generation: std::sync::atomic::AtomicU64::new(0),
         temporal: std::sync::RwLock::new(None),
         temporal_shutdown: std::sync::RwLock::new(None),
@@ -300,6 +301,9 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
     if config.auth_dev_mode {
         router = router.route("/auth/test-token", axum::routing::post(routes::test_token));
     }
+
+    // Guest login is always on (the per-IP limiter is the abuse control).
+    router = router.route("/auth/guest", axum::routing::post(routes::guest_token));
 
     if mock_enabled {
         router = router.route(

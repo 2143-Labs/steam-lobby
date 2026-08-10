@@ -812,6 +812,28 @@ async fn rate_limited_test_token(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test]
+async fn rate_limited_guest_token(pool: sqlx::PgPool) {
+    let h = setup(pool).await;
+    let client = reqwest::Client::new();
+    let (mut ok, mut limited) = (0, 0);
+    for _ in 0..25u64 {
+        let status = client
+            .post(format!("{}/auth/guest", h.base_url))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        match status.as_u16() {
+            200 => ok += 1,
+            429 => limited += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(ok, 20, "first 20 guest mints per IP succeed");
+    assert_eq!(limited, 5, "the rest are rate-limited");
+}
+
+#[sqlx::test]
 async fn logout_revokes_token(pool: sqlx::PgPool) {
     let h = setup(pool).await;
     let client = reqwest::Client::new();
@@ -2359,6 +2381,10 @@ async fn auth_config_advertises_configured_providers(pool: sqlx::PgPool) {
         providers.iter().any(|p| p.as_str() == Some("steam")),
         "public_url is set, so steam must be listed"
     );
+    assert_eq!(
+        cfg["guest_login"], true,
+        "guest login is always on and must be advertised"
+    );
 }
 
 #[sqlx::test]
@@ -2450,4 +2476,109 @@ async fn au2143_group_controls_admin_flag(pool: sqlx::PgPool) {
         .await
         .unwrap();
     assert!(!is_admin3, "discord login (no groups claim) must leave is_admin false");
+}
+
+/// A guest ("No account") mints a fresh identity-less account: steam_id NULL,
+/// primary_provider 'guest', no user_identities row, Guest-xxxx name — then
+/// queues, matches, and resolves a full match against a normal dev account.
+#[sqlx::test]
+async fn guest_plays_full_match(pool: sqlx::PgPool) {
+    let h = setup_temporal_pong(pool).await;
+
+    // Client 1: guest. `authenticate_guest` POSTs /auth/guest and connects.
+    let mut p1 = lobby_client::LobbyClient::connect(&h.ws_url).await.unwrap();
+    let gauth = p1.authenticate_guest(&h.base_url).await.unwrap();
+    let guest_id = gauth.player_id.clone();
+    assert!(
+        !guest_id.is_empty(),
+        "guest player_id must be a non-empty UUID string"
+    );
+
+    // Client 2: a normal dev account (guests must match real players).
+    let mut p2 = lobby_client::LobbyClient::connect(&h.ws_url).await.unwrap();
+    let _a2 = p2.authenticate_test_token(200, &h.base_url).await.unwrap();
+
+    // Guest account shape: steam_id NULL, 'guest', never an admin, no identity.
+    let row = sqlx::query_as::<_, (Option<i64>, String, bool)>(
+        "SELECT steam_id, primary_provider, is_admin FROM users WHERE id = $1::uuid",
+    )
+    .bind(&guest_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, None, "guest must have steam_id NULL");
+    assert_eq!(row.1, "guest", "guest primary_provider must be 'guest'");
+    assert!(!row.2, "guests are never admins");
+    let identities: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_identities WHERE user_id = $1::uuid")
+            .bind(&guest_id)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(identities, 0, "guest must have no user_identities row");
+    let name: String = sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1::uuid")
+        .bind(&guest_id)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert!(
+        name.starts_with("Guest-"),
+        "guest display name must be Guest-xxxx, got {name:?}"
+    );
+
+    // Full match: queue both, accept both, guest wins, match resolves.
+    p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+    p2.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+    let m1 = timeout(Duration::from_secs(15), p1.wait_for_match())
+        .await
+        .expect("p1 (guest) match within 15s")
+        .unwrap()
+        .unwrap();
+    let m2 = timeout(Duration::from_secs(15), p2.wait_for_match())
+        .await
+        .expect("p2 match within 15s")
+        .unwrap()
+        .unwrap();
+    assert_eq!(m1.match_token, m2.match_token);
+    p1.accept_match(&m1.match_token).await.unwrap();
+    p2.accept_match(&m1.match_token).await.unwrap();
+    assert!(
+        wait_for_status(&h.pool, &m1.match_token, "InProgress").await,
+        "both accepts must transition the match to InProgress"
+    );
+    p1.start_match(&m1.match_token).await.unwrap();
+    p2.start_match(&m1.match_token).await.unwrap();
+    assert!(
+        wait_for_status(&h.pool, &m1.match_token, "Reporting").await,
+        "both connections must transition the match to Reporting"
+    );
+    // Guest claims the win (winner = the guest's player_id) and both report.
+    p1.submit_report(&m1.match_token, Some(&guest_id), None)
+        .await
+        .unwrap();
+    p2.submit_report(&m1.match_token, Some(&guest_id), None)
+        .await
+        .unwrap();
+    assert!(
+        wait_for_row(
+            &h.pool,
+            &m1.match_token,
+            "SELECT match_token, mu_change_a FROM match_results WHERE match_token = $1",
+        )
+        .await
+        .is_some(),
+        "match must resolve for a guest player"
+    );
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM matches WHERE match_token = $1",
+    )
+    .bind(&m1.match_token)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "Resolved");
+    // A fresh guest call mints a DIFFERENT account (every click = fresh).
+    let mut p3 = lobby_client::LobbyClient::connect(&h.ws_url).await.unwrap();
+    let gauth2 = p3.authenticate_guest(&h.base_url).await.unwrap();
+    assert_ne!(gauth2.player_id, guest_id, "each guest mint must be a new account");
 }

@@ -61,6 +61,7 @@ then start matchmaking in each.</p>
     <input id="steam-id" value="76561198000000001" size="20">
   </div>
   <button id="btn-connect" class="primary">Connect</button>
+  <div id="guest-login" style="display:none"><button id="btn-guest" class="primary">No account</button></div>
   <button id="btn-disconnect" disabled>Disconnect</button>
 </section>
 
@@ -169,6 +170,7 @@ fetch(cfgUrl).then(r => r.ok ? r.json() : null).then(cfg => {
   const providers = cfg.providers || [];
   $("steam-login").style.display = providers.includes("steam") ? "" : "none";
   $("dev-panel").style.display = cfg.dev_mode ? "" : "none";
+  $("guest-login").style.display = cfg.guest_login ? "" : "none";
   // Render every non-Steam provider as a "Sign in with {label}" button.
   const labels = { discord: "Discord", au2143: "au.2143.me" };
   const extra = providers.filter(p => p !== "steam");
@@ -259,7 +261,6 @@ $("btn-steam-login").addEventListener("click", () => {
   const base = $("server-url").value.trim().replace(/\/+$/, "");
   location.href = base + "/auth/steam/login?return_to=/";
 });
-
 $("btn-connect").addEventListener("click", async () => {
   const base = $("server-url").value.trim().replace(/\/+$/, "");
   const steamId = $("steam-id").value.trim();
@@ -293,6 +294,14 @@ $("btn-connect").addEventListener("click", async () => {
     }
   }
 
+  await connectWithToken(base, token);
+});
+
+// Connect the WebSocket with an already-acquired session token: populate the
+// mode dropdown (fallback to ranked_1v1), open the WS, and wire the
+// onopen/onmessage/onclose handlers. Shared by the Connect button (fragment or
+// dev test-token) and the guest "No account" flow.
+async function connectWithToken(base, token) {
   // Populate the mode dropdown from the server (same base the user typed).
   try {
     const resp = await fetch(base + "/modes");
@@ -347,6 +356,31 @@ $("btn-connect").addEventListener("click", async () => {
     state.token = null;
   };
   state.ws.onerror = () => log("sys", "WS error");
+}
+
+$("btn-guest").addEventListener("click", async () => {
+  const base = $("server-url").value.trim().replace(/\/+$/, "");
+  if (!base) {
+    setStatus("Error: server URL is required", "err");
+    return;
+  }
+  $("btn-guest").disabled = true;
+  setStatus("Minting guest account…");
+  log("sys", "POST " + base + "/auth/guest");
+  try {
+    const resp = await fetch(base + "/auth/guest", { method: "POST" });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const body = await resp.json();
+    const token = body.token;
+    if (!token) throw new Error("no token in response");
+    log("sys", "got guest token (first 12 chars): " + token.slice(0, 12) + "…");
+    await connectWithToken(base, token);
+  } catch (e) {
+    setStatus("Error: guest account failed — " + e.message, "err");
+    log("sys", "guest account failed: " + e.message);
+  } finally {
+    $("btn-guest").disabled = false;
+  }
 });
 
 $("btn-disconnect").addEventListener("click", () => {
@@ -379,6 +413,7 @@ $("btn-signout").addEventListener("click", async () => {
   $("player-id-box").style.display = "none";
   $("btn-steam-login").style.display = "";
   $("extra-login").style.display = $("extra-login").childElementCount ? "" : "none";
+  $("guest-login").style.display = "";
   $("btn-signout").style.display = "none";
 });
 async function handleServer(raw) {
@@ -407,6 +442,7 @@ async function handleServer(raw) {
       }
       $("btn-steam-login").style.display = "none";
       $("extra-login").style.display = "none";
+      $("guest-login").style.display = "none";
       $("btn-signout").style.display = "";
       break;
     case "match_found":
