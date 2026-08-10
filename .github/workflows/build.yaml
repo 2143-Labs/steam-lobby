@@ -13,7 +13,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nixos]
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     permissions:
       contents: write
@@ -27,17 +27,11 @@ jobs:
       run: |
         echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
     - name: Build and push
-      uses: docker/build-push-action@v6
-      with:
-        context: .
-        push: true
-        tags: "${{ env.registry }}/${{ env.repo }}:${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_number }}"
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+      run: |
+        IMAGE="${{ env.registry }}/${{ env.repo }}:${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_number }}"
+        docker build -t "$IMAGE" .
+        docker push "$IMAGE"
 
     - name: Set image tag output
       id: meta
