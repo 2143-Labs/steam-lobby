@@ -242,6 +242,20 @@ impl PostgresStore {
         Ok(user_id)
     }
 
+    /// Brand-new identity-less account: steam_id NULL, primary_provider
+    /// 'guest', no user_identities row. Plain INSERT — every call is a fresh
+    /// account; losing the session JWT loses the account (by design).
+    pub async fn create_guest_user(&self, display_name: &str) -> Result<uuid::Uuid> {
+        let row = sqlx::query_as::<_, (uuid::Uuid,)>(
+            "INSERT INTO users (display_name, primary_provider) VALUES ($1, 'guest') RETURNING id",
+        )
+        .bind(display_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_db_error)?;
+        Ok(row.0)
+    }
+
     /// The player's display name (stored at login from the provider userinfo).
     pub async fn get_display_name(&self, user_id: uuid::Uuid) -> Result<Option<String>> {
         let row = sqlx::query_as::<_, (String,)>("SELECT display_name FROM users WHERE id = $1")

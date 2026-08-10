@@ -78,6 +78,8 @@ pub struct AppState {
     pub ticket_limiter: RateLimiter,
     /// Rate limiter for /auth/test-token.
     pub test_token_limiter: RateLimiter,
+    /// Rate limiter for /auth/guest (20/min per IP, same budget as test-token).
+    pub guest_token_limiter: RateLimiter,
     /// Bumped per connection so a reconnecting client supersedes a stale one.
     pub next_generation: AtomicU64,
     /// Active pong matches: match_token -> input channel + task handle.

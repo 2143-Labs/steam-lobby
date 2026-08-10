@@ -490,6 +490,29 @@ impl LobbyClient {
         self.authenticate(token).await
     }
 
+    /// POST /auth/guest to mint a fresh ephemeral "No account" session JWT,
+    /// then authenticate over WebSocket. Always available (not dev-gated);
+    /// rate-limited to 20/min per IP server-side.
+    pub async fn authenticate_guest(&mut self, base_url: &str) -> Result<AuthOk, ClientError> {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base_url}/auth/guest"))
+            .send()
+            .await
+            .map_err(|e| ClientError::Connection(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(ClientError::Server(format!("HTTP {}", resp.status())));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ClientError::Connection(e.to_string()))?;
+        let token = body["token"]
+            .as_str()
+            .ok_or_else(|| ClientError::Server("no token in response".into()))?;
+        self.authenticate(token).await
+    }
+
     /// Enter the matchmaking queue.
     pub async fn begin_matchmaking(
         &mut self,

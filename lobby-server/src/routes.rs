@@ -671,6 +671,64 @@ pub async fn test_token(
     (StatusCode::OK, Json(TokenResponse { token })).into_response()
 }
 
+/// Ephemeral "No account" login: mint a brand-new identity-less guest
+/// account (steam_id NULL, primary_provider 'guest', no identity row) and
+/// return a session JWT — the token is the only handle to the account.
+/// Every call is a fresh account; losing the token loses the account.
+pub async fn guest_token(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(ip): ConnectInfo<std::net::SocketAddr>,
+) -> impl IntoResponse {
+    if !state.guest_token_limiter.check(ip.ip()) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "rate_limited"})),
+        )
+            .into_response();
+    }
+    // Guest suffix from the low 24 bits of a fresh UUID (1/16M collision
+    // chance per pair; harmless — display_name has no uniqueness constraint).
+    let display_name = format!(
+        "Guest-{:06x}",
+        (uuid::Uuid::new_v4().as_u128() & 0x00ff_ffff) as u32
+    );
+    let user_id = match state.store.create_guest_user(&display_name).await {
+        Ok(uid) => uid,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response();
+        }
+    };
+    let version = match state.store.get_token_version(user_id).await {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response();
+        }
+    };
+    let token = match state
+        .steam_auth
+        .generate_session_token(user_id, version, state.config.jwt_ttl_secs)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("JWT generation failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response();
+        }
+    };
+    (StatusCode::OK, Json(TokenResponse { token })).into_response()
+}
+
 /// Revoke the session token presented in `Authorization: Bearer <token>` by
 /// bumping the player's token_version (all previously minted tokens die).
 pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
@@ -861,6 +919,9 @@ pub async fn auth_config(State(state): State<Arc<AppState>>) -> Json<serde_json:
     Json(serde_json::json!({
         "providers": providers,
         "dev_mode": state.config.auth_dev_mode,
+        // Guests are NOT a provider-registry entry (their flow is a POST to
+        // /auth/guest, not an OAuth redirect), so they're a separate boolean.
+        "guest_login": true,
     }))
 }
 
