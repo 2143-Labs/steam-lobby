@@ -805,9 +805,13 @@ function pongLoop() {
   // locally would desync the sims.
   if (state.session && state.holdUntilMs !== null) {
     // Expire only once the timer elapsed AND confirmed caught up to the last
-    // frozen frame (the referee's final broadcast can arrive a tick late).
-    // While waiting, the frozen frame keeps rendering under the countdown.
-    if (performance.now() < state.holdUntilMs || state.session.confirmed < state.holdEndFrame) {
+    // frozen frame — BUT bounded by a short grace: the referee's final
+    // broadcast can arrive a tick late, yet if it never arrives (dropped WS
+    // message), waiting forever would deadlock the match (no inputs sent, the
+    // referee's gate stalls). After the grace, resume with skipTo(confirmed);
+    // a one-frame lag is absorbed by the rollback engine.
+    const late = performance.now() - state.holdUntilMs;
+    if (late < 0 || (state.session.confirmed < state.holdEndFrame && late < 300)) {
       if (state.game) renderFrame(); // countdown overlay only
       return;
     }
