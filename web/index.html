@@ -106,6 +106,7 @@ then start matchmaking in each.</p>
   <div id="game-area" style="display:none">
     <canvas id="pong" width="640" height="400"></canvas>
     <p id="game-status">—</p>
+    <p id="conn-metrics">Server: — · Opponent: —</p>
   </div>
 <section>
   <label>Event log</label>
@@ -252,6 +253,30 @@ function startHeartbeat(intervalMs) {
 function stopHeartbeat() {
   if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
 }
+let connTimer = null;
+let serverRtt = null;
+const pendingAcks = new Map(); // game_input frame -> performance.now() when sent
+function startConnMetrics() { if (!connTimer) connTimer = setInterval(updateConnMetrics, 2000); }
+function stopConnMetrics() { if (connTimer) { clearInterval(connTimer); connTimer = null; } }
+async function updateConnMetrics() {
+  const el = $("conn-metrics");
+  if (!el) return;
+  let opp = "Opponent: —";
+  const pc = state.link?.pc;
+  if (pc) {
+    let rtt = null;
+    try {
+      const stats = await pc.getStats();
+      stats.forEach(s => {
+        if (s.type === "candidate-pair" && (s.nominated || s.selected)
+            && typeof s.currentRoundTripTime === "number") rtt = s.currentRoundTripTime;
+      });
+    } catch { /* getStats throws when the pc is closing — keep last value */ }
+    const ch = state.link.channelState;
+    opp = "Opponent: " + (rtt !== null ? rtt.toFixed(0) + "ms " : "") + (ch === "open" ? "(direct)" : "(relay)");
+  }
+  el.textContent = "Server: " + (serverRtt === null ? "—" : serverRtt.toFixed(0) + "ms") + " · " + opp;
+}
 function send(obj) {
   const text = JSON.stringify(obj);
   // Log a sanitized copy — never credentials.
@@ -350,6 +375,7 @@ async function connectWithToken(base, token) {
   state.ws.onmessage = (ev) => handleServer(ev.data);
   state.ws.onclose = () => {
     stopHeartbeat();
+    stopConnMetrics();
     stopGame();
     if (state.link) { state.link.close(); state.link = null; }
     log("sys", "WS closed");
@@ -435,6 +461,7 @@ async function handleServer(raw) {
       // drops the connection after 30s without a heartbeat (10s cadence gives
       // margin); while queueing this also keeps the queue entry alive.
       startHeartbeat(10000);
+      startConnMetrics();
       log("sys", "server state on connect: " + msg.state);
       // Player ID box: the abstract account id (users.id, the JWT `sub`) that
       // every provider's session will share — never the per-provider steam_id.
@@ -663,6 +690,13 @@ async function handleServer(raw) {
         }
       }
       state.session.setConfirmed(msg.frame);
+      // Round hold (3-2-1): the local sim is frozen and may not have a snapshot
+      // yet (round 0) — render the referee's authoritative frozen frame so the
+      // canvas shows the ball + paddles under the countdown instead of a black
+      // screen. Safe: the sim is identical every held frame.
+      if (state.holdUntilMs !== null) {
+        state.game = { left_y: msg.left_y, right_y: msg.right_y, ball_x: msg.ball_x, ball_y: msg.ball_y };
+      }
       // Local desync check — meaningful only when no rollback is pending for
       // this frame: a prediction that hasn't been replayed yet legitimately
       // differs from the server. A persistent divergence with no pending
@@ -682,6 +716,10 @@ async function handleServer(raw) {
     case "input_ack":
       if (state.session) {
         state.session.setConfirmed(msg.frame);
+        // Server RTT: measure the game_input → input_ack round trip (the real
+        // gameplay path — network + the referee's 33ms tick).
+        const sentAt = pendingAcks.get(msg.frame);
+        if (sentAt !== undefined) { serverRtt = performance.now() - sentAt; pendingAcks.delete(msg.frame); }
         // Referee health check: report the settled checksum for the confirmed
         // frame. Skip while a rollback is pending — the local engine is
         // converging on its own; a real (unfixable) divergence is reported on
@@ -763,6 +801,12 @@ function pongLoop() {
       if (state.game) renderFrame(); // countdown overlay only
       return;
     }
+    // Hold over: the referee resumed at confirmed + 1 — jump the local frame
+    // counter (sim unchanged: the held frames were identical) so the next
+    // step/send targets exactly the referee's frame. Without this the client
+    // replays ~90 frozen frames at ~30fps and the referee's input gate
+    // (`left_inputs.back().frame >= next`) stalls silently for ~3s.
+    state.session.skipTo(state.session.confirmed);
     state.holdUntilMs = null;
   }
   const t = performance.now();
@@ -777,8 +821,15 @@ function pongLoop() {
     // The target travels as its shortest round-trip decimal string — JS
     // Number and Rust str::parse round-trip exactly; serde_json's f64 parser
     // is not (off by 1 ULP for some values).
-    send({ type: "game_input", match_token: state.matchToken, frame: session.frame + 1, target: state.inputTarget.toString() });
-    state.link?.send({ type: "game_input", frame: session.frame + 1, target: state.inputTarget.toString() });
+    const frame = session.frame + 1;
+    session.localTarget(frame, state.inputTarget);
+    send({ type: "game_input", match_token: state.matchToken, frame, target: state.inputTarget.toString() });
+    state.link?.send({ type: "game_input", frame, target: state.inputTarget.toString() });
+    pendingAcks.set(frame, performance.now());
+    if (pendingAcks.size > 900) {
+      const now = performance.now();
+      for (const [f, t] of pendingAcks) if (now - t > 2000) pendingAcks.delete(f);
+    }
     const result = session.step();
     state.stalled = result.stalled;
     if (result.snapshot) state.game = result.snapshot;

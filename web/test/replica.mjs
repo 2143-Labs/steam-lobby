@@ -208,7 +208,103 @@ function runResync() {
   }
 }
 
+/** Round-hold convergence test: mid-match the referee freezes the sim for 90
+ *  frames (advancing only its frame counter, like the real server's RoundStart
+ *  hold), both clients hold their sims (no localTarget, no step — the client's
+ *  pongLoop hold guard), then skipTo(confirmed) at expiry and resume. The
+ *  first resumed step must land exactly on the referee's next frame with no
+ *  stall, and all three must converge to the same winner. */
+function runHold() {
+  const HOLD_FROM = 100; // referee frame where the hold begins (after stepping)
+  const HOLD_TICKS = 90; // mirrors the server default LOBBY_PONG_COUNTDOWN_TICKS
+  const delay = 0;
+  const referee = new Referee();
+  const A = new RollbackSession({ sim: new PongSim(), side: "left", windowSize: 10, ringSize: 128 });
+  const B = new RollbackSession({ sim: new PongSim(), side: "right", windowSize: 10, ringSize: 128 });
+  const pendingA = [];
+  const pendingB = [];
+  const pendingRef = [];
+
+  const pumpIteration = (t, sendInputs) => {
+    if (sendInputs) {
+      const aT = schedule(t, "left");
+      const bT = schedule(t, "right");
+      A.localTarget(t, aT);
+      B.localTarget(t, bT);
+      (pendingA[t + delay] ??= []).push(() => A.remoteTarget(t, bT));
+      (pendingB[t + delay] ??= []).push(() => B.remoteTarget(t, aT));
+      (pendingRef[t + delay] ??= []).push(() => {
+        referee.receiveInput("left", t, aT);
+        referee.receiveInput("right", t, bT);
+      });
+    }
+    for (const q of [pendingA, pendingB, pendingRef]) {
+      for (const fn of q[t] ?? []) fn();
+    }
+    for (const g of referee.advance()) {
+      A.setConfirmed(g);
+      B.setConfirmed(g);
+    }
+    const rA = A.step();
+    const rB = B.step();
+    return { rA, rB };
+  };
+
+  // Phase 1: normal play to HOLD_FROM - 1.
+  for (let t = 0; t < HOLD_FROM; t++) {
+    pumpIteration(t, true);
+    assertConverged(referee, A, B, t, "hold-1");
+  }
+  if (referee.frame !== HOLD_FROM - 1) {
+    throw new Error(`hold: expected referee at ${HOLD_FROM - 1}, got ${referee.frame}`);
+  }
+
+  // Phase 2: the hold — the referee advances its frame counter WITHOUT stepping
+  // the sim (broadcasting identical checksums); the clients only setConfirmed
+  // from the frozen broadcasts and do NOT step or send inputs.
+  const frozenChecksum = referee.sim.checksum();
+  for (let h = 0; h < HOLD_TICKS; h++) {
+    referee.frame += 1;
+    referee.checksums[referee.frame] = referee.sim.checksum();
+    if (referee.checksums[referee.frame] !== frozenChecksum) {
+      throw new Error(`hold: referee state changed during hold at frame ${referee.frame}`);
+    }
+    A.setConfirmed(referee.frame);
+    B.setConfirmed(referee.frame);
+  }
+  if (A.frame !== HOLD_FROM - 1 || B.frame !== HOLD_FROM - 1) {
+    throw new Error("hold: clients stepped during the hold");
+  }
+
+  // Phase 3: expiry — skipTo(confirmed) exactly like the client's hold guard,
+  // then resume the normal pump. The FIRST step must advance (no post-hold
+  // stall) onto exactly the referee's next frame.
+  A.skipTo(A.confirmed);
+  B.skipTo(B.confirmed);
+  if (A.frame !== referee.frame || B.frame !== referee.frame) {
+    throw new Error(`hold: skipTo target wrong: A=${A.frame} B=${B.frame} ref=${referee.frame}`);
+  }
+  const END = HOLD_FROM + HOLD_TICKS + 300;
+  for (let t = HOLD_FROM + HOLD_TICKS; t < END; t++) {
+    const { rA, rB } = pumpIteration(t, true);
+    if (t === HOLD_FROM + HOLD_TICKS && (rA.stalled || rB.stalled)) {
+      throw new Error("hold: post-hold first step stalled");
+    }
+    assertConverged(referee, A, B, t, "hold-2");
+  }
+  assertConverged(referee, A, B, "hold-tail", delay);
+  const wA = winnerAt(A, referee.frame);
+  const wB = winnerAt(B, referee.frame);
+  const wR = referee.sim.winner();
+  if (wA !== wB || wB !== wR) {
+    throw new Error(`hold: winner disagreement: A=${wA} B=${wB} ref=${wR}`);
+  }
+  return referee.frame;
+}
+
 for (const delay of [0, 3, 10]) runReplica(delay);
 console.log("replica: OK (delays 0/3/10)");
 runResync();
 console.log("resync: OK");
+runHold();
+console.log("hold: OK");
