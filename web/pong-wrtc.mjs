@@ -121,6 +121,9 @@ export class WrtcLink {
     this._onStateChange("closed");
   }
 
+  /** The data channel's readyState ("new"|"connecting"|"open"|"closed"). */
+  get channelState() { return this._channel ? this._channel.readyState : "new"; }
+
   // ── private ──
 
   _wire(channel) {

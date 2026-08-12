@@ -81,6 +81,15 @@ export class RollbackSession {
     if (frame > this.confirmed) this.confirmed = frame;
   }
 
+  /** Fast-forward past a server-side round hold: the sim is frozen and
+   *  identical every frame, so only the frame counter advances. The
+   *  referee resumes stepping at `confirmed + 1`; jump so the next
+   *  step() targets exactly that frame. */
+  skipTo(frame) {
+    if (frame > this.frame) this.frame = frame;
+    if (frame > this.confirmed) this.confirmed = frame;
+  }
+
   /**
    * Advance one frame. Returns `{ snapshot, rolledBack, stalled }`; when
    * stalled (prediction window cap), `snapshot` is null and nothing advanced.

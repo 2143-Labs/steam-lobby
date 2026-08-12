@@ -106,6 +106,7 @@ then start matchmaking in each.</p>
   <div id="game-area" style="display:none">
     <canvas id="pong" width="640" height="400"></canvas>
     <p id="game-status">—</p>
+    <p id="conn-metrics">Server: — · Opponent: —</p>
   </div>
 <section>
   <label>Event log</label>
@@ -142,7 +143,7 @@ const state = { ws: null, playerId: null, matchToken: null, opponentId: null, ga
   inputTarget: 0.5, gameMode: "off", game: null,
   sim: null, session: null, stalled: false, lastPongAt: 0, pongAcc: 0, lastPracticeAt: 0,
   practiceTimer: null, pongTimer: null, iAmPlayerA: undefined,
-  holdUntilMs: null }; // round hold: freeze the sim + draw 3-2-1 until this time
+  holdUntilMs: null, holdEndFrame: 0 }; // round hold: freeze the sim + draw 3-2-1 until this time
 // Consume an OpenID-issued fragment token (#token=…) if present, then strip it
 // from the URL so it isn't re-sent or stored in history.
 let fragmentToken = null;
@@ -252,6 +253,30 @@ function startHeartbeat(intervalMs) {
 function stopHeartbeat() {
   if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
 }
+let connTimer = null;
+let serverRtt = null;
+const pendingAcks = new Map(); // game_input frame -> performance.now() when sent
+function startConnMetrics() { if (!connTimer) connTimer = setInterval(updateConnMetrics, 2000); }
+function stopConnMetrics() { if (connTimer) { clearInterval(connTimer); connTimer = null; } }
+async function updateConnMetrics() {
+  const el = $("conn-metrics");
+  if (!el) return;
+  let opp = "Opponent: —";
+  const pc = state.link?.pc;
+  if (pc) {
+    let rtt = null;
+    try {
+      const stats = await pc.getStats();
+      stats.forEach(s => {
+        if (s.type === "candidate-pair" && (s.nominated || s.selected)
+            && typeof s.currentRoundTripTime === "number") rtt = s.currentRoundTripTime;
+      });
+    } catch { /* getStats throws when the pc is closing — keep last value */ }
+    const ch = state.link.channelState;
+    opp = "Opponent: " + (rtt !== null ? rtt.toFixed(0) + "ms " : "") + (ch === "open" ? "(direct)" : "(relay)");
+  }
+  el.textContent = "Server: " + (serverRtt === null ? "—" : serverRtt.toFixed(0) + "ms") + " · " + opp;
+}
 function send(obj) {
   const text = JSON.stringify(obj);
   // Log a sanitized copy — never credentials.
@@ -350,6 +375,7 @@ async function connectWithToken(base, token) {
   state.ws.onmessage = (ev) => handleServer(ev.data);
   state.ws.onclose = () => {
     stopHeartbeat();
+    stopConnMetrics();
     stopGame();
     if (state.link) { state.link.close(); state.link = null; }
     log("sys", "WS closed");
@@ -435,6 +461,7 @@ async function handleServer(raw) {
       // drops the connection after 30s without a heartbeat (10s cadence gives
       // margin); while queueing this also keeps the queue entry alive.
       startHeartbeat(10000);
+      startConnMetrics();
       log("sys", "server state on connect: " + msg.state);
       // Player ID box: the abstract account id (users.id, the JWT `sub`) that
       // every provider's session will share — never the per-provider steam_id.
@@ -612,6 +639,13 @@ async function handleServer(raw) {
       // Referee froze the sim for the 3-2-1: hold rendering at the current
       // frame (no stepping, no input send) until the hold expires.
       state.holdUntilMs = performance.now() + msg.countdown_ticks * 33;
+      // The last frame the referee broadcasts while frozen (the hold spans
+      // frames `msg.frame + 1 .. msg.frame + countdown_ticks`; the ball
+      // launches at `+ 1` after that). Resume must wait until confirmed has
+      // reached it — the referee's final frozen broadcast can land a tick
+      // after the client-side timer fires, and jumping early would make the
+      // client step a frame the referee never steps.
+      state.holdEndFrame = (msg.frame ?? 0) + msg.countdown_ticks;
       break;
     case "game_state":
       // The referee's authoritative frame (~30Hz). The CANVAS renders the
@@ -663,6 +697,13 @@ async function handleServer(raw) {
         }
       }
       state.session.setConfirmed(msg.frame);
+      // Round hold (3-2-1): the local sim is frozen and may not have a snapshot
+      // yet (round 0) — render the referee's authoritative frozen frame so the
+      // canvas shows the ball + paddles under the countdown instead of a black
+      // screen. Safe: the sim is identical every held frame.
+      if (state.holdUntilMs !== null) {
+        state.game = { left_y: msg.left_y, right_y: msg.right_y, ball_x: msg.ball_x, ball_y: msg.ball_y };
+      }
       // Local desync check — meaningful only when no rollback is pending for
       // this frame: a prediction that hasn't been replayed yet legitimately
       // differs from the server. A persistent divergence with no pending
@@ -682,6 +723,10 @@ async function handleServer(raw) {
     case "input_ack":
       if (state.session) {
         state.session.setConfirmed(msg.frame);
+        // Server RTT: measure the game_input → input_ack round trip (the real
+        // gameplay path — network + the referee's 33ms tick).
+        const sentAt = pendingAcks.get(msg.frame);
+        if (sentAt !== undefined) { serverRtt = performance.now() - sentAt; pendingAcks.delete(msg.frame); }
         // Referee health check: report the settled checksum for the confirmed
         // frame. Skip while a rollback is pending — the local engine is
         // converging on its own; a real (unfixable) divergence is reported on
@@ -759,10 +804,23 @@ function pongLoop() {
   // hold expires — the referee is broadcasting unchanged frames; advancing
   // locally would desync the sims.
   if (state.session && state.holdUntilMs !== null) {
-    if (performance.now() < state.holdUntilMs) {
+    // Expire only once the timer elapsed AND confirmed caught up to the last
+    // frozen frame — BUT bounded by a short grace: the referee's final
+    // broadcast can arrive a tick late, yet if it never arrives (dropped WS
+    // message), waiting forever would deadlock the match (no inputs sent, the
+    // referee's gate stalls). After the grace, resume with skipTo(confirmed);
+    // a one-frame lag is absorbed by the rollback engine.
+    const late = performance.now() - state.holdUntilMs;
+    if (late < 0 || (state.session.confirmed < state.holdEndFrame && late < 300)) {
       if (state.game) renderFrame(); // countdown overlay only
       return;
     }
+    // Hold over: the referee resumed at confirmed + 1 — jump the local frame
+    // counter (sim unchanged: the held frames were identical) so the next
+    // step/send targets exactly the referee's frame. Without this the client
+    // replays ~90 frozen frames at ~30fps and the referee's input gate
+    // (`left_inputs.back().frame >= next`) stalls silently for ~3s.
+    state.session.skipTo(state.session.confirmed);
     state.holdUntilMs = null;
   }
   const t = performance.now();
@@ -777,8 +835,15 @@ function pongLoop() {
     // The target travels as its shortest round-trip decimal string — JS
     // Number and Rust str::parse round-trip exactly; serde_json's f64 parser
     // is not (off by 1 ULP for some values).
-    send({ type: "game_input", match_token: state.matchToken, frame: session.frame + 1, target: state.inputTarget.toString() });
-    state.link?.send({ type: "game_input", frame: session.frame + 1, target: state.inputTarget.toString() });
+    const frame = session.frame + 1;
+    session.localTarget(frame, state.inputTarget);
+    send({ type: "game_input", match_token: state.matchToken, frame, target: state.inputTarget.toString() });
+    state.link?.send({ type: "game_input", frame, target: state.inputTarget.toString() });
+    pendingAcks.set(frame, performance.now());
+    if (pendingAcks.size > 900) {
+      const now = performance.now();
+      for (const [f, t] of pendingAcks) if (now - t > 2000) pendingAcks.delete(f);
+    }
     const result = session.step();
     state.stalled = result.stalled;
     if (result.snapshot) state.game = result.snapshot;
@@ -821,6 +886,7 @@ function stopGame() {
   state.session = null;
   state.stalled = false;
   state.holdUntilMs = null;
+  state.holdEndFrame = 0;
   clearStartCountdown();
   clearInterval(state.practiceTimer);
   state.practiceTimer = null;
