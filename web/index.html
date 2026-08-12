@@ -143,7 +143,7 @@ const state = { ws: null, playerId: null, matchToken: null, opponentId: null, ga
   inputTarget: 0.5, gameMode: "off", game: null,
   sim: null, session: null, stalled: false, lastPongAt: 0, pongAcc: 0, lastPracticeAt: 0,
   practiceTimer: null, pongTimer: null, iAmPlayerA: undefined,
-  holdUntilMs: null }; // round hold: freeze the sim + draw 3-2-1 until this time
+  holdUntilMs: null, holdEndFrame: 0 }; // round hold: freeze the sim + draw 3-2-1 until this time
 // Consume an OpenID-issued fragment token (#token=…) if present, then strip it
 // from the URL so it isn't re-sent or stored in history.
 let fragmentToken = null;
@@ -639,6 +639,13 @@ async function handleServer(raw) {
       // Referee froze the sim for the 3-2-1: hold rendering at the current
       // frame (no stepping, no input send) until the hold expires.
       state.holdUntilMs = performance.now() + msg.countdown_ticks * 33;
+      // The last frame the referee broadcasts while frozen (the hold spans
+      // frames `msg.frame + 1 .. msg.frame + countdown_ticks`; the ball
+      // launches at `+ 1` after that). Resume must wait until confirmed has
+      // reached it — the referee's final frozen broadcast can land a tick
+      // after the client-side timer fires, and jumping early would make the
+      // client step a frame the referee never steps.
+      state.holdEndFrame = (msg.frame ?? 0) + msg.countdown_ticks;
       break;
     case "game_state":
       // The referee's authoritative frame (~30Hz). The CANVAS renders the
@@ -797,7 +804,10 @@ function pongLoop() {
   // hold expires — the referee is broadcasting unchanged frames; advancing
   // locally would desync the sims.
   if (state.session && state.holdUntilMs !== null) {
-    if (performance.now() < state.holdUntilMs) {
+    // Expire only once the timer elapsed AND confirmed caught up to the last
+    // frozen frame (the referee's final broadcast can arrive a tick late).
+    // While waiting, the frozen frame keeps rendering under the countdown.
+    if (performance.now() < state.holdUntilMs || state.session.confirmed < state.holdEndFrame) {
       if (state.game) renderFrame(); // countdown overlay only
       return;
     }
@@ -872,6 +882,7 @@ function stopGame() {
   state.session = null;
   state.stalled = false;
   state.holdUntilMs = null;
+  state.holdEndFrame = 0;
   clearStartCountdown();
   clearInterval(state.practiceTimer);
   state.practiceTimer = null;
