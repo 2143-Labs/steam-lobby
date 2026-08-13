@@ -794,7 +794,8 @@ async function handleServer(raw) {
       state.rpsChosen = false;
       setRpsButtons(true);
       $("rps-status").textContent = "Round " + (msg.round + 1) + " — choose!";
-      $("rps-score").textContent = "You 0 – 0 Opponent";
+      // Keep the cumulative score across rounds; only round 0 starts at 0-0.
+      if (msg.round === 0) $("rps-score").textContent = "You 0 – 0 Opponent";
       log("sys", `rps round ${msg.round} open (${msg.timeout_ms}ms window)`);
       break;
     case "rps_round": {
