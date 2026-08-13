@@ -84,9 +84,27 @@ export class RollbackSession {
   /** Fast-forward past a server-side round hold: the sim is frozen and
    *  identical every frame, so only the frame counter advances. The
    *  referee resumes stepping at `confirmed + 1`; jump so the next
-   *  step() targets exactly that frame. */
+   *  step() targets exactly that frame.
+   *
+   * The skipped (held) frames all carry the SAME sim state, so their
+   * snapshot slots are filled with the current frozen state. Without this,
+   * the FIRST post-hold frames are stepped on predictions (the opponent's
+   * real input hasn't arrived yet), and when it does the rollback rewinds
+   * to `minIncorrect - 1` == the last held frame — whose snapshot is
+   * missing, so step() throws "rollback snapshot evicted". */
   skipTo(frame) {
-    if (frame > this.frame) this.frame = frame;
+    if (frame > this.frame) {
+      const bytes = this.sim.fullState();
+      const checksum = this.sim.checksum();
+      const applied = {
+        [PongSide.Left]: this.inputFor(this.rings[PongSide.Left], frame),
+        [PongSide.Right]: this.inputFor(this.rings[PongSide.Right], frame),
+      };
+      for (let f = this.frame + 1; f <= frame; f++) {
+        this.snapshots[this.slot(f)] = { frame: f, bytes, checksum, applied, held: true };
+      }
+      this.frame = frame;
+    }
     if (frame > this.confirmed) this.confirmed = frame;
   }
 
@@ -113,7 +131,31 @@ export class RollbackSession {
       this.incorrect.clear();
       this.minIncorrect = null;
       rolledBack = true;
-      for (let f = from + 1; f <= next; f++) this.advanceTo(f);
+      for (let f = from + 1; f <= next; f++) {
+        // Round-hold frames: the sim was frozen, so the state is identical to
+        // the frame before the hold — advance only the counter. Re-stepping
+        // them would move the frozen sim off the referee's trajectory (the
+        // replay walks the held region when a pre-hold input arrived late and
+        // was marked incorrect during the hold). The frame check guards the
+        // ring-slot collision: a held fill entry can sit in the slot of a
+        // not-yet-stepped POST-hold frame (f and its fill frame share the
+        // slot mod ringSize) — only skip when the entry IS frame f.
+        const es = this.snapshots[this.slot(f)];
+        if (es && es.held && es.frame === f) {
+          // The replay has just corrected the pre-hold region with real
+          // inputs, so the sim is now on the REAL frozen trajectory —
+          // refresh the held fill (all held entries share the bytes/checksum
+          // references) so a later rollback restoring FROM a held frame gets
+          // the correct state, not the stale predicted one captured at
+          // skipTo (pre-hold corrections are blocked by the hold guard, so
+          // skipTo can fire with the sim a few frames ahead of confirmed).
+          es.bytes = this.sim.fullState();
+          es.checksum = this.sim.checksum();
+          this.frame = f;
+          continue;
+        }
+        this.advanceTo(f);
+      }
     } else {
       this.advanceTo(next);
     }

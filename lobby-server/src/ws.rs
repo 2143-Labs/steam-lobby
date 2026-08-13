@@ -50,6 +50,11 @@ pub enum ClientMessage {
         /// unacceptable). Parsed with `str::parse::<f64>()` (correctly rounded).
         target: String,
     },
+    /// RPS round choice (0 = rock, 1 = paper, 2 = scissors).
+    RpsChoice {
+        match_token: String,
+        choice: u8,
+    },
     /// WebRTC signaling: offer SDP from the offerer (player_a).
     WebrtcOffer { match_token: String, sdp: String },
     /// WebRTC signaling: answer SDP from the answerer (player_b).
@@ -116,6 +121,7 @@ pub enum ServerMessage {
         opponent: OpponentInfo,
         timeout_ms: u64,
         game_type: lobby_core::types::GameType,
+        game_mode: String,
     },
     /// Both players accepted — the START window of `start_timeout_secs` is open.
     MatchStarted {
@@ -164,6 +170,28 @@ pub enum ServerMessage {
         frame: u32,
         round: u32,
         countdown_ticks: u32,
+    },
+    /// An RPS round is open: both players must send `RpsChoice` within
+    /// `timeout_ms`. `round` is 0-based (0 at match start); `player_a` /
+    /// `player_b` are the participants, so each client learns its own side
+    /// (RPS has no `GameState` frames to carry it).
+    RpsBegin {
+        match_token: String,
+        round: u32,
+        timeout_ms: u64,
+        player_a: String,
+        player_b: String,
+    },
+    /// verdict. `winner` is the round winner's player id (None = draw);
+    /// scores are cumulative.
+    RpsRound {
+        match_token: String,
+        round: u32,
+        a_choice: u8,
+        b_choice: u8,
+        winner: Option<String>,
+        a_score: u8,
+        b_score: u8,
     },
     /// One player's `GameInput`, relayed to the opponent so each client can
     /// run the peer's inputs through its local rollback engine. The sender
@@ -740,6 +768,21 @@ async fn handle_client_message(
                         checksum,
                     });
                 }
+            }
+        }
+        ClientMessage::RpsChoice {
+            match_token,
+            choice,
+        } => {
+            if choice > 2 {
+                return;
+            }
+            let games = state.rps_games.lock();
+            if let Some(g) = games.get(&match_token) {
+                let _ = g.choice_tx.send(crate::rps::RpsChoice {
+                    from: user_id,
+                    choice,
+                });
             }
         }
         // ── Reporting ──

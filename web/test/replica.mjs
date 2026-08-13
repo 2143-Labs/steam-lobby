@@ -302,9 +302,114 @@ function runHold() {
   return referee.frame;
 }
 
+/** Rollback INTO the held region: pre-hold opponent inputs that arrive late
+ *  (during the hold) mark pre-hold frames incorrect; at hold expiry the first
+ *  step() rolls back and replays — which walks the held region. The replay
+ *  must SKIP held frames (the sim was frozen — re-stepping moves it off the
+ *  referee's trajectory) and the skipTo-fill must provide the restore
+ *  snapshot for the last held frame (else step() throws "rollback snapshot
+ *  evicted"). */
+function runHoldRollback() {
+  // Per-frame-varying deterministic inputs — schedule() is constant within
+  // 5-frame groups, which would make the hold-boundary predictions match the
+  // real inputs (never marked incorrect) and skip the rollback under test.
+  const vary = (frame, side) => (((frame * 7919 + (side === "left" ? 0 : 331)) % 997)) / 997;
+  const HOLD_FROM = 100;
+  const HOLD_TICKS = 90;
+  const delay = 3;
+  const referee = new Referee();
+  const A = new RollbackSession({ sim: new PongSim(), side: "left", windowSize: 10, ringSize: 128 });
+  const B = new RollbackSession({ sim: new PongSim(), side: "right", windowSize: 10, ringSize: 128 });
+  const pendingA = [];
+  const pendingB = [];
+  const pendingRef = [];
+  let rollbacks = 0;
+
+  const pumpIteration = (t, sendInputs, stepClients) => {
+    if (sendInputs) {
+      const aT = vary(t, "left");
+      const bT = vary(t, "right");
+      A.localTarget(t, aT);
+      B.localTarget(t, bT);
+      (pendingA[t + delay] ??= []).push(() => A.remoteTarget(t, bT));
+      (pendingB[t + delay] ??= []).push(() => B.remoteTarget(t, aT));
+      (pendingRef[t + delay] ??= []).push(() => {
+        referee.receiveInput("left", t, aT);
+        referee.receiveInput("right", t, bT);
+      });
+    }
+    for (const q of [pendingA, pendingB, pendingRef]) {
+      for (const fn of q[t] ?? []) fn();
+    }
+    for (const g of referee.advance()) {
+      A.setConfirmed(g);
+      B.setConfirmed(g);
+    }
+    if (stepClients) {
+      const rA = A.step();
+      const rB = B.step();
+      if (rA.rolledBack || rB.rolledBack) rollbacks++;
+    }
+  };
+
+  // Phase 1: play to exactly HOLD_FROM - 1 (clients step once per tick).
+  for (let t = 0; t < HOLD_FROM; t++) pumpIteration(t, true, true);
+  if (A.frame !== HOLD_FROM - 1 || B.frame !== HOLD_FROM - 1) {
+    throw new Error(`holdRollback: clients did not stop at ${HOLD_FROM - 1} (A=${A.frame} B=${B.frame})`);
+  }
+
+  // Phase 1b: the delayed pre-hold inputs land DURING the hold (remoteTarget
+  // only — no stepping, exactly the client's hold guard). These mark pre-hold
+  // frames incorrect — the rollback trigger for the held-region replay.
+  for (let t = HOLD_FROM; t < HOLD_FROM + delay; t++) pumpIteration(t, false, false);
+  if (referee.frame !== HOLD_FROM - 1) {
+    throw new Error(`holdRollback: referee at ${referee.frame}, expected ${HOLD_FROM - 1}`);
+  }
+  if (A.minIncorrect === null || B.minIncorrect === null) {
+    throw new Error("holdRollback: no pre-hold lag input marked incorrect — scenario not exercising the held-region rollback");
+  }
+
+  // Phase 2: the hold (referee freezes; clients only setConfirmed).
+  const frozenChecksum = referee.sim.checksum();
+  for (let h = 0; h < HOLD_TICKS; h++) {
+    referee.frame += 1;
+    referee.checksums[referee.frame] = referee.sim.checksum();
+    if (referee.checksums[referee.frame] !== frozenChecksum) {
+      throw new Error(`holdRollback: referee state changed during hold at frame ${referee.frame}`);
+    }
+    A.setConfirmed(referee.frame);
+    B.setConfirmed(referee.frame);
+  }
+  if (A.frame !== HOLD_FROM - 1 || B.frame !== HOLD_FROM - 1) {
+    throw new Error("holdRollback: clients stepped during the hold");
+  }
+
+  // Phase 3: skipTo + resume with lagging inputs. The FIRST step must roll
+  // back through the held region without throwing or diverging.
+  A.skipTo(A.confirmed);
+  B.skipTo(B.confirmed);
+  const END = HOLD_FROM + HOLD_TICKS + 300;
+  for (let t = HOLD_FROM + HOLD_TICKS; t < END; t++) pumpIteration(t, true, true);
+  for (let t = END; t < END + delay + 5; t++) pumpIteration(t, false, true);
+
+  if (rollbacks === 0) {
+    throw new Error("holdRollback: no rollback exercised — scenario is not testing the held-region restore");
+  }
+  assertConverged(referee, A, B, "hold-rollback-tail", delay);
+  const wA = winnerAt(A, referee.frame);
+  const wB = winnerAt(B, referee.frame);
+  const wR = referee.sim.winner();
+  if (wA !== wB || wB !== wR) {
+    throw new Error(`holdRollback: winner disagreement: A=${wA} B=${wB} ref=${wR}`);
+  }
+  return { rollbacks, frame: referee.frame };
+}
+
 for (const delay of [0, 3, 10]) runReplica(delay);
 console.log("replica: OK (delays 0/3/10)");
 runResync();
 console.log("resync: OK");
 runHold();
 console.log("hold: OK");
+runHoldRollback();
+console.log("hold-rollback: OK");

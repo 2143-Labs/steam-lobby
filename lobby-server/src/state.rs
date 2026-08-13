@@ -84,6 +84,8 @@ pub struct AppState {
     pub next_generation: AtomicU64,
     /// Active pong matches: match_token -> input channel + task handle.
     pub pong_games: ParkMutex<std::collections::HashMap<String, crate::pong::ActivePong>>,
+    /// Active RPS matches: match_token -> choice channel + task handle.
+    pub rps_games: ParkMutex<std::collections::HashMap<String, crate::rps::ActiveRps>>,
     /// Temporal client slot, set by the worker once it connects. `None` while
     /// Temporal is down — handlers fall back to the in-process path (Step 9
     /// transition window; deleted at cutover).

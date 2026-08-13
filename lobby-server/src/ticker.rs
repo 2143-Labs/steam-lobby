@@ -71,6 +71,7 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                                 },
                                 timeout_ms: 30_000,
                                 game_type: info_a.game_type,
+                                game_mode: info_a.game_mode.clone(),
                             });
                         }
                     });
@@ -96,6 +97,7 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                                 },
                                 timeout_ms: 30_000,
                                 game_type: info_b.game_type,
+                                game_mode: info_b.game_mode.clone(),
                             });
                         }
                     });
