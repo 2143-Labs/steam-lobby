@@ -102,7 +102,11 @@ impl LobbyActivities {
         // the server-authoritative pong referee for PLAYBACK (Step 11 — it
         // renders frames/checksums; the workflow owns resolution).
         if let Ok(Some(m)) = self.state.store.get_match(&args.match_token).await {
-            if self.state.config.pong_enabled
+            if m.game_mode == "rps_1v1"
+                && m.status == lobby_core::types::MatchStatus::Reporting
+            {
+                crate::rps::spawn_game(&self.state, &m);
+            } else if self.state.config.pong_enabled
                 && m.game_type == lobby_core::types::GameType::P2p
                 && m.status == lobby_core::types::MatchStatus::Reporting
             {
@@ -437,6 +441,7 @@ impl LobbyActivities {
                     },
                     timeout_ms: 30_000,
                     game_type: m.game_type,
+                    game_mode: m.game_mode.clone(),
                 };
                 let connections = self.state.connections.lock().await;
                 if let Some(e) = connections.get(&pid) {

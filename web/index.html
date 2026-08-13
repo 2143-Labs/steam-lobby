@@ -34,6 +34,14 @@
   #pong { border: 1px solid #333; border-radius: 6px; width: 100%; height: auto;
          background: #0a0a0a; }
   #game-status { font-size: 0.8rem; color: #aaa; margin: 0.5rem 0 0; }
+  #rps-buttons { display: flex; gap: 0.75rem; margin: 0.75rem 0; }
+  .rps-btn { font-size: 2rem; padding: 0.75rem 1.25rem; border-radius: 8px;
+             background: #1c1c1c; border: 1px solid #444; cursor: pointer; }
+  .rps-btn:hover:not(:disabled) { border-color: #7fb3ff; }
+  .rps-btn:disabled { opacity: 0.45; cursor: default; }
+  #rps-panel { text-align: center; }
+  #rps-status { font-size: 1.1rem; margin: 0.5rem 0 0.25rem; }
+  #rps-score { font-size: 0.9rem; color: #aaa; margin: 0.25rem 0 0.5rem; }
   .in { color: #7fb3ff; } .out { color: #ffd28f; } .sys { color: #888; }
 </style>
 </head>
@@ -105,6 +113,15 @@ then start matchmaking in each.</p>
   </div>
   <div id="game-area" style="display:none">
     <canvas id="pong" width="640" height="400"></canvas>
+    <div id="rps-panel" style="display:none">
+      <p id="rps-status">—</p>
+      <div id="rps-buttons">
+        <button class="rps-btn" data-choice="0" title="Rock">✊</button>
+        <button class="rps-btn" data-choice="1" title="Paper">✋</button>
+        <button class="rps-btn" data-choice="2" title="Scissors">✌</button>
+      </div>
+      <p id="rps-score">—</p>
+    </div>
     <p id="game-status">—</p>
     <p id="conn-metrics">Server: — · Opponent: —</p>
   </div>
@@ -140,10 +157,12 @@ function playerLabel(p) {
     : "Player " + id;
 }
 const state = { ws: null, playerId: null, matchToken: null, opponentId: null, gameType: null,
+  matchMode: null, // the mode name from match_found (e.g. rps_1v1 vs ranked_1v1)
   inputTarget: 0.5, gameMode: "off", game: null,
   sim: null, session: null, stalled: false, lastPongAt: 0, pongAcc: 0, lastPracticeAt: 0,
   practiceTimer: null, pongTimer: null, iAmPlayerA: undefined,
-  holdUntilMs: null, holdEndFrame: 0 }; // round hold: freeze the sim + draw 3-2-1 until this time
+  holdUntilMs: null, holdEndFrame: 0, // round hold: freeze the sim + draw 3-2-1 until this time
+  rpsRound: null, rpsChosen: false, rpsTimer: null };
 // Consume an OpenID-issued fragment token (#token=…) if present, then strip it
 // from the URL so it isn't re-sent or stored in history.
 let fragmentToken = null;
@@ -481,8 +500,8 @@ async function handleServer(raw) {
       stopGame(); // the match replaces the practice game
       setStatus("MatchFound", "ok");
       state.matchToken = msg.match_token;
-      state.opponentId = msg.opponent.player_id;
       state.gameType = msg.game_type;
+      state.matchMode = msg.game_mode;
       $("opponent").textContent = playerLabel(msg.opponent);
       $("match-token").textContent = msg.match_token;
       $("opp-p2p").textContent = "Waiting for opponent to start…";
@@ -764,9 +783,74 @@ async function handleServer(raw) {
       setStatus("Error: " + msg.message, "err");
       showControls("connected");
       break;
-    default:
-      log("sys", "unhandled event type: " + msg.type);
+    case "rps_begin":
+      // Switch the game area to the RPS panel (the pong canvas is unused here).
+      stopGame();
+      state.gameMode = "rps";
+      $("pong").style.display = "none";
+      $("rps-panel").style.display = "";
+      state.iAmPlayerA = state.playerId === msg.player_a;
+      state.rpsRound = msg.round;
+      state.rpsChosen = false;
+      setRpsButtons(true);
+      $("rps-status").textContent = "Round " + (msg.round + 1) + " — choose!";
+      $("rps-score").textContent = "You 0 – 0 Opponent";
+      log("sys", `rps round ${msg.round} open (${msg.timeout_ms}ms window)`);
+      break;
+    case "rps_round": {
+      clearInterval(state.rpsTimer);
+      state.rpsTimer = null;
+      const mine = state.iAmPlayerA ? msg.a_choice : msg.b_choice;
+      const theirs = state.iAmPlayerA ? msg.b_choice : msg.a_choice;
+      const myScore = state.iAmPlayerA ? msg.a_score : msg.b_score;
+      const oppScore = state.iAmPlayerA ? msg.b_score : msg.a_score;
+      $("rps-score").textContent = "You " + myScore + " – " + oppScore + " Opponent";
+      setRpsButtons(false);
+      if (mine === 255 || theirs === 255) {
+        const who = mine === 255 ? "You" : "The opponent";
+        $("rps-status").textContent = who + " didn't choose" +
+          (msg.winner === state.playerId ? " — you win the round!" : " — round lost.");
+      } else {
+        const face = [["✊", "rock"], ["✋", "paper"], ["✌", "scissors"]];
+        const myTxt = face[mine][0] + " " + face[mine][1];
+        const oppTxt = face[theirs][0] + " " + face[theirs][1];
+        const verdict = msg.winner === null ? "Draw!"
+          : msg.winner === state.playerId ? "You win the round!"
+          : "Opponent wins the round.";
+        $("rps-status").textContent = "You: " + myTxt + " · Opp: " + oppTxt + " — " + verdict;
+      }
+      log("sys", `rps round ${msg.round}: a=${msg.a_choice} b=${msg.b_choice} winner=${msg.winner} score ${msg.a_score}-${msg.b_score}`);
+      break;
+    }
+    case "game_over":
+      stopGame(); // stop both rAF loops; the canvas keeps the final frame
+      clearInterval(state.rpsTimer);
+      state.rpsTimer = null;
+      setRpsButtons(false);
+      if (state.gameMode === "rps") {
+        $("rps-status").textContent = msg.winner === state.playerId
+          ? "You win the match!" : "You lose the match.";
+      }
+      $("game-status").textContent = msg.winner === state.playerId ? "You win!" : "You lose";
+      break;
   }
+}
+// ── Rock Paper Scissors ──
+function setRpsButtons(enabled) {
+  for (const b of document.querySelectorAll(".rps-btn")) {
+    b.disabled = !enabled;
+  }
+}
+for (const b of document.querySelectorAll(".rps-btn")) {
+  b.addEventListener("click", () => {
+    if (!state.matchToken || state.rpsChosen || b.disabled) return;
+    state.rpsChosen = true;
+    setRpsButtons(false);
+    $("rps-status").textContent = "You threw — waiting for the opponent…";
+    clearInterval(state.rpsTimer);
+    state.rpsTimer = null;
+    send({ type: "rps_choice", match_token: state.matchToken, choice: parseInt(b.dataset.choice, 10) });
+  });
 }
 // ── Pong game ──
 const PONG_H = 400; // canvas height, px
@@ -777,6 +861,9 @@ const pongCtx = $("pong").getContext("2d");
 function startPractice() {
   state.gameMode = "practice";
   state.sim = new PongSim({ scoring: false });
+  // The RPS panel is per-match: back to the pong canvas when (re)queueing.
+  $("rps-panel").style.display = "none";
+  $("pong").style.display = "";
   $("game-status").textContent = "Practice — waiting for opponent";
   if (!state.practiceTimer) {
     state.lastPracticeAt = performance.now();
@@ -892,6 +979,8 @@ function stopGame() {
   state.practiceTimer = null;
   clearInterval(state.pongTimer);
   state.pongTimer = null;
+  clearInterval(state.rpsTimer);
+  state.rpsTimer = null;
   if (state.link) { state.link.close(); state.link = null; }
 }
 function hexToBytes(hex) {

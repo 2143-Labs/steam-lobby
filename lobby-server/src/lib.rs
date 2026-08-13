@@ -12,7 +12,7 @@ use tower_http::trace::TraceLayer;
 pub mod auth_providers;
 mod db;
 mod gameserver;
-mod pong;
+mod rps;
 mod rate_limit;
 mod routes;
 mod state;
@@ -243,6 +243,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         },
         openid_states: parking_lot::Mutex::new(std::collections::HashMap::new()),
         pong_games: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        rps_games: parking_lot::Mutex::new(std::collections::HashMap::new()),
         ticket_limiter: RateLimiter::new(10, std::time::Duration::from_secs(60)),
         test_token_limiter: RateLimiter::new(20, std::time::Duration::from_secs(60)),
         guest_token_limiter: RateLimiter::new(20, std::time::Duration::from_secs(60)),
