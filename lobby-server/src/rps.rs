@@ -27,9 +27,14 @@ pub struct ActiveRps {
     pub abort: tokio::task::AbortHandle,
 }
 
-/// Choices a client may send.
+/// Choices a client may send (wire values; the client sends raw u8). The
+/// named constants document the protocol and are exercised by the unit tests
+/// below.
+#[allow(dead_code)]
 pub const ROCK: u8 = 0;
+#[allow(dead_code)]
 pub const PAPER: u8 = 1;
+#[allow(dead_code)]
 pub const SCISSORS: u8 = 2;
 /// Sentinel broadcast for a player who did not choose before the window.
 pub const NO_CHOICE: u8 = 255;
@@ -80,8 +85,7 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
         let mut next_begin_at: Option<std::time::Instant> = None;
         let mut interval =
             tokio::time::interval(std::time::Duration::from_millis(TICK_MS));
-        let mut done = false;
-        while !done {
+        loop {
             interval.tick().await;
             // Stop if the match left Reporting (report/expiry/dispute raced us):
             // the workflow is the lifecycle writer once Temporal is up.
@@ -109,7 +113,6 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                 broadcast(
                     &task_state,
                     &players,
-                    &task_token,
                     crate::ws::ServerMessage::RpsBegin {
                         match_token: task_token.clone(),
                         round,
@@ -134,7 +137,6 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                 broadcast(
                     &task_state,
                     &players,
-                    &task_token,
                     crate::ws::ServerMessage::RpsBegin {
                         match_token: task_token.clone(),
                         round,
@@ -173,7 +175,6 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                 broadcast(
                     &task_state,
                     &players,
-                    &task_token,
                     crate::ws::ServerMessage::RpsRound {
                         match_token: task_token.clone(),
                         round,
@@ -186,17 +187,10 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                 )
                 .await;
                 round_deadline = None;
-                // Match over?
+                // Match over: someone reached FIRST_TO (winner_id is always
+                // Some here — a reachable FIRST_TO score implies a round win).
                 if a_score >= FIRST_TO || b_score >= FIRST_TO {
-                    let winner_id = winner_id.unwrap_or_else(|| {
-                        if a_score >= FIRST_TO {
-                            players[0].to_string()
-                        } else {
-                            players[1].to_string()
-                        }
-                    });
-                    finish(&task_state, &players, &task_token, winner_id).await;
-                    done = true;
+                    finish(&task_state, &players, &task_token, winner_id.expect("FIRST_TO implies a round winner")).await;
                     break;
                 }
                 // Hard cap: leader wins; tie resolves nowhere (workflow disputes).
@@ -209,7 +203,6 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
                         };
                         finish(&task_state, &players, &task_token, leader.to_string()).await;
                     }
-                    done = true;
                     break;
                 }
                 next_begin_at =
@@ -241,7 +234,6 @@ pub fn spawn_game(state: &Arc<AppState>, m: &lobby_core::types::MatchInfo) {
 async fn broadcast(
     state: &Arc<AppState>,
     players: &[uuid::Uuid; 2],
-    token: &str,
     msg: crate::ws::ServerMessage,
 ) {
     let connections = state.connections.lock().await;
@@ -265,7 +257,6 @@ async fn finish(
     broadcast(
         state,
         players,
-        token,
         crate::ws::ServerMessage::GameOver {
             match_token: token.to_string(),
             winner: winner.clone(),
@@ -286,13 +277,16 @@ async fn finish(
             .resolve_pong(token, w, &state.store, &state.store, &state.store)
             .await;
         tracing::info!("match {token} rps ended, winner {winner}: {outcome:?}");
+        let outcome_val = outcome
+            .ok()
+            .and_then(|o| serde_json::to_value(o).ok())
+            .unwrap_or(serde_json::Value::Null);
         broadcast(
             state,
             players,
-            token,
             crate::ws::ServerMessage::MatchResult {
                 match_token: token.to_string(),
-                outcome: serde_json::to_value(outcome).unwrap_or(serde_json::Value::Null),
+                outcome: outcome_val,
             },
         )
         .await;

@@ -12,6 +12,7 @@ use tower_http::trace::TraceLayer;
 pub mod auth_providers;
 mod db;
 mod gameserver;
+mod pong;
 mod rps;
 mod rate_limit;
 mod routes;

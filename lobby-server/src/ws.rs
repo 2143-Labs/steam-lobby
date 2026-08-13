@@ -785,24 +785,6 @@ async fn handle_client_message(
                 });
             }
         }
-        ClientMessage::RollbackHealth {
-            match_token,
-            frame,
-            checksum,
-        } => {
-            // Checksums travel as decimal strings (JS cannot hold u64 exactly);
-            // a malformed report is ignored.
-            if let Ok(checksum) = checksum.parse::<u64>() {
-                let games = state.pong_games.lock();
-                if let Some(g) = games.get(&match_token) {
-                    let _ = g.health_tx.send(RollbackHealth {
-                        from: user_id,
-                        frame,
-                        checksum,
-                    });
-                }
-            }
-        }
         // ── Reporting ──
         ClientMessage::MatchReport {
             match_token,
