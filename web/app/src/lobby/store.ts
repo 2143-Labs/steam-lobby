@@ -163,7 +163,19 @@ export function setStatus(text: string, cls = "") {
   notify();
 }
 
-/** Append a protocol log line (kind: "in" | "out" | "sys"). */
+let logNotifyTimer: TimerHandle | undefined;
+
+/**
+ * Append a protocol log line (kind: "in" | "out" | "sys").
+ *
+ * The log grows at 30Hz+ during a match (every game_state and game_input
+ * is logged, mirroring the demo). The demo appended straight to the DOM with
+ * zero re-render cost; here every `log` used to notify() the whole tree,
+ * re-rendering the page at frame rate and starving the game loop (the client
+ * fell behind the referee and the rollback ring evicted — "rollback snapshot
+ * for frame N evicted"). So log-driven re-renders are throttled to ~10Hz:
+ * the log content stays complete, the UI just batches its updates.
+ */
 export function log(kind: string, text: string) {
   // Mask raw Steam IDs (17 digits) in the protocol dump — the UI and wire
   // are player-id-only, so this only guards against stray legacy values.
@@ -173,7 +185,11 @@ export function log(kind: string, text: string) {
     text: new Date().toISOString().slice(11, 23) + "  " + masked,
   });
   if (state.logLines.length > 500) state.logLines.splice(0, state.logLines.length - 500);
-  notify();
+  if (logNotifyTimer) return;
+  logNotifyTimer = setTimeout(() => {
+    logNotifyTimer = undefined;
+    notify();
+  }, 100);
 }
 
 /** Send a protocol message, logging a sanitized copy (never credentials). */

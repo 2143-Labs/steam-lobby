@@ -122,7 +122,18 @@ function pongLoop() {
         if (now - sentAt > 2000) state.pendingAcks.delete(f);
       }
     }
-    const result = session.step();
+    let result;
+    try {
+      result = session.step();
+    } catch (e) {
+      // The rollback engine could not recover locally (snapshot evicted after
+      // the client fell > ringSize behind — e.g. a throttled hidden tab).
+      // Don't kill the interval: pause stepping and keep the UI + WS alive;
+      // the referee's divergence detection resyncs us when it can.
+      log("sys", "rollback failed: " + (e as Error).message + " — pausing local sim");
+      state.stalled = true;
+      break;
+    }
     state.stalled = result.stalled;
     if (result.snapshot) state.game = result.snapshot;
     if (result.rolledBack) log("sys", "rolled back to correct trajectory");

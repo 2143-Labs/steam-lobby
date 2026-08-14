@@ -468,6 +468,7 @@ function handleServer(raw: string) {
     case "rollback_resync":
       if (state.session) {
         state.session.restore(msg.frame, hexToBytes(msg.state));
+        state.stalled = false; // resume stepping from the authoritative state
         log("sys", `resynced to frame ${msg.frame}`);
       }
       break;
