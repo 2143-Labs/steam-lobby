@@ -292,37 +292,4 @@ impl PostgresStore {
             .map_err(map_db_error)?;
         Ok(row.map(|r| r.0))
     }
-
-    /// Public profile fields for the player page: display name, primary
-    /// provider, and account creation time. None when the user row is missing.
-    pub async fn player_profile(
-        &self,
-        user_id: uuid::Uuid,
-    ) -> Result<Option<(String, String, DateTime<Utc>)>> {
-        let row = sqlx::query_as::<_, (String, String, DateTime<Utc>)>(
-            "SELECT display_name, primary_provider, created_at FROM users WHERE id = $1",
-        )
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_db_error)?;
-        Ok(row)
-    }
-
-    /// The player's linked identities (provider + last login). The
-    /// provider_uid is deliberately NOT returned — it never leaves the server.
-    pub async fn user_identities(
-        &self,
-        user_id: uuid::Uuid,
-    ) -> Result<Vec<(String, DateTime<Utc>)>> {
-        let rows = sqlx::query_as::<_, (String, DateTime<Utc>)>(
-            "SELECT provider, last_login_at FROM user_identities \
-             WHERE user_id = $1 ORDER BY last_login_at DESC",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_db_error)?;
-        Ok(rows)
-    }
 }

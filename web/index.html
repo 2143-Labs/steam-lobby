@@ -1,0 +1,1075 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline'; connect-src http: https: ws: wss:; img-src data:">
+<link rel="icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==">
+<title>Steam Lobby — Protocol Demo</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+         max-width: 720px; margin: 2rem auto; padding: 0 1rem;
+         background: #111; color: #ddd; }
+  h1 { font-size: 1.2rem; }
+  section { border: 1px solid #333; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+  label { display: block; margin: 0.5rem 0 0.25rem; font-size: 0.8rem; color: #aaa; }
+  input, select, button { font: inherit; padding: 0.4rem 0.6rem; border-radius: 6px;
+         border: 1px solid #555; background: #1c1c1c; color: #eee; }
+  button { cursor: pointer; margin-right: 0.4rem; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary, a.primary { background: #2d6a4f; border-color: #2d6a4f; }
+  a.primary { display: inline-block; font: inherit; line-height: normal; box-sizing: border-box;
+         padding: 0.4rem 0.6rem;
+         border-radius: 6px; border: 1px solid #2d6a4f; background: #2d6a4f;
+         color: #eee; text-decoration: none; cursor: pointer; margin-right: 0.4rem; }
+  #status { font-weight: bold; }
+  #status.ok { color: #74c69d; }
+  #status.err { color: #e76f51; }
+  #opponent { color: #74c69d; }
+  #log { height: 240px; overflow-y: auto; background: #0a0a0a; border: 1px solid #333;
+         border-radius: 6px; padding: 0.5rem; font-size: 0.75rem; white-space: pre-wrap;
+         word-break: break-all; }
+  #pong { border: 1px solid #333; border-radius: 6px; width: 100%; height: auto;
+         background: #0a0a0a; }
+  #game-status { font-size: 0.8rem; color: #aaa; margin: 0.5rem 0 0; }
+  #rps-buttons { display: flex; gap: 0.75rem; margin: 0.75rem 0; }
+  .rps-btn { font-size: 2rem; padding: 0.75rem 1.25rem; border-radius: 8px;
+             background: #1c1c1c; border: 1px solid #444; cursor: pointer; }
+  .rps-btn:hover:not(:disabled) { border-color: #7fb3ff; }
+  .rps-btn:disabled { opacity: 0.45; cursor: default; }
+  #rps-panel { text-align: center; }
+  #rps-status { font-size: 1.1rem; margin: 0.5rem 0 0.25rem; }
+  #rps-score { font-size: 0.9rem; color: #aaa; margin: 0.25rem 0 0.5rem; }
+  .in { color: #7fb3ff; } .out { color: #ffd28f; } .sys { color: #888; }
+</style>
+</head>
+<body>
+<h1>Steam Lobby — zero-dependency protocol demo</h1>
+<p class="sys">Uses native <code>fetch</code> + <code>WebSocket</code>. Sign in through Steam for a
+genuine login (needs the server reachable via its public URL), or open two tabs with
+distinct dev steam IDs (server must run with <code>AUTH_DEV_MODE=true</code>), connect both,
+then start matchmaking in each.</p>
+
+<section id="connect-panel">
+  <label>Server URL</label>
+  <input id="server-url" value="http://localhost:8080" size="30">
+  <div id="steam-login" style="display:none">
+    <button id="btn-steam-login" class="primary">Sign in with Steam</button>
+    <div id="player-id-box" style="display:none">
+      <label>Player ID</label>
+      <input id="player-id" readonly size="40" placeholder="—">
+    </div>
+    <button id="btn-signout" style="display:none">Sign out</button>
+  </div>
+  <div id="extra-login" style="display:none"></div>
+  <div id="dev-panel" style="display:none">
+    <label>Steam ID (dev test-token; server must run with AUTH_DEV_MODE=true)</label>
+    <input id="steam-id" value="76561198000000001" size="20">
+  </div>
+  <button id="btn-connect" class="primary">Connect</button>
+  <div id="guest-login" style="display:none"><button id="btn-guest" class="primary">No account</button></div>
+  <button id="btn-disconnect" disabled>Disconnect</button>
+</section>
+
+<section>
+  <label>Status: <span id="status">Disconnected</span></label>
+</section>
+
+<section id="controls" style="display:none">
+  <div id="ctrl-connected">
+    <label>Mode</label>
+    <select id="mode"></select>
+    <label>Difficulty</label>
+    <select id="difficulty"><option>easy</option><option selected>normal</option><option>hard</option></select>
+    <button id="btn-queue" class="primary">Start Matchmaking</button>
+  </div>
+  <div id="ctrl-queueing" style="display:none">
+    <button id="btn-cancel">Cancel Matchmaking</button>
+    <div id="queue-stats">
+      <p>Waiting: <span id="q-wait">—</span> — MMR band <span id="q-band">—</span>
+         — opponents in band: <span id="q-cands">—</span> (queue size <span id="q-size">—</span>)</p>
+      <p>My MMR: μ <span id="q-mu">—</span> σ <span id="q-sigma">—</span>
+         rating <span id="q-rating">—</span></p>
+    </div>
+    <table id="leaderboard"><thead><tr><th>Player ID</th><th>μ</th><th>σ</th><th>Rating</th></tr></thead>
+      <tbody></tbody></table>
+  </div>
+  <div id="ctrl-match" style="display:none">
+    <p>Opponent: <span id="opponent">—</span><br>
+       Match token: <span id="match-token">—</span></p>
+    <button id="btn-accept" class="primary">Accept Match</button>
+    <button id="btn-decline">Decline Match</button>
+  </div>
+  <div id="ctrl-inmatch" style="display:none">
+    <p id="server-info" style="display:none"></p>
+    <p>P2P: <span id="opp-p2p">Waiting for opponent to start…</span></p>
+    <p>Result: <span id="report-status">—</span></p>
+    <button id="btn-start" class="primary" style="display:none" disabled>START Match</button>
+    <button id="btn-report-win" style="display:none">Report Win</button>
+    <button id="btn-report-loss" style="display:none">Report Loss</button>
+    <button id="btn-report-draw" style="display:none">Report Draw</button>
+  </div>
+  <div id="game-area" style="display:none">
+    <canvas id="pong" width="640" height="400"></canvas>
+    <div id="rps-panel" style="display:none">
+      <p id="rps-status">—</p>
+      <div id="rps-buttons">
+        <button class="rps-btn" data-choice="0" title="Rock">✊</button>
+        <button class="rps-btn" data-choice="1" title="Paper">✋</button>
+        <button class="rps-btn" data-choice="2" title="Scissors">✌</button>
+      </div>
+      <p id="rps-score">—</p>
+    </div>
+    <p id="game-status">—</p>
+    <p id="conn-metrics">Server: — · Opponent: —</p>
+  </div>
+<section>
+  <label>Event log</label>
+  <div id="log"></div>
+</section>
+
+<script type="module">
+"use strict";
+import { PongSim, PongSide } from "/pong-sim.mjs";
+import { RollbackSession } from "/pong-rollback.mjs";
+import { WrtcLink } from "/pong-wrtc.mjs";
+const $ = (id) => document.getElementById(id);
+
+// Decode the JWT payload's `sub` claim (base64url middle segment). The token
+// is already in memory (state.token), so no server round-trip is needed.
+function jwtSub(token) {
+  try {
+    const b64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const pad = b64.length % 4 ? "=".repeat(4 - b64.length % 4) : "";
+    return JSON.parse(atob(b64 + pad)).sub || null;
+  } catch { return null; }
+}
+
+// Short display form of a player id (first 8 chars of the account UUID).
+function shortId(id) { return id && id.length >= 8 ? id.slice(0, 8) : (id || "—"); }
+// A player's display label: name when known, always with the short player id.
+function playerLabel(p) {
+  const id = shortId(p.player_id);
+  return p.display_name && p.display_name !== "Unknown"
+    ? p.display_name + " · " + id
+    : "Player " + id;
+}
+const state = { ws: null, playerId: null, matchToken: null, opponentId: null, gameType: null,
+  matchMode: null, // the mode name from match_found (e.g. rps_1v1 vs ranked_1v1)
+  inputTarget: 0.5, gameMode: "off", game: null,
+  sim: null, session: null, stalled: false, lastPongAt: 0, pongAcc: 0, lastPracticeAt: 0,
+  practiceTimer: null, pongTimer: null, iAmPlayerA: undefined,
+  holdUntilMs: null, holdEndFrame: 0, // round hold: freeze the sim + draw 3-2-1 until this time
+  rpsRound: null, rpsChosen: false, rpsTimer: null };
+// Consume an OpenID-issued fragment token (#token=…) if present, then strip it
+// from the URL so it isn't re-sent or stored in history.
+let fragmentToken = null;
+if (location.hash.startsWith("#token=")) {
+  fragmentToken = location.hash.slice(7);
+  history.replaceState(null, "", location.pathname + location.search);
+}
+// When served by the server itself (http://host:port/), default the API base
+// to this same origin so the hostname and port are always right.
+if (location.protocol.startsWith("http")) {
+  $("server-url").value = location.origin;
+}
+
+// Gate the login UI from the server's auth config: the Steam button only when
+// a public origin is configured (OpenID needs an absolute callback), the dev
+// test-token field only when AUTH_DEV_MODE is on. If the config is
+// unreachable (offline / file://), show only the dev-panel — the Steam
+// button navigates to an HTTP endpoint that doesn't exist offline, and the
+// browser's security policy blocks cross-scheme redirects (file:// → http://).
+const cfgUrl = $("server-url").value.trim().replace(/\/+$/, "") + "/auth/config";
+fetch(cfgUrl).then(r => r.ok ? r.json() : null).then(cfg => {
+  if (!cfg) {
+    $("dev-panel").style.display = "";
+    return;
+  }
+  const providers = cfg.providers || [];
+  $("steam-login").style.display = providers.includes("steam") ? "" : "none";
+  $("dev-panel").style.display = cfg.dev_mode ? "" : "none";
+  $("guest-login").style.display = cfg.guest_login ? "" : "none";
+  // The bare Connect button is the dev test-token path (or completing a
+  // Steam login from a #token= fragment). In production the test-token
+  // endpoint 404s, so hide it unless a fragment token is present.
+  $("btn-connect").style.display = (cfg.dev_mode || fragmentToken) ? "" : "none";
+  // Render every non-Steam provider as a "Sign in with {label}" button.
+  const labels = { discord: "Discord", au2143: "au.2143.me" };
+  const extra = providers.filter(p => p !== "steam");
+  const box = $("extra-login");
+  box.innerHTML = "";
+  for (const p of extra) {
+    const a = document.createElement("a");
+    a.className = "primary";
+    a.href = "#";
+    a.textContent = "Sign in with " + (labels[p] || p);
+    a.addEventListener("click", ev => {
+      ev.preventDefault();
+      const base = $("server-url").value.trim().replace(/\/+$/, "");
+      location.href = base + "/auth/" + encodeURIComponent(p) + "/login?return_to=/";
+    });
+    box.appendChild(a);
+  }
+  box.style.display = extra.length ? "" : "none";
+}).catch(() => {
+  $("dev-panel").style.display = "";
+});
+
+
+function setStatus(text, cls) {
+  const el = $("status");
+  el.textContent = text;
+  el.className = cls || "";
+}
+function log(kind, text) {
+  const el = $("log");
+  const line = document.createElement("div");
+  line.className = kind;
+  // Mask raw Steam IDs (17 digits) in the protocol dump — the UI and wire
+  // are player-id-only, so this only guards against stray legacy values.
+  const masked = text.replace(/\b7\d{16}\b/g, "…");
+  line.textContent = new Date().toISOString().slice(11, 23) + "  " + masked;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+function showControls(name) {
+  $("ctrl-connected").style.display = name === "connected" ? "" : "none";
+  $("ctrl-queueing").style.display = name === "queueing" ? "" : "none";
+  $("ctrl-match").style.display = name === "match" ? "" : "none";
+  $("ctrl-inmatch").style.display = name === "inmatch" ? "" : "none";
+  $("game-area").style.display = (name === "queueing" || name === "inmatch") ? "" : "none";
+}
+let startCountdownTimer = null;
+// match_started → reveal the START button with the server's actual window
+// length (msg.start_timeout_secs, NOT a hardcoded 15) and count it down.
+function beginStartCountdown(timeoutSecs) {
+  $("btn-start").style.display = ""; // REVEAL only now — match_started means both accepted
+  $("btn-start").disabled = false;
+  let n = timeoutSecs; // seconds — the server's LOBBY_START_TIMEOUT_SECS
+  $("btn-start").textContent = "START Match (" + n + "s)";
+  startCountdownTimer = setInterval(() => {
+    n -= 1;
+    if (n <= 0) {
+      clearStartCountdown();
+      $("btn-start").disabled = true;
+      $("btn-start").textContent = "Didn't start in time — awaiting result";
+      return;
+    }
+    $("btn-start").textContent = "START Match (" + n + "s)";
+  }, 1000);
+}
+function clearStartCountdown() {
+  if (startCountdownTimer) { clearInterval(startCountdownTimer); startCountdownTimer = null; }
+}
+let hbTimer = null;
+function startHeartbeat(intervalMs) {
+  stopHeartbeat();
+  hbTimer = setInterval(() => send({ type: "heartbeat" }), intervalMs);
+}
+function stopHeartbeat() {
+  if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+}
+let connTimer = null;
+let serverRtt = null;
+const pendingAcks = new Map(); // game_input frame -> performance.now() when sent
+function startConnMetrics() { if (!connTimer) connTimer = setInterval(updateConnMetrics, 2000); }
+function stopConnMetrics() { if (connTimer) { clearInterval(connTimer); connTimer = null; } }
+async function updateConnMetrics() {
+  const el = $("conn-metrics");
+  if (!el) return;
+  let opp = "Opponent: —";
+  const pc = state.link?.pc;
+  if (pc) {
+    let rtt = null;
+    try {
+      const stats = await pc.getStats();
+      stats.forEach(s => {
+        if (s.type === "candidate-pair" && (s.nominated || s.selected)
+            && typeof s.currentRoundTripTime === "number") rtt = s.currentRoundTripTime;
+      });
+    } catch { /* getStats throws when the pc is closing — keep last value */ }
+    const ch = state.link.channelState;
+    opp = "Opponent: " + (rtt !== null ? rtt.toFixed(0) + "ms " : "") + (ch === "open" ? "(direct)" : "(relay)");
+  }
+  el.textContent = "Server: " + (serverRtt === null ? "—" : serverRtt.toFixed(0) + "ms") + " · " + opp;
+}
+function send(obj) {
+  const text = JSON.stringify(obj);
+  // Log a sanitized copy — never credentials.
+  const shown = { ...obj };
+  if ("session_token" in shown) shown.session_token = "***";
+  if ("ticket" in shown) shown.ticket = "***";
+  log("out", "→ " + JSON.stringify(shown));
+  state.ws.send(text);
+}
+
+$("btn-steam-login").addEventListener("click", () => {
+  const base = $("server-url").value.trim().replace(/\/+$/, "");
+  location.href = base + "/auth/steam/login?return_to=/";
+});
+$("btn-connect").addEventListener("click", async () => {
+  const base = $("server-url").value.trim().replace(/\/+$/, "");
+  const steamId = $("steam-id").value.trim();
+
+  if (!base || !steamId) {
+    setStatus("Error: server URL and steam ID are required", "err");
+    return;
+  }
+
+  let token = fragmentToken;
+  if (token) {
+    setStatus("Using Steam login token");
+    log("sys", "using session token from Steam OpenID login (fragment)");
+  } else {
+    setStatus("Fetching test token…");
+    log("sys", "POST " + base + "/auth/test-token");
+    try {
+      const resp = await fetch(base + "/auth/test-token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ steam_id: Number(steamId) }), // dev-only: test-token body is a plain u64
+      });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const body = await resp.json();
+      token = body.token;
+      log("sys", "got token (first 12 chars): " + token.slice(0, 12) + "…");
+    } catch (e) {
+      setStatus("Error: test-token request failed — " + e.message, "err");
+      log("sys", "test-token failed: " + e.message);
+      return;
+    }
+  }
+
+  await connectWithToken(base, token);
+});
+
+// Connect the WebSocket with an already-acquired session token: populate the
+// mode dropdown (fallback to ranked_1v1), open the WS, and wire the
+// onopen/onmessage/onclose handlers. Shared by the Connect button (fragment or
+// dev test-token) and the guest "No account" flow.
+async function connectWithToken(base, token) {
+  // Populate the mode dropdown from the server (same base the user typed).
+  try {
+    const resp = await fetch(base + "/modes");
+    if (resp.ok) {
+      const body = await resp.json();
+      const sel = $("mode");
+      sel.innerHTML = "";
+      for (const m of body.modes) {
+        const opt = document.createElement("option");
+        opt.value = m.name;
+        opt.textContent = m.name + " (" + m.game_type + ")";
+        sel.appendChild(opt);
+      }
+    }
+  } catch (e) {
+    log("sys", "modes fetch failed: " + e.message);
+  }
+  if ($("mode").options.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = "ranked_1v1";
+    opt.textContent = "ranked_1v1 (p2p)";
+    $("mode").appendChild(opt);
+  }
+
+  const wsUrl = base.replace(/^http/, "ws") + "/ws";
+  try {
+    state.ws = new WebSocket(wsUrl);
+  } catch (e) {
+    setStatus("Error: " + e.message, "err");
+    return;
+  }
+
+  state.ws.onopen = () => {
+    log("sys", "WS open: " + wsUrl);
+    $("btn-connect").disabled = true;
+    $("btn-disconnect").disabled = false;
+    state.token = token; // keep for sign-out
+
+    send({ type: "auth", session_token: token });
+  };
+  state.ws.onmessage = (ev) => handleServer(ev.data);
+  state.ws.onclose = () => {
+    stopHeartbeat();
+    stopConnMetrics();
+    stopGame();
+    if (state.link) { state.link.close(); state.link = null; }
+    log("sys", "WS closed");
+    if (state.ws) { state.ws = null; }
+    $("btn-connect").disabled = false;
+    $("btn-disconnect").disabled = true;
+    setStatus("Disconnected", "");
+    $("controls").style.display = "none";
+    state.token = null;
+  };
+  state.ws.onerror = () => log("sys", "WS error");
+}
+
+$("btn-guest").addEventListener("click", async () => {
+  const base = $("server-url").value.trim().replace(/\/+$/, "");
+  if (!base) {
+    setStatus("Error: server URL is required", "err");
+    return;
+  }
+  $("btn-guest").disabled = true;
+  setStatus("Minting guest account…");
+  log("sys", "POST " + base + "/auth/guest");
+  try {
+    const resp = await fetch(base + "/auth/guest", { method: "POST" });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const body = await resp.json();
+    const token = body.token;
+    if (!token) throw new Error("no token in response");
+    log("sys", "got guest token (first 12 chars): " + token.slice(0, 12) + "…");
+    await connectWithToken(base, token);
+  } catch (e) {
+    setStatus("Error: guest account failed — " + e.message, "err");
+    log("sys", "guest account failed: " + e.message);
+  } finally {
+    $("btn-guest").disabled = false;
+  }
+});
+
+$("btn-disconnect").addEventListener("click", () => {
+  log("sys", "disconnecting");
+  // ws.close() runs the normal close handshake; onclose resets the UI and
+  // the server cleans up (handle_disconnect, queue sweep) on the close frame.
+  if (state.ws) { state.ws.close(); }
+  // Clear session state so a reconnect can't inherit a stale match.
+  state.playerId = null;
+  state.matchToken = null;
+  state.opponentId = null;
+  state.gameType = null;
+});
+
+
+$("btn-signout").addEventListener("click", async () => {
+  const base = $("server-url").value.trim().replace(/\/+$/, "");
+  if (state.token) {
+    try {
+      await fetch(base + "/auth/logout", {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + state.token },
+      });
+    } catch (e) {
+      log("sys", "logout request failed: " + e.message);
+    }
+  }
+  state.token = null;
+  if (state.ws) { state.ws.close(); } // onclose resets the panel
+  $("player-id-box").style.display = "none";
+  $("btn-steam-login").style.display = "";
+  $("extra-login").style.display = $("extra-login").childElementCount ? "" : "none";
+  $("guest-login").style.display = "";
+  $("btn-signout").style.display = "none";
+});
+async function handleServer(raw) {
+  log("in", "← " + raw);
+  let msg;
+  try { msg = JSON.parse(raw); } catch { return; }
+  switch (msg.type) {
+    case "auth_ok":
+      setStatus(msg.state === "queueing" ? "Connected — still in queue" : "Connected", "ok");
+      $("controls").style.display = "";
+      showControls(msg.state === "queueing" ? "queueing" : "connected");
+      if (msg.state === "queueing") startPractice();
+      // Passive liveness: heartbeat for as long as we're connected. The server
+      // drops the connection after 30s without a heartbeat (10s cadence gives
+      // margin); while queueing this also keeps the queue entry alive.
+      startHeartbeat(10000);
+      startConnMetrics();
+      log("sys", "server state on connect: " + msg.state);
+      // Player ID box: the abstract account id (users.id, the JWT `sub`) that
+      // every provider's session will share — never the per-provider steam_id.
+      // Shown after any successful login (Steam button or dev Connect).
+      const sub = msg.player_id || jwtSub(state.token);
+      state.playerId = sub || null;
+      if (sub) {
+        $("player-id").value = sub;
+        $("player-id-box").style.display = "";
+      }
+      $("btn-steam-login").style.display = "none";
+      $("extra-login").style.display = "none";
+      $("guest-login").style.display = "none";
+      $("btn-signout").style.display = "";
+      break;
+    case "match_found":
+      stopGame(); // the match replaces the practice game
+      setStatus("MatchFound", "ok");
+      state.matchToken = msg.match_token;
+      state.gameType = msg.game_type;
+      state.matchMode = msg.game_mode;
+      $("opponent").textContent = playerLabel(msg.opponent);
+      $("match-token").textContent = msg.match_token;
+      $("opp-p2p").textContent = "Waiting for opponent to start…";
+      $("report-status").textContent = "—";
+      if (msg.game_type === "server") {
+        $("server-info").style.display = "";
+        $("server-info").textContent = "Waiting for server allocation…";
+        $("btn-start").style.display = "none";
+        $("btn-start").disabled = true;
+        $("btn-report-win").style.display = "none";
+        $("btn-report-loss").style.display = "none";
+        $("btn-report-draw").style.display = "none";
+      } else {
+        $("server-info").style.display = "none";
+        $("btn-start").style.display = "none";
+        $("btn-start").disabled = true;
+        $("btn-report-win").style.display = "none";
+        $("btn-report-loss").style.display = "none";
+        $("btn-report-draw").style.display = "none";
+      }
+      showControls("match");
+      break;
+    case "queue_status":
+      $("q-wait").textContent = Math.floor(msg.elapsed_ms / 1000) + "s";
+      $("q-band").textContent = msg.band_lo.toFixed(1) + " – " + msg.band_hi.toFixed(1);
+      $("q-cands").textContent = msg.candidates;
+      $("q-size").textContent = msg.queue_size;
+      $("q-mu").textContent = msg.my_mu.toFixed(1);
+      $("q-sigma").textContent = msg.my_sigma.toFixed(1);
+      $("q-rating").textContent = msg.my_rating.toFixed(1);
+      const tbody = document.querySelector("#leaderboard tbody");
+      tbody.innerHTML = "";
+      for (const e of msg.leaderboard) {
+        const tr = document.createElement("tr");
+        const td = (txt) => {
+          const cell = document.createElement("td");
+          cell.textContent = txt;
+          return cell;
+        };
+        tr.appendChild(td(shortId(e.player_id)));
+        tr.appendChild(td(e.mu.toFixed(1)));
+        tr.appendChild(td(e.sigma.toFixed(1)));
+        tr.appendChild(td(e.rating.toFixed(1)));
+        tbody.appendChild(tr);
+      }
+      break;
+    case "opponent_connected":
+      $("opp-p2p").textContent = "Opponent ready ✓";
+      log("sys", "opponent started");
+      break;
+    case "report_received":
+      const who = msg.reporting_player === state.playerId ? "You" : "Opponent";
+      const w = msg.winner === null ? "Draw"
+        : (msg.winner === state.playerId ? "Win (you)" : "Win (opponent)");
+      $("report-status").textContent = who + " reported: " + w;
+      log("sys", who + " reported: " + w);
+      if (msg.reporting_player === state.playerId) {
+        // The server stores one report per player per match — once ours is in,
+        // hide the buttons so a repeat can't be submitted from the UI.
+        $("btn-report-win").style.display = "none";
+        $("btn-report-loss").style.display = "none";
+        $("btn-report-draw").style.display = "none";
+      }
+      break;
+    case "match_expired":
+      setStatus("Match expired — no one accepted in time", "");
+      log("sys", "match expired — no one accepted in time");
+      showControls("connected");
+      stopGame();
+      state.matchToken = null;
+      break;
+    case "queue_expired":
+      setStatus("Removed from queue — no opponent found in time", "");
+      log("sys", "removed from queue (no heartbeat / no match found)");
+      showControls("connected");
+      stopGame();
+      $("q-wait").textContent = "—";
+      $("q-band").textContent = "—";
+      $("q-cands").textContent = "—";
+      $("q-size").textContent = "—";
+      break;
+    case "match_declined":
+      setStatus("Match declined", "");
+      showControls("connected");
+      stopGame();
+      state.matchToken = null;
+      state.gameType = null;
+      $("server-info").style.display = "none";
+      break;
+    case "game_server_ready":
+      $("server-info").textContent = "Server ready: " + msg.address
+        + (msg.join_token ? " (join token " + msg.join_token + ")" : "");
+      log("sys", "game server ready: " + msg.address);
+      setStatus("Playing on game server — awaiting result", "ok");
+      break;
+    case "game_server_error":
+      setStatus("Game server error: " + msg.message, "err");
+      log("sys", "game server error: " + msg.message);
+      break;
+    case "peer_input":
+      // The opponent's real input for `frame` — feed the rollback engine.
+      // `target` is a decimal string (bit-exact wire); parseFloat is exact.
+      if (state.session) state.session.remoteTarget(msg.frame, parseFloat(msg.target));
+      break;
+    case "webrtc_offer":
+      state.link?.handleSignal("offer", msg.sdp);
+      break;
+    case "webrtc_answer":
+      state.link?.handleSignal("answer", msg.sdp);
+      break;
+    case "webrtc_ice":
+      state.link?.handleIce(msg.candidate);
+      break;
+    case "match_result":
+      const o = msg.outcome;
+      clearStartCountdown();
+      state.holdUntilMs = null;
+      // The server stores and broadcasts ONE outcome, keyed to player_a's
+      // perspective (Win = player_a won, Loss = player_b won). The pong
+      // frames told us our side, so render OUR verdict — the two players must
+      // see opposite results. mu_change is only ours when we are player_a.
+      let txt;
+      if (o && typeof o === "object" && !o.Disputed) {
+        const kind = Object.keys(o)[0];
+        const muChange = o[kind] && o[kind].mu_change;
+        if (kind === "Forfeit") {
+          // Neither player started — double loss; both players see this.
+          txt = "Match forfeited" + (muChange !== undefined ? " (mu change " + muChange.toFixed(2) + ")" : "");
+        } else if (state.iAmPlayerA === undefined) {
+          // Manual-report flow: sides unknown, fall back to the raw outcome.
+          txt = kind + (muChange !== undefined ? " (mu change " + muChange.toFixed(2) + ")" : "");
+        } else if (kind === "Draw") {
+          txt = "Draw";
+        } else {
+          const iWon = (kind === "Win" && state.iAmPlayerA) || (kind === "Loss" && !state.iAmPlayerA);
+          txt = (iWon ? "You won" : "You lost")
+            + (state.iAmPlayerA && muChange !== undefined ? " (mu change " + muChange.toFixed(2) + ")" : "");
+        }
+      } else {
+        txt = o && o.Disputed ? "Match disputed" : String(o);
+      }
+      setStatus("Match resolved: " + txt, "ok");
+      log("sys", "match resolved: " + JSON.stringify(o));
+      showControls("connected");
+      state.matchToken = null;
+      state.gameType = null;
+      $("server-info").style.display = "none";
+      break;
+    case "match_started":
+      beginStartCountdown(msg.start_timeout_secs);
+      $("opp-p2p").textContent = "Waiting for opponent to start…";
+      break;
+    case "round_start":
+      // Referee froze the sim for the 3-2-1: hold rendering at the current
+      // frame (no stepping, no input send) until the hold expires.
+      state.holdUntilMs = performance.now() + msg.countdown_ticks * 33;
+      // The last frame the referee broadcasts while frozen (the hold spans
+      // frames `msg.frame + 1 .. msg.frame + countdown_ticks`; the ball
+      // launches at `+ 1` after that). Resume must wait until confirmed has
+      // reached it — the referee's final frozen broadcast can land a tick
+      // after the client-side timer fires, and jumping early would make the
+      // client step a frame the referee never steps.
+      state.holdEndFrame = (msg.frame ?? 0) + msg.countdown_ticks;
+      break;
+    case "game_state":
+      // The referee's authoritative frame (~30Hz). The CANVAS renders the
+      // local rollback sim (responsive to your input immediately); the score
+      // and speed displays come from the server (authoritative).
+      state.gameMode = "pong";
+      state.iAmPlayerA = state.playerId === msg.player_a;
+      if (!state.session) {
+        // First frame: create the local bit-exact sim + rollback session.
+        state.sim = new PongSim();
+        state.session = new RollbackSession({
+          sim: state.sim,
+          side: state.iAmPlayerA ? PongSide.Left : PongSide.Right,
+        });
+        state.lastPongAt = performance.now();
+        state.pongAcc = 0;
+        state.stalled = false;
+        if (!state.pongTimer) state.pongTimer = setInterval(pongLoop, 16);
+        // Create the WebRTC data channel for direct peer-to-peer inputs.
+        if (!state.link) {
+          const base = $("server-url").value.trim().replace(/\/+$/, "");
+          let iceServers = [];
+          try {
+            const resp = await fetch(base + "/internal/turn-credentials");
+            if (resp.ok) {
+              const body = await resp.json();
+              iceServers = [{ urls: body.uris, username: body.username, credential: body.password }];
+            } else {
+              log("sys", "TURN unavailable — host candidates only");
+            }
+          } catch {
+            log("sys", "TURN unavailable — host candidates only");
+          }
+          state.link = new WrtcLink({
+            role: state.iAmPlayerA ? "offer" : "answer",
+            iceServers,
+            sendSignal: (kind, payload) => send({ type: kind, match_token: state.matchToken, ...payload }),
+            onMessage: (m) => {
+              if (m.type === "game_input" && state.session) {
+                state.session.remoteTarget(m.frame, parseFloat(m.target));
+              }
+            },
+            onStateChange: (s) => {
+              log("sys", "WebRTC " + s);
+              if (s === "connected") log("sys", "inputs via data channel");
+            },
+          });
+          state.link.start();
+        }
+      }
+      state.session.setConfirmed(msg.frame);
+      // Round hold (3-2-1): the local sim is frozen and may not have a snapshot
+      // yet (round 0) — render the referee's authoritative frozen frame so the
+      // canvas shows the ball + paddles under the countdown instead of a black
+      // screen. Safe: the sim is identical every held frame.
+      if (state.holdUntilMs !== null) {
+        state.game = { left_y: msg.left_y, right_y: msg.right_y, ball_x: msg.ball_x, ball_y: msg.ball_y };
+      }
+      // Local desync check — meaningful only when no rollback is pending for
+      // this frame: a prediction that hasn't been replayed yet legitimately
+      // differs from the server. A persistent divergence with no pending
+      // rollback is a real bug → loud log.
+      const localCksum = state.session.checksumAt(msg.frame);
+      const rollbackPending = state.session.minIncorrect !== null
+        && msg.frame >= state.session.minIncorrect;
+      if (localCksum !== null && !rollbackPending && localCksum !== BigInt(msg.checksum)) {
+        log("sys", `desync at frame ${msg.frame} (server: ${msg.checksum}, local: ${localCksum})`);
+      }
+      const iAmLeft = state.iAmPlayerA;
+      const myScore = iAmLeft ? msg.left_score : msg.right_score;
+      const oppScore = iAmLeft ? msg.right_score : msg.left_score;
+      $("game-status").textContent = "You " + myScore + " – " + oppScore
+        + " Opponent — ball speed ×" + (msg.speed / BALL_SPEED0).toFixed(2);
+      break;
+    case "input_ack":
+      if (state.session) {
+        state.session.setConfirmed(msg.frame);
+        // Server RTT: measure the game_input → input_ack round trip (the real
+        // gameplay path — network + the referee's 33ms tick).
+        const sentAt = pendingAcks.get(msg.frame);
+        if (sentAt !== undefined) { serverRtt = performance.now() - sentAt; pendingAcks.delete(msg.frame); }
+        // Referee health check: report the settled checksum for the confirmed
+        // frame. Skip while a rollback is pending — the local engine is
+        // converging on its own; a real (unfixable) divergence is reported on
+        // the next settled frame.
+        const pending = state.session.minIncorrect !== null
+          && msg.frame >= state.session.minIncorrect;
+        const cksum = state.session.checksumAt(msg.frame);
+        if (cksum !== null && !pending) {
+          send({
+            type: "rollback_health",
+            match_token: state.matchToken,
+            frame: msg.frame,
+            checksum: cksum.toString(),
+          });
+        }
+      }
+      break;
+    case "rollback_resync":
+      if (state.session) {
+        state.session.restore(msg.frame, hexToBytes(msg.state));
+        log("sys", `resynced to frame ${msg.frame}`);
+      }
+      break;
+    case "game_over":
+      stopGame(); // stop both rAF loops; the canvas keeps the final frame
+      $("game-status").textContent = msg.winner === state.playerId ? "You win!" : "You lose";
+      break;
+    case "error":
+      if (msg.code === "invalid_report") {
+        // A rejected (e.g. duplicate) report: log it, don't yank a mid-match
+        // player back to the connected panel.
+        log("sys", msg.message);
+        break;
+      }
+      setStatus("Error: " + msg.message, "err");
+      showControls("connected");
+      break;
+    case "rps_begin":
+      // Switch the game area to the RPS panel (the pong canvas is unused here).
+      stopGame();
+      state.gameMode = "rps";
+      $("pong").style.display = "none";
+      $("rps-panel").style.display = "";
+      state.iAmPlayerA = state.playerId === msg.player_a;
+      state.rpsRound = msg.round;
+      state.rpsChosen = false;
+      setRpsButtons(true);
+      $("rps-status").textContent = "Round " + (msg.round + 1) + " — choose!";
+      // Keep the cumulative score across rounds; only round 0 starts at 0-0.
+      if (msg.round === 0) $("rps-score").textContent = "You 0 – 0 Opponent";
+      log("sys", `rps round ${msg.round} open (${msg.timeout_ms}ms window)`);
+      break;
+    case "rps_round": {
+      clearInterval(state.rpsTimer);
+      state.rpsTimer = null;
+      const mine = state.iAmPlayerA ? msg.a_choice : msg.b_choice;
+      const theirs = state.iAmPlayerA ? msg.b_choice : msg.a_choice;
+      const myScore = state.iAmPlayerA ? msg.a_score : msg.b_score;
+      const oppScore = state.iAmPlayerA ? msg.b_score : msg.a_score;
+      $("rps-score").textContent = "You " + myScore + " – " + oppScore + " Opponent";
+      setRpsButtons(false);
+      if (mine === 255 || theirs === 255) {
+        const who = mine === 255 ? "You" : "The opponent";
+        $("rps-status").textContent = who + " didn't choose" +
+          (msg.winner === state.playerId ? " — you win the round!" : " — round lost.");
+      } else {
+        const face = [["✊", "rock"], ["✋", "paper"], ["✌", "scissors"]];
+        const myTxt = face[mine][0] + " " + face[mine][1];
+        const oppTxt = face[theirs][0] + " " + face[theirs][1];
+        const verdict = msg.winner === null ? "Draw!"
+          : msg.winner === state.playerId ? "You win the round!"
+          : "Opponent wins the round.";
+        $("rps-status").textContent = "You: " + myTxt + " · Opp: " + oppTxt + " — " + verdict;
+      }
+      log("sys", `rps round ${msg.round}: a=${msg.a_choice} b=${msg.b_choice} winner=${msg.winner} score ${msg.a_score}-${msg.b_score}`);
+      break;
+    }
+    case "game_over":
+      stopGame(); // stop both rAF loops; the canvas keeps the final frame
+      clearInterval(state.rpsTimer);
+      state.rpsTimer = null;
+      setRpsButtons(false);
+      if (state.gameMode === "rps") {
+        $("rps-status").textContent = msg.winner === state.playerId
+          ? "You win the match!" : "You lose the match.";
+      }
+      $("game-status").textContent = msg.winner === state.playerId ? "You win!" : "You lose";
+      break;
+  }
+}
+// ── Rock Paper Scissors ──
+function setRpsButtons(enabled) {
+  for (const b of document.querySelectorAll(".rps-btn")) {
+    b.disabled = !enabled;
+  }
+}
+for (const b of document.querySelectorAll(".rps-btn")) {
+  b.addEventListener("click", () => {
+    if (!state.matchToken || state.rpsChosen || b.disabled) return;
+    state.rpsChosen = true;
+    setRpsButtons(false);
+    $("rps-status").textContent = "You threw — waiting for the opponent…";
+    clearInterval(state.rpsTimer);
+    state.rpsTimer = null;
+    send({ type: "rps_choice", match_token: state.matchToken, choice: parseInt(b.dataset.choice, 10) });
+  });
+}
+// ── Pong game ──
+const PONG_H = 400; // canvas height, px
+const PADDLE_H = 0.08, PADDLE_X_L = 0.03, PADDLE_X_R = 0.97;
+const BALL_SPEED0 = 0.9; // only for the speed display; the sim lives in PongSim
+const pongCtx = $("pong").getContext("2d");
+
+function startPractice() {
+  state.gameMode = "practice";
+  state.sim = new PongSim({ scoring: false });
+  // The RPS panel is per-match: back to the pong canvas when (re)queueing.
+  $("rps-panel").style.display = "none";
+  $("pong").style.display = "";
+  $("game-status").textContent = "Practice — waiting for opponent";
+  if (!state.practiceTimer) {
+    state.lastPracticeAt = performance.now();
+    state.practiceTimer = setInterval(practiceLoop, 16);
+  }
+}
+function practiceLoop() {
+  // setInterval (not rAF): a hidden tab fully pauses rAF, which would freeze
+  // the sim; interval-based loops degrade to ~1Hz hidden instead.
+  if (state.gameMode !== "practice") { clearInterval(state.practiceTimer); state.practiceTimer = null; return; }
+  const t = performance.now();
+  const dt = Math.min(0.05, (t - state.lastPracticeAt) / 1000);
+  state.lastPracticeAt = t;
+  const sim = state.sim;
+  sim.setTarget(PongSide.Left, state.inputTarget);
+  sim.setTarget(PongSide.Right, sim.snapshot().ball_y); // AI tracks the ball
+  sim.step(dt);
+  state.game = sim.snapshot();
+  renderFrame();
+}
+function pongLoop() {
+  // setInterval (not rAF): see practiceLoop — hidden tabs must keep stepping.
+  if (state.gameMode !== "pong") { clearInterval(state.pongTimer); state.pongTimer = null; return; }
+  // Round hold (3-2-1): freeze stepping AND input sends until the server's
+  // hold expires — the referee is broadcasting unchanged frames; advancing
+  // locally would desync the sims.
+  if (state.session && state.holdUntilMs !== null) {
+    // Expire only once the timer elapsed AND confirmed caught up to the last
+    // frozen frame — BUT bounded by a short grace: the referee's final
+    // broadcast can arrive a tick late, yet if it never arrives (dropped WS
+    // message), waiting forever would deadlock the match (no inputs sent, the
+    // referee's gate stalls). After the grace, resume with skipTo(confirmed);
+    // a one-frame lag is absorbed by the rollback engine.
+    const late = performance.now() - state.holdUntilMs;
+    if (late < 0 || (state.session.confirmed < state.holdEndFrame && late < 300)) {
+      if (state.game) renderFrame(); // countdown overlay only
+      return;
+    }
+    // Hold over: the referee resumed at confirmed + 1 — jump the local frame
+    // counter (sim unchanged: the held frames were identical) so the next
+    // step/send targets exactly the referee's frame. Without this the client
+    // replays ~90 frozen frames at ~30fps and the referee's input gate
+    // (`left_inputs.back().frame >= next`) stalls silently for ~3s.
+    state.session.skipTo(state.session.confirmed);
+    state.holdUntilMs = null;
+  }
+  const t = performance.now();
+  state.pongAcc += Math.min(0.05, (t - state.lastPongAt) / 1000);
+  state.lastPongAt = t;
+  const DT = 33 / 1000;
+  while (state.session && state.pongAcc >= DT && !state.stalled) {
+    state.pongAcc -= DT;
+    const session = state.session;
+    // My real input for the next frame: apply locally AND send to the
+    // server (per-frame sends are ~360 B/s — no deadband/throttle needed).
+    // The target travels as its shortest round-trip decimal string — JS
+    // Number and Rust str::parse round-trip exactly; serde_json's f64 parser
+    // is not (off by 1 ULP for some values).
+    const frame = session.frame + 1;
+    session.localTarget(frame, state.inputTarget);
+    send({ type: "game_input", match_token: state.matchToken, frame, target: state.inputTarget.toString() });
+    state.link?.send({ type: "game_input", frame, target: state.inputTarget.toString() });
+    pendingAcks.set(frame, performance.now());
+    if (pendingAcks.size > 900) {
+      const now = performance.now();
+      for (const [f, t] of pendingAcks) if (now - t > 2000) pendingAcks.delete(f);
+    }
+    const result = session.step();
+    state.stalled = result.stalled;
+    if (result.snapshot) state.game = result.snapshot;
+    if (result.rolledBack) log("sys", "rolled back to correct trajectory");
+  }
+  if (state.game) renderFrame();
+}
+function renderFrame() {
+  const g = state.game;
+  if (!g) return;
+  const w = 640, h = PONG_H;
+  pongCtx.fillStyle = "#0a0a0a";
+  pongCtx.fillRect(0, 0, w, h);
+  pongCtx.strokeStyle = "#333";
+  pongCtx.beginPath();
+  pongCtx.moveTo(w / 2, 0); pongCtx.lineTo(w / 2, h);
+  pongCtx.stroke();
+  pongCtx.fillStyle = "#eee";
+  pongCtx.fillRect(PADDLE_X_L * w - 2, (g.left_y - PADDLE_H) * h, 4, PADDLE_H * 2 * h);
+  pongCtx.fillRect(PADDLE_X_R * w - 2, (g.right_y - PADDLE_H) * h, 4, PADDLE_H * 2 * h);
+  pongCtx.beginPath();
+  pongCtx.arc(g.ball_x * w, g.ball_y * h, 6, 0, Math.PI * 2);
+  pongCtx.fill();
+  // 3-2-1 countdown overlay (server round hold).
+  if (state.holdUntilMs !== null) {
+    const remaining = state.holdUntilMs - performance.now();
+    const n = Math.ceil(remaining / 1000);
+    if (n > 0 && n <= 3) {
+      pongCtx.fillStyle = "#fff";
+      pongCtx.font = "bold 64px ui-monospace, monospace";
+      pongCtx.textAlign = "center"; pongCtx.textBaseline = "middle";
+      pongCtx.fillText(String(n), w / 2, h / 2);
+    }
+  }
+}
+function stopGame() {
+  state.gameMode = "off";
+  state.game = null;
+  state.sim = null;
+  state.session = null;
+  state.stalled = false;
+  state.holdUntilMs = null;
+  state.holdEndFrame = 0;
+  clearStartCountdown();
+  clearInterval(state.practiceTimer);
+  state.practiceTimer = null;
+  clearInterval(state.pongTimer);
+  state.pongTimer = null;
+  clearInterval(state.rpsTimer);
+  state.rpsTimer = null;
+  if (state.link) { state.link.close(); state.link = null; }
+}
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+function computeTargetFromEvent(e) {
+  const y = e.offsetY / PONG_H;
+  state.inputTarget = Math.max(0, Math.min(1, y));
+}
+addEventListener("keydown", (e) => {
+  const step = 0.08;
+  if (e.key === "ArrowDown" || e.key === "s" || e.key === "S") state.inputTarget = Math.min(1, state.inputTarget + step);
+  else if (e.key === "ArrowUp" || e.key === "w" || e.key === "W") state.inputTarget = Math.max(0, state.inputTarget - step);
+});
+$("pong").addEventListener("mousemove", computeTargetFromEvent);
+$("btn-queue").addEventListener("click", () => {
+  send({ type: "begin_matchmaking", mode: $("mode").value, difficulty: $("difficulty").value });
+  setStatus("Queueing…", "");
+  showControls("queueing");
+  startPractice();
+  $("q-wait").textContent = "waiting…";
+  $("q-band").textContent = "—";
+  $("q-cands").textContent = "—";
+  $("q-size").textContent = "—";
+  $("q-mu").textContent = "—";
+  $("q-sigma").textContent = "—";
+  $("q-rating").textContent = "—";
+  document.querySelector("#leaderboard tbody").innerHTML = "";
+});
+$("btn-cancel").addEventListener("click", () => {
+  send({ type: "cancel_matchmaking" });
+  setStatus("Connected", "ok");
+  showControls("connected");
+});
+$("btn-accept").addEventListener("click", () => {
+  send({ type: "accept_match", match_token: state.matchToken });
+  log("sys", "match accepted — START when your transport is up");
+  showControls("inmatch");
+  // Reset the in-match panel so a previous game's state never leaks in.
+  // btn-start stays HIDDEN + disabled here: match_started reveals it only
+  // once BOTH players accepted (an early click could never form the game).
+  $("btn-start").style.display = "none";
+  $("btn-start").disabled = true;
+  $("server-info").style.display = "none";
+  $("btn-report-win").style.display = "none";
+  $("btn-report-loss").style.display = "none";
+  $("btn-report-draw").style.display = "none";
+  $("opp-p2p").textContent = "Waiting for opponent to start…";
+  $("report-status").textContent = "—";
+});
+$("btn-decline").addEventListener("click", () => {
+  send({ type: "decline_match", match_token: state.matchToken });
+  setStatus("Match declined", "");
+  log("sys", "match declined");
+  showControls("connected");
+  state.matchToken = null;
+  state.gameType = null;
+  $("server-info").style.display = "none";
+});
+$("btn-start").addEventListener("click", () => {
+  clearStartCountdown();
+  send({ type: "start_match", match_token: state.matchToken });
+  $("btn-start").style.display = "none";
+  $("opp-p2p").textContent = "Waiting for opponent to start…";
+  // No report buttons for p2p: the server-authoritative pong game decides the
+  // winner and auto-resolves the match. (They stay hidden in the HTML and
+  // remain the fallback if the server runs with LOBBY_PONG=false.)
+});
+$("btn-report-win").addEventListener("click", () => {
+  send({ type: "match_report", match_token: state.matchToken, winner: state.playerId, demo_hash: "web-demo" });
+});
+$("btn-report-loss").addEventListener("click", () => {
+  // Winner is the opponent.
+  send({ type: "match_report", match_token: state.matchToken, winner: state.opponentId, demo_hash: "web-demo" });
+});
+$("btn-report-draw").addEventListener("click", () => {
+  send({ type: "match_report", match_token: state.matchToken, winner: null, demo_hash: "web-demo" });
+});
+
+
+// A Steam login redirected back with a #token= fragment — complete the
+// sign-in automatically so the user lands signed in instead of having to
+// click Connect again. (All handlers above are registered by now.)
+if (fragmentToken) {
+  $("btn-connect").click();
+}
+</script>
+</body>
+</html>

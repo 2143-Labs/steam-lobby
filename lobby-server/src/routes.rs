@@ -1,82 +1,53 @@
-//! HTTP surface: health + embedded single-file app, the read-only stats API
-//! (leaderboard + player profile), Steam OpenID login/callback, ticket auth,
-//! logout, the internal gameserver result webhook, and the dev-only
-//! test-token + mock creator endpoints.
+//! HTTP surface: health + embedded demo index, Steam OpenID login/callback,
+//! ticket auth, logout, the internal gameserver result webhook, and the
+//! dev-only test-token + mock creator endpoints.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::state::{AppState, OpenIdState};
 use lobby_core::traits::{MatchStore, PlayerStore};
 
-// ── stats API response types (snake_case on the wire, mirror of web/app/src/types.ts) ──
-
-#[derive(Serialize)]
-pub struct LeaderboardRow {
-    pub player_id: String,
-    pub display_name: String,
-    pub mu: f64,
-    pub sigma: f64,
-    pub rating: f64, // mu - 3*sigma, the display/matchmaking value
-}
-
-#[derive(Serialize)]
-pub struct PlayerIdentity {
-    pub provider: String,
-    pub last_login_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Serialize)]
-pub struct PlayerRating {
-    pub game_mode: String,
-    pub mu: f64,
-    pub sigma: f64,
-    pub rating: f64,
-    pub last_updated: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Serialize)]
-pub struct RecentMatch {
-    pub match_token: String,
-    pub game_mode: String,
-    pub status: String,
-    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub opponent_id: String,
-    pub opponent_name: String,
-    /// The viewer's perspective (flipped from the stored player_a perspective).
-    pub outcome: Option<String>,
-    pub mu_change: Option<f64>,
-}
-
-#[derive(Serialize)]
-pub struct PlayerProfile {
-    pub player_id: String,
-    pub display_name: String,
-    pub primary_provider: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub identities: Vec<PlayerIdentity>,
-    pub ratings: Vec<PlayerRating>,
-    pub recent_matches: Vec<RecentMatch>,
-}
-
 pub async fn health() -> &'static str {
     "ok"
 }
 
-/// The built single-file app (`web/app/dist/index.html`), embedded at build
-/// time so it works from any CWD and inside the Docker image.
+/// The zero-dependency browser demo (`web/index.html`), embedded at build time
+/// so it works from any CWD and inside the Docker image.
 pub async fn index() -> Html<&'static str> {
-    Html(include_str!("../../web/app/dist/index.html"))
+    Html(include_str!("../../web/index.html"))
 }
 
+/// The rollback sim module (`web/pong-sim.mjs`), embedded and served as JS so
+/// the demo's `<script type="module">` can import it from the same origin.
+pub async fn pong_sim() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript")],
+        include_str!("../../web/pong-sim.mjs"),
+    )
+}
 
+/// The rollback session module (`web/pong-rollback.mjs`), same treatment.
+pub async fn pong_rollback() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript")],
+        include_str!("../../web/pong-rollback.mjs"),
+    )
+}
+
+/// The WebRTC glue module (`web/pong-wrtc.mjs`), embedded and served as JS.
+pub async fn pong_wrtc() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript")],
+        include_str!("../../web/pong-wrtc.mjs"),
+    )
+}
 
 #[derive(Deserialize)]
 pub struct LoginQuery {
@@ -932,156 +903,6 @@ pub async fn modes(State(state): State<Arc<AppState>>) -> Json<serde_json::Value
     Json(
         serde_json::json!({ "modes": state.game_modes.iter().map(|(n, t)| ModeInfo { name: n.clone(), game_type: *t }).collect::<Vec<_>>() }),
     )
-}
-
-/// GET /api/leaderboard/{game_mode} — all rated players for a mode, ordered
-/// by rating (mu - 3*sigma). 404 for an unknown game_mode.
-pub async fn api_leaderboard(
-    State(state): State<Arc<AppState>>,
-    Path(game_mode): Path<String>,
-) -> Response {
-    let known = state.game_modes.iter().any(|(n, _)| n == &game_mode);
-    if !known {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": format!("unknown game_mode: {game_mode}") })),
-        )
-            .into_response();
-    }
-    match state.store.leaderboard_with_names(&game_mode).await {
-        Ok(rows) => Json(
-            rows.into_iter()
-                .map(|(player_id, display_name, mu, sigma)| LeaderboardRow {
-                    player_id: player_id.to_string(),
-                    display_name,
-                    mu,
-                    sigma,
-                    rating: mu - 3.0 * sigma,
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Err(e) => {
-            tracing::error!("leaderboard query failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal" })),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// GET /api/player/{player_id} — profile: linked accounts (provider + last
-/// login only, never the provider_uid), per-game ratings, and recent match
-/// history with outcomes in the viewer's perspective. 404 for an unknown id.
-pub async fn api_player(
-    State(state): State<Arc<AppState>>,
-    Path(player_id): Path<String>,
-) -> Response {
-    let Ok(user_id) = player_id.parse::<uuid::Uuid>() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "unknown player" })),
-        )
-            .into_response();
-    };
-    let Ok(Some((display_name, primary_provider, created_at))) =
-        state.store.player_profile(user_id).await
-    else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "unknown player" })),
-        )
-            .into_response();
-    };
-
-    let identities = match state.store.user_identities(user_id).await {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|(provider, last_login_at)| PlayerIdentity {
-                provider,
-                last_login_at,
-            })
-            .collect(),
-        Err(e) => {
-            tracing::error!("identities query failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal" })),
-            )
-                .into_response();
-        }
-    };
-    let ratings = match state.store.all_ratings_for_user(user_id).await {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|(game_mode, mu, sigma, last_updated)| PlayerRating {
-                game_mode,
-                mu,
-                sigma,
-                rating: mu - 3.0 * sigma,
-                last_updated,
-            })
-            .collect(),
-        Err(e) => {
-            tracing::error!("ratings query failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal" })),
-            )
-                .into_response();
-        }
-    };
-    let recent_matches = match state.store.recent_matches_for_user(user_id, 20).await {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|m| {
-                // The stored outcome is player_a-perspective; flip when the
-                // viewer was player_b (Win↔Loss), and use their mu change.
-                let (outcome, mu_change) = if m.player_b == user_id {
-                    let flipped = match m.outcome.as_deref() {
-                        Some("Win") => Some("Loss".to_string()),
-                        Some("Loss") => Some("Win".to_string()),
-                        other => other.map(str::to_string),
-                    };
-                    (flipped, m.mu_change_b)
-                } else {
-                    (m.outcome, m.mu_change_a)
-                };
-                RecentMatch {
-                    match_token: m.match_token,
-                    game_mode: m.game_mode,
-                    status: m.status,
-                    started_at: m.started_at,
-                    ended_at: m.ended_at,
-                    opponent_id: m.opponent_id.to_string(),
-                    opponent_name: m.opponent_name,
-                    outcome,
-                    mu_change,
-                }
-            })
-            .collect(),
-        Err(e) => {
-            tracing::error!("recent matches query failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal" })),
-            )
-                .into_response();
-        }
-    };
-
-    Json(PlayerProfile {
-        player_id: player_id.clone(),
-        display_name,
-        primary_provider,
-        created_at,
-        identities,
-        ratings,
-        recent_matches,
-    })
-    .into_response()
 }
 
 /// Auth surface capabilities the demo uses to gate its login UI:

@@ -5,5 +5,3 @@ justfile
 .env.example
 .env
 shell.nix
-/web/app/dist
-/web/app/node_modules

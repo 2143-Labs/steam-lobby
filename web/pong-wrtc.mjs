@@ -35,12 +35,6 @@ export class WrtcLink {
   /** Returns a promise so tests can await signal delivery. */
   start() {
     if (this.pc) return;
-    // Feature-detect: a WebRTC-less browser (or SSR) must never throw from
-    // `new RTCPeerConnection`. Callers fall back to the ws relay.
-    if (typeof RTCPeerConnection === "undefined") {
-      this._onStateChange?.("unsupported");
-      return;
-    }
     this.pc = new RTCPeerConnection({ iceServers: this._iceServers });
     this.pc.onicecandidate = (e) => {
       if (e.candidate) {
