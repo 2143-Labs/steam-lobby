@@ -308,3 +308,54 @@ impl MatchStore for PostgresStore {
         tx.commit().await.map_err(map_db_error)
     }
 }
+
+/// One row for the player page's recent-matches table. `outcome` is the raw
+/// stored value (player_a perspective, null when the match has no result
+/// yet); the route handler flips it to the viewer's perspective.
+#[derive(sqlx::FromRow)]
+pub struct RecentMatchRow {
+    pub match_token: String,
+    pub game_mode: String,
+    pub status: String,
+    pub player_a: uuid::Uuid,
+    pub player_b: uuid::Uuid,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub outcome: Option<String>,
+    pub mu_change_a: Option<f64>,
+    pub mu_change_b: Option<f64>,
+    pub opponent_id: uuid::Uuid,
+    pub opponent_name: String,
+}
+
+impl PostgresStore {
+    /// The player's most recent matches (newest first), each joined with its
+    /// result row (LEFT JOIN — unresolved matches have null outcome) and the
+    /// opponent's identity for display.
+    pub async fn recent_matches_for_user(
+        &self,
+        user_id: uuid::Uuid,
+        limit: i64,
+    ) -> Result<Vec<RecentMatchRow>> {
+        let rows = sqlx::query_as::<_, RecentMatchRow>(
+            "SELECT m.match_token, m.game_mode, m.status, m.player_a, m.player_b, \
+                    m.created_at, m.started_at, m.ended_at, \
+                    r.outcome, r.mu_change_a, r.mu_change_b, \
+                    CASE WHEN m.player_a = $1 THEN m.player_b ELSE m.player_a END AS opponent_id, \
+                    COALESCE(u2.display_name, '') AS opponent_name \
+             FROM matches m \
+             LEFT JOIN match_results r ON r.match_token = m.match_token \
+             LEFT JOIN users u2 ON u2.id = CASE WHEN m.player_a = $1 THEN m.player_b ELSE m.player_a END \
+             WHERE m.player_a = $1 OR m.player_b = $1 \
+             ORDER BY m.created_at DESC \
+             LIMIT $2",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_db_error)?;
+        Ok(rows)
+    }
+}

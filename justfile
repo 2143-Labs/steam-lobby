@@ -6,8 +6,16 @@ has_nix := `if command -v nix-shell >/dev/null 2>&1; then echo 1; fi`
 nix := if has_nix == "1" { "nix-shell shell.nix --run " } else { "" }
 
 
-# build all crates
-build:
+# Build the vite frontend (the server embeds web/app/dist/index.html — the
+# Dockerfile does this automatically, local cargo builds need it present).
+frontend-build:
+  cd web/app && npm run build
+
+frontend-dev:
+  cd web/app && npm run dev
+
+# build all crates (frontend dist must exist — run frontend-build first locally)
+build: frontend-build
   {{nix}}"cargo build --workspace"
 
 test:
