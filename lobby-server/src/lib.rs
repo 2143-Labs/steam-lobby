@@ -282,10 +282,11 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
             "/auth/{provider}/callback",
             get(routes::auth_callback),
         )
-        .route("/pong-wrtc.mjs", get(routes::pong_wrtc))
         .route("/", get(routes::index))
-        .route("/pong-sim.mjs", get(routes::pong_sim))
-        .route("/pong-rollback.mjs", get(routes::pong_rollback))
+        .route("/leaderboard/{game_mode}", get(routes::index))
+        .route("/player/{player_id}", get(routes::index))
+        .route("/api/leaderboard/{game_mode}", get(routes::api_leaderboard))
+        .route("/api/player/{player_id}", get(routes::api_player))
         .route("/health", get(routes::health))
         .route("/modes", get(routes::modes))
         .route("/auth/config", get(routes::auth_config))

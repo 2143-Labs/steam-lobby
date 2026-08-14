@@ -4,3 +4,7 @@
 .direnv/
 
 web/test/.js-hashes.json
+
+# vite frontend build artifacts
+/web/app/dist
+/web/app/node_modules
