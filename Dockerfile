@@ -1,3 +1,18 @@
+# Stage indices below are load-bearing: buildah 5.8.x on the build machines
+# cannot forward-reference a named stage in `COPY --from=` ("no stage or image
+# found with that name") AND truncates a stage to just its FROM when a stage
+# is defined before it. The verified-working layout is: frontend first
+# (index 0), builder second (index 1) referencing it via `--from=0`, scratch
+# last. Do not reorder or rename stages without re-verifying a full build.
+FROM docker.io/library/node:24-alpine AS frontend
+# The vite build resolves the shared game modules via ../../../ (web/), so
+# the whole web/ tree must be present at /app/web — not just web/app/.
+WORKDIR /app/web/app
+COPY web/app/package.json web/app/package-lock.json ./
+RUN npm ci
+COPY web/ /app/web/
+RUN npm run build   # tsc -b && vite build -> dist/index.html (single file)
+
 FROM rust:1.97.1-alpine AS builder
 # protoc (protobuf) + well-known-type proto includes (protobuf-dev):
 # temporalio-prost / prost-wkt-types compile proto files at build time —
@@ -33,19 +48,22 @@ RUN mkdir -p lobby-core/src lobby-macros/src lobby-client/src lobby-server/src \
 # than the real sources and cargo would skip recompiling — shipping the stub
 # binary. Touching the sources forces the lobby-* crates to rebuild, while
 # external deps (in /usr/local/cargo, untouched) stay cached.
+# `--from=0` = the frontend stage above (numeric: named forward refs fail on
+# buildah 5.8.x). dist/ is gitignored, so `COPY . .` never brings it.
 COPY . .
+COPY --from=0 /app/web/app/dist/index.html /app/web/app/dist/index.html
 RUN find lobby-core lobby-macros lobby-client lobby-server -name '*.rs' -exec touch {} + \
  && cargo build --release -p lobby-server
 
 FROM scratch
-COPY --from=builder /app/target/release/lobby-server /usr/local/bin/lobby-server
-COPY --from=builder /app/lobby-server/migrations /migrations
+COPY --from=1 /app/target/release/lobby-server /usr/local/bin/lobby-server
+COPY --from=1 /app/lobby-server/migrations /migrations
 # rustls bundles webpki-roots, so the binary works without these — kept as
 # belt-and-braces for any future rustls-native-certs use.
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=1 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 # scratch has no users; the app user from the builder lets USER app resolve.
-COPY --from=builder /etc/passwd /etc/passwd
-COPY --from=builder /etc/group /etc/group
+COPY --from=1 /etc/passwd /etc/passwd
+COPY --from=1 /etc/group /etc/group
 USER app
 EXPOSE 8080
 # No HEALTHCHECK: scratch has no shell; the k8s Deployment probes /health already.

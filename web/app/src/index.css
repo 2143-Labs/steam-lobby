@@ -1,0 +1,58 @@
+/* Port of the demo's inline styles (web/index.html:10-46) + small additions
+   for the stats pages and nav. */
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  max-width: 720px; margin: 2rem auto; padding: 0 1rem;
+  background: #111; color: #ddd;
+}
+h1 { font-size: 1.2rem; }
+h2 { font-size: 1.1rem; }
+h3 { font-size: 0.95rem; color: #aaa; margin: 1rem 0 0.25rem; }
+section { border: 1px solid #333; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+nav { margin: 1rem 0; }
+label { display: block; margin: 0.5rem 0 0.25rem; font-size: 0.8rem; color: #aaa; }
+input, select, button {
+  font: inherit; padding: 0.4rem 0.6rem; border-radius: 6px;
+  border: 1px solid #555; background: #1c1c1c; color: #eee;
+}
+button { cursor: pointer; margin-right: 0.4rem; margin-top: 0.25rem; }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button.primary, a.primary { background: #2d6a4f; border-color: #2d6a4f; }
+a.primary {
+  display: inline-block; font: inherit; line-height: normal; box-sizing: border-box;
+  padding: 0.4rem 0.6rem; border-radius: 6px; border: 1px solid #2d6a4f; background: #2d6a4f;
+  color: #eee; text-decoration: none; cursor: pointer; margin-right: 0.4rem;
+}
+a { color: #7fb3ff; }
+#status { font-weight: bold; }
+#status.ok { color: #74c69d; }
+#status.err { color: #e76f51; }
+#opponent { color: #74c69d; }
+#log {
+  height: 240px; overflow-y: auto; background: #0a0a0a; border: 1px solid #333;
+  border-radius: 6px; padding: 0.5rem; font-size: 0.75rem; white-space: pre-wrap;
+  word-break: break-all;
+}
+#pong {
+  border: 1px solid #333; border-radius: 6px; width: 100%; height: auto;
+  background: #0a0a0a; touch-action: none;
+}
+#game-status { font-size: 0.8rem; color: #aaa; margin: 0.5rem 0 0; }
+#rps-buttons { display: flex; gap: 0.75rem; margin: 0.75rem 0; justify-content: center; }
+.rps-btn {
+  font-size: 2rem; padding: 0.75rem 1.25rem; border-radius: 8px;
+  background: #1c1c1c; border: 1px solid #444; cursor: pointer;
+}
+.rps-btn:hover:not(:disabled) { border-color: #7fb3ff; }
+.rps-btn:disabled { opacity: 0.45; cursor: default; }
+#rps-panel { text-align: center; }
+#rps-status { font-size: 1.1rem; margin: 0.5rem 0 0.25rem; }
+#rps-score { font-size: 0.9rem; color: #aaa; margin: 0.25rem 0 0.5rem; }
+.in { color: #7fb3ff; } .out { color: #ffd28f; } .sys { color: #888; }
+.ok { color: #74c69d; }
+.err { color: #e76f51; }
+table { border-collapse: collapse; width: 100%; margin: 0.5rem 0; }
+th, td { text-align: left; padding: 0.25rem 0.5rem; border-bottom: 1px solid #2a2a2a; font-size: 0.85rem; }
+th { color: #aaa; font-weight: normal; }
