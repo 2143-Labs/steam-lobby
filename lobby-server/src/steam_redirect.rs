@@ -47,47 +47,35 @@ pub async fn steam_redirect(Path(rest): Path<String>) -> Response {
         .into_response()
 }
 
-/// Interstitial shown before handing off to the Steam client. The
-/// `__STEAM_URI__` placeholder appears exactly three times (button href,
-/// visible `<code>`, auto-launch script) and `.replace` swaps all three. The
-/// relative "Back to home" link keeps this page working on pvp.john2143.com
-/// and the pvp-{N}.john2143.com PR previews alike.
+/// Interstitial shown before handing off to the Steam client: a Steam-styled
+/// page with a single Join button. The `__STEAM_URI__` placeholder appears
+/// once (the button href) and `.replace` swaps it.
 const INTERSTITIAL: &str = r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Opening Steam…</title>
+<title>Join the Steam lobby</title>
 <style>
   :root { color-scheme: dark; }
   body { margin: 0; min-height: 100vh; display: grid; place-items: center;
-         background: #0f1115; color: #e6e8ee;
-         font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  .card { max-width: 32rem; text-align: center; padding: 2rem; }
-  h1 { font-size: 1.4rem; margin: 0 0 1rem; }
-  p { color: #9aa1ad; line-height: 1.5; }
-  code { color: #c9d1de; word-break: break-all; }
-  a.btn { display: inline-block; margin: 1rem 0; padding: 0.7rem 1.6rem;
-          background: #1b6ac9; color: #fff; border-radius: 8px;
-          text-decoration: none; font-weight: 600; }
-  a.btn:hover { background: #2a7de0; }
-  a.home { color: #9aa1ad; font-size: 0.85rem; }
+         background: #171a21; color: #c7d5e0;
+         font-family: "Motiva Sans", Arial, Helvetica, sans-serif; }
+  .card { text-align: center; padding: 2rem; }
+  h1 { color: #ffffff; font-size: 1.4rem; font-weight: 400;
+       letter-spacing: 0.03em; margin: 0 0 2rem; }
+  a.btn { display: inline-block; padding: 0.8rem 3.5rem; border-radius: 2px;
+          background: linear-gradient(to bottom, #75b022, #588a1b);
+          color: #ffffff; font-size: 1.1rem; text-decoration: none;
+          text-shadow: 0 1px 0 rgba(0, 0, 0, 0.4); }
+  a.btn:hover { filter: brightness(1.1); }
 </style>
 </head>
 <body>
   <main class="card">
-    <h1>Opening Steam…</h1>
-    <p>If Steam does not open, click the button — most browsers only allow a
-       click to hand off to another application.</p>
-    <a class="btn" href="__STEAM_URI__">Open in Steam</a>
-    <p><code>__STEAM_URI__</code></p>
-    <p><a class="home" href="/">Back to home</a></p>
+    <h1>Join the Steam lobby</h1>
+    <a class="btn" href="__STEAM_URI__">Join</a>
   </main>
-  <script>
-    // Auto-attempt the hand-off shortly after paint; the button above is the
-    // reliable user-gesture fallback if the browser blocks this navigation.
-    window.setTimeout(function () { window.location.href = "__STEAM_URI__"; }, 500);
-  </script>
 </body>
 </html>"#;
 
