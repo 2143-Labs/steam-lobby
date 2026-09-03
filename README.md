@@ -90,6 +90,7 @@ need a POSIX shell. Use WSL2 or Git Bash, or run the server directly:
 | POST | `/auth/guest` | Fresh identity-less account -> JWT (rate-limited 20/min per IP); always on |
 | POST | `/auth/logout` | Revoke the current session token (all earlier tokens die) |
 | GET | `/auth/config` | Auth surface capabilities `{ providers, dev_mode, guest_login }` — the demo gates its login UI on this |
+| GET | `/steam/{action}/{params}` | Steam protocol hand-off: serves an interstitial that launches `steam://{action}/{params}` (allowlisted action+app only) |
 | POST | `/internal/game-result/{token}/{secret}` | Gameserver result webhook; the URL itself is the auth |
 
 | Variable | Default | Description |
@@ -144,6 +145,17 @@ flow still works. Its Connect button uses the test-token endpoint (or a
 and no fragment token exists, Connect shows an error — only genuine provider
 logins work in production. A guest can queue against provider or dev players;
 guest accounts are unrecoverable after the JWT expires.
+
+### Steam Redirect
+
+`/steam/{action}/{params}` is a browser-friendly bridge to the Steam client
+protocol: `https://…/steam/joinlobby/357190/109775244080946091/0` serves an
+interstitial page that launches `steam://joinlobby/357190/109775244080946091/0`.
+The interstitial (auto-attempt plus a "Open in Steam" button) exists because
+browsers only let a user click hand off to another application. Only
+allowlisted combos resolve — currently action `joinlobby` with app `357190`;
+extend `ALLOWLIST` in `lobby-server/src/steam_redirect.rs` to enable more
+(e.g. `run`). Anything else returns `404`.
 
 ## WebSocket Quick Test
 
@@ -270,6 +282,7 @@ Every pairing, accept, and decline is appended to the `match_events` audit table
 | lobby-core | `mmr.rs` | Weng-Lin rating math |
 | lobby-core | `error.rs` | `LobbyError` + `Result` |
 | lobby-server | `steam_auth.rs` | Steam ticket/OpenID auth + JWT (claims: `sub` = player_id UUID) |
+| lobby-server | `steam_redirect.rs` | Steam protocol hand-off (allowlist + interstitial) |
 | lobby-server | `db/players.rs` | `PlayerStore` impl + `find_or_create_user` (find-or-create identity attach) |
 | lobby-server | `migrations/` | Schema; `users.id` (UUID) is the provider-agnostic account key, `user_identities` maps `(provider, provider_uid)` → account |
 | lobby-server | `db/` | Other `PostgresStore` impls (one file per store trait) |

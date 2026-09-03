@@ -1,7 +1,8 @@
 //! Lobby server: `build_app` wires config + shared state into an axum Router.
 //! Module map: `db/` PostgresStore impls, `gameserver` creator client,
 //! `rate_limit` limiter, `routes` HTTP surface, `state` AppState, `steam_auth`
-//! Steam ticket + JWT auth, `ticker` maintenance loop, `ws` WebSocket protocol.
+//! Steam ticket + JWT auth, `steam_redirect` Steam protocol hand-off,
+//! `ticker` maintenance loop, `ws` WebSocket protocol.
 use std::sync::Arc;
 
 use axum::{Router, routing::get};
@@ -18,6 +19,7 @@ mod rate_limit;
 mod routes;
 mod state;
 mod steam_auth;
+mod steam_redirect;
 mod temporal;
 mod ticker;
 mod turn;
@@ -299,7 +301,8 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         .route("/auth/ticket", axum::routing::post(routes::ticket_auth))
         .route("/internal/turn-credentials", get(routes::turn_credentials))
         .route("/auth/logout", axum::routing::post(routes::logout))
-        .route("/ws", get(ws::ws_route));
+        .route("/ws", get(ws::ws_route))
+        .route("/steam/{*rest}", get(steam_redirect::steam_redirect));
 
     if config.auth_dev_mode {
         router = router.route("/auth/test-token", axum::routing::post(routes::test_token));
