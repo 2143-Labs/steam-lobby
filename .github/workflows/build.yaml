@@ -30,7 +30,15 @@ jobs:
     - name: Build and push
       run: |
         IMAGE="${{ env.registry }}/${{ env.repo }}:${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_number }}"
-        docker build -t "$IMAGE" .
+        # Cross-run layer cache on the self-hosted (podman/buildah) runner:
+        # buildx's type=gha cache is unavailable there, so cache to a ghcr tag
+        # instead. The login above covers the cache pull/push. Shared between
+        # push and PR builds; survives runner storage pruning.
+        CACHE_REF="${{ env.registry }}/${{ env.repo }}:buildcache"
+        docker build \
+          --cache-from="type=registry,ref=${CACHE_REF}" \
+          --cache-to="type=registry,ref=${CACHE_REF},mode=max" \
+          -t "$IMAGE" .
         docker push "$IMAGE"
 
     - name: Set image tag output
