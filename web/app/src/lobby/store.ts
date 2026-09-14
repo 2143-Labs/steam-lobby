@@ -14,6 +14,7 @@ export type TimerHandle = ReturnType<typeof setInterval>;
 
 export type GameMode = "off" | "practice" | "pong" | "rps" | "rps_preview";
 export type ControlsPanel = "connected" | "queueing" | "match" | "inmatch";
+export type AuthMode = "cookie" | "token";
 
 export interface LobbyState {
   // connection / identity
@@ -23,12 +24,16 @@ export interface LobbyState {
   displayName: string | null;
   lastBase: string | null; // last successful server base (for Reconnect)
   lastToken: string | null; // last session token (for Reconnect; cleared on signout)
+  authMode: AuthMode | null;
+  lastAuthMode: AuthMode | null;
+  csrfToken: string | null;
+  authProvider: string | null;
   // match
   matchToken: string | null;
   opponentId: string | null;
   opponentName: string | null;
   gameType: "p2p" | "server" | null;
-  matchMode: string | null; // mode name from match_found (rps_1v1 vs ranked_1v1)
+  matchMode: string | null; // mode name from match_found (rps_1v1 vs pong_1v1)
   // pong
   game: PongSnapshot | null;
   sim: PongSim | null;
@@ -77,8 +82,9 @@ export interface LobbyState {
   };
   // derived convenience for components
   connected: boolean;
-  /** The currently selected matchmaking mode ("ranked_1v1" etc.). */
+  /** The currently selected matchmaking mode. */
   selectedMode: string;
+  rankedQueueEnabled: boolean;
 }
 
 export const state: LobbyState = {
@@ -88,6 +94,10 @@ export const state: LobbyState = {
   displayName: null,
   lastBase: null,
   lastToken: null,
+  authMode: null,
+  lastAuthMode: null,
+  csrfToken: null,
+  authProvider: null,
   matchToken: null,
   opponentId: null,
   opponentName: null,
@@ -135,7 +145,8 @@ export const state: LobbyState = {
     leaderboard: [],
   },
   connected: false,
-  selectedMode: "ranked_1v1",
+  selectedMode: "pong_1v1",
+  rankedQueueEnabled: true,
 };
 
 // ── subscription (React) ─────────────────────────────────────────────────

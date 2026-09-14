@@ -109,7 +109,7 @@ need a POSIX shell. Use WSL2 or Git Bash, or run the server directly:
 | `LOBBY_HOST` | `0.0.0.0` | Bind address |
 | `LOBBY_PORT` | `8080` | Bind port |
 | `PUBLIC_URL` | — | Required for Steam OpenID login (absolute public origin); login returns `400` without it |
-| `GAME_MODES` | `ranked_1v1:p2p,server_arena:server` | Comma-separated `mode:type` pairs; `type` = `p2p` \| `server` |
+| `GAME_MODES` | `pong_1v1:p2p,server_arena:server` | Comma-separated `mode:type` pairs; `type` = `p2p` \| `server` |
 | `GAMESERVER_CREATOR_URL` | — | Absolute URL of the gameserver creator's allocate endpoint (required for server modes) |
 | `GAMESERVER_ALLOC_TIMEOUT_S` | `60` | Seconds before an unallocated server match is disputed |
 | `GAMESERVER_RESULT_TIMEOUT_S` | `300` | Seconds after the server is ready before a missing result is disputed |
@@ -134,7 +134,7 @@ configured; `dev_mode` = `/auth/test-token` is exposed; `guest_login` is true
 whenever the server is reachable — the guest flow is always on). `POST
 /auth/test-token` returns a JWT when `AUTH_DEV_MODE=true` and `404` otherwise.
 `POST /auth/guest` mints a brand-new identity-less account (a `users` row with
-`steam_id NULL`, `primary_provider 'guest'`, no `user_identities` row) and
+`steam_id NULL`, `primary_provider 'guest'`, no `accounts` row) and
 returns a JWT; it is rate-limited to 20/min per IP. The web demo
 (`web/index.html`) fetches `/auth/config` on load and shows only the login
 surfaces the server actually offers: a button per listed provider, the dev
@@ -177,7 +177,7 @@ The Rust reference client (`lobby-client`) has a helper for this flow:
 `/auth/test-token` and authenticates over WebSocket in one call. The
 integration tests in `lobby-server/tests/` use it to emulate players.
 
-Then send: `{"type":"begin_matchmaking","mode":"ranked_1v1","difficulty":"normal"}`
+Then send: `{"type":"begin_matchmaking","mode":"pong_1v1","difficulty":"normal"}`
 
 The token is only ever sent in the first WS `auth` frame (or delivered as a URL
 **fragment** — `#token=…` — after Steam OpenID login), never as a query
@@ -284,7 +284,7 @@ Every pairing, accept, and decline is appended to the `match_events` audit table
 | lobby-server | `steam_auth.rs` | Steam ticket/OpenID auth + JWT (claims: `sub` = player_id UUID) |
 | lobby-server | `steam_redirect.rs` | Steam protocol hand-off (allowlist + interstitial) |
 | lobby-server | `db/players.rs` | `PlayerStore` impl + `find_or_create_user` (find-or-create identity attach) |
-| lobby-server | `migrations/` | Schema; `users.id` (UUID) is the provider-agnostic account key, `user_identities` maps `(provider, provider_uid)` → account |
+| lobby-server | `migrations/` | Schema; `users.id` (UUID) is the provider-agnostic account key, `accounts` maps `(provider, provider_uid)` → account |
 | lobby-server | `db/` | Other `PostgresStore` impls (one file per store trait) |
 | lobby-server | `state.rs` | `AppState` composition root |
 | lobby-server | `ws.rs` | WebSocket protocol |
@@ -304,9 +304,9 @@ Steam login is implemented directly (OpenID 2.0 against `steamcommunity.com`).
 provider registry (`lobby-server/src/auth_providers.rs`) plus generic
 login/callback dispatch (`/auth/{provider}/login`, `/auth/{provider}/callback`).
 Nothing in the schema or JWT changes between providers: the JWT `sub` is the
-abstract `users.id` player key, and `user_identities` maps
+abstract `users.id` player key, and `accounts` maps
 `(provider, provider_uid)` → account. Discord users and Pocket ID users get
-`steam_id NULL`; their identity lives only in `user_identities`.
+`steam_id NULL`; their identity lives only in `accounts`.
 
 **Provider config** (new `lobby-server/src/auth_providers.rs`; mirror
 `john2143.com/src/auth/providers.ts`):
@@ -354,7 +354,7 @@ if multi-instance deployment ever happens.
 `GET /auth/link/{provider}`, which issues the same one-time state but stores
 `linking_user_id` (from the session JWT) in it. The callback verifies the
 provider identity, then runs
-`INSERT INTO user_identities (provider, provider_uid, user_id) VALUES ($1, $2, <linking_user_id>)
+`INSERT INTO accounts (provider, provider_uid, user_id) VALUES ($1, $2, <linking_user_id>)
 ON CONFLICT (provider, provider_uid) DO NOTHING` — attaching instead of
 find-or-create. `UNIQUE (user_id, provider)` rejects linking a second identity
 of the same provider; the `(provider, provider_uid)` PK makes an identity
@@ -387,7 +387,7 @@ All communication happens over a single WebSocket connection at `/ws`. Messages 
 |------|--------|-------------|
 | `auth` | `session_token: String` | Authenticate with a JWT |
 | `auth_ticket` | `ticket: String` | Authenticate with a Steam session ticket |
-| `begin_matchmaking` | `mode: String`, `difficulty: String` | Enter queue (`"ranked_1v1"`, difficulty: `"easy"`/`"normal"`/`"hard"`) |
+| `begin_matchmaking` | `mode: String`, `difficulty: String` | Enter queue (`"pong_1v1"`, difficulty: `"easy"`/`"normal"`/`"hard"`) |
 | `cancel_matchmaking` | — | Leave queue |
 | `accept_match` | `match_token: String` | Accept a found match |
 | `decline_match` | `match_token: String` | Decline a found match (rare — acceptance is the default) |
@@ -533,7 +533,7 @@ serves it at `/` — with the server running, just open `http://localhost:8080/`
 in two browser tabs. To test multiple users locally:
 
 4. Pick a **mode** — the dropdown is populated from `GET /modes`
-   (`ranked_1v1 (p2p)` by default; `server_arena (server)` when the default
+   (`pong_1v1 (p2p)` by default; `server_arena (server)` when the default
    `GAME_MODES` is in force). Click **Start Matchmaking** in both — the
    queueing panel shows live wait time, the expanding MMR band and opponents in
    it, your own μ/σ/rating, and a leaderboard of every player's rating.

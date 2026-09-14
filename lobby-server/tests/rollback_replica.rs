@@ -242,7 +242,7 @@ async fn wait_game_over(p: &mut LobbyClient, deadline: std::time::Instant) -> St
 #[sqlx::test]
 async fn pong_three_replicas_converge(pool: sqlx::PgPool) {
     let h = setup_temporal_pong(pool).await;
-    let (mut p1, mut p2, token, pid1, pid2) = pair_up(&h, 915, 916, "ranked_1v1").await;
+    let (mut p1, mut p2, token, pid1, pid2) = pair_up(&h, 915, 916, "pong_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
     // Both clients must drive CONCURRENTLY: the referee only advances when
@@ -282,7 +282,7 @@ async fn pong_three_replicas_converge(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn pong_divergence_detected_and_resynced(pool: sqlx::PgPool) {
     let h = setup_temporal_pong(pool).await;
-    let (mut p1, mut p2, token, pid1, pid2) = pair_up(&h, 913, 914, "ranked_1v1").await;
+    let (mut p1, mut p2, token, pid1, pid2) = pair_up(&h, 913, 914, "pong_1v1").await;
     accept_and_connect(&h, &mut p1, &mut p2, &token).await;
 
     // p1 diverges at frame 25 (well before the winner at ~51); both drives

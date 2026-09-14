@@ -109,7 +109,14 @@ export default function QueuePanel() {
             <option key={d}>{d}</option>
           ))}
         </select>
-        <button className="primary" onClick={startQueue}>
+        {!st.rankedQueueEnabled && st.selectedMode === "umvc3_1v1" && (
+          <p className="sys">The production UMVC3 ranked queue is not enabled yet.</p>
+        )}
+        <button
+          className="primary"
+          disabled={!st.rankedQueueEnabled && st.selectedMode === "umvc3_1v1"}
+          onClick={startQueue}
+        >
           Start Matchmaking
         </button>
       </div>

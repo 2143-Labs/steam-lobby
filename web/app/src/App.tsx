@@ -2,6 +2,7 @@ import { Route, Routes } from "react-router-dom";
 import LobbyPage from "./pages/LobbyPage";
 import LeaderboardPage from "./pages/LeaderboardPage";
 import PlayerPage from "./pages/PlayerPage";
+import LinkPage from "./pages/LinkPage";
 
 export default function App() {
   return (
@@ -9,6 +10,8 @@ export default function App() {
       <Route path="/" element={<LobbyPage />} />
       <Route path="/leaderboard/:game" element={<LeaderboardPage />} />
       <Route path="/player/:playerId" element={<PlayerPage />} />
+      <Route path="/link" element={<LinkPage />} />
+      <Route path="/link/native-complete" element={<LinkPage nativeComplete />} />
       <Route path="*" element={<LobbyPage />} />
     </Routes>
   );

@@ -2,6 +2,12 @@
 //! with a graceful shutdown. Helpers: `parse_game_modes` and `shutdown_signal`.
 use lobby_server::{AppConfig, build_app};
 
+fn positive_env(name:&str,default:u64)->u64 {
+    let raw=std::env::var(name).unwrap_or_else(|_|default.to_string());
+    raw.parse::<u64>().ok().filter(|value|*value>0)
+        .unwrap_or_else(||panic!("{name} must be a positive integer"))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = dotenvy::dotenv();
@@ -39,10 +45,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth_dev_mode: std::env::var("AUTH_DEV_MODE")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false),
-        jwt_ttl_secs: std::env::var("JWT_TTL_S")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(86400),
+        steam_backed_accounts_only: std::env::var("STEAM_BACKED_ACCOUNTS_ONLY")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
+        ranked_queue_enabled: std::env::var("RANKED_QUEUE_ENABLED")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(true),
+        ranked_queue_lease_secs: positive_env("RANKED_QUEUE_LEASE_S",45),
+        umvc3_trying_timeout_secs: positive_env("UMVC3_TRYING_TIMEOUT_S",15),
+        umvc3_connect_timeout_secs: positive_env("UMVC3_CONNECT_TIMEOUT_S",30),
+        umvc3_ready_timeout_secs: positive_env("UMVC3_READY_TIMEOUT_S",60),
+        umvc3_play_timeout_secs: positive_env("UMVC3_PLAY_TIMEOUT_S",7200),
+        jwt_ttl_secs: positive_env("JWT_TTL_S", 86400),
         cors_origins: std::env::var("CORS_ORIGINS")
             .map(|v| {
                 v.split(',')
@@ -52,9 +66,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .unwrap_or_default(),
         game_modes: parse_game_modes(
-            &std::env::var("GAME_MODES")
-                .unwrap_or_else(|_| "ranked_1v1:p2p,server_arena:server".into()),
-        ),
+            &std::env::var("GAME_MODES").unwrap_or_else(|_| {
+                "pong_1v1:p2p,rps_1v1:p2p,server_arena:server".into()
+            }),
+        )?,
         gameserver_creator_url: std::env::var("GAMESERVER_CREATOR_URL")
             .ok()
             .filter(|s| !s.is_empty()),
@@ -129,30 +144,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Parse `GAME_MODES` (`mode:type,mode:type`) into (mode, GameType) pairs.
-/// Unknown type tokens are logged and skipped — a bad mode must not kill the server.
-fn parse_game_modes(s: &str) -> Vec<(String, lobby_core::types::GameType)> {
-    s.split(',')
-        .filter_map(|pair| {
-            let mut it = pair.split(':');
-            let name = it.next()?.trim();
-            let ty = it.next()?.trim();
-            if name.is_empty() {
-                return None;
+/// Parse `GAME_MODES` (`mode:connection,mode:connection`) against the canonical
+/// registry. Unknown, duplicate, malformed, or mismatched entries are fatal.
+fn parse_game_modes(s: &str) -> Result<Vec<&'static lobby_core::types::ModeSpec>, String> {
+    use std::collections::HashSet;
+
+    if s.trim().is_empty() {
+        return Err("GAME_MODES must contain at least one mode".into());
+    }
+
+    let mut seen = HashSet::new();
+    let mut modes = Vec::new();
+    for entry in s.split(',') {
+        let entry = entry.trim();
+        let mut parts = entry.split(':');
+        let id = parts.next().unwrap_or_default().trim();
+        let connection = parts.next().unwrap_or_default().trim();
+        if id.is_empty() || connection.is_empty() || parts.next().is_some() {
+            return Err(format!(
+                "GAME_MODES malformed entry '{entry}'; expected mode:connection"
+            ));
+        }
+        if !seen.insert(id) {
+            return Err(format!("GAME_MODES duplicate mode '{id}'"));
+        }
+        let spec = lobby_core::types::mode_spec(id)
+            .ok_or_else(|| format!("GAME_MODES unknown mode '{id}'"))?;
+        let configured = match connection {
+            "p2p" => lobby_core::types::ConnectionStrategy::P2p,
+            "server" => lobby_core::types::ConnectionStrategy::Server,
+            other => {
+                return Err(format!(
+                    "GAME_MODES unknown connection '{other}' for mode '{id}'"
+                ));
             }
-            let game_type = match ty {
-                "p2p" => lobby_core::types::GameType::P2p,
-                "server" => lobby_core::types::GameType::Server,
-                other => {
-                    tracing::warn!(
-                        "GAME_MODES: unknown game type '{other}' for mode '{name}' — skipping"
-                    );
-                    return None;
-                }
-            };
-            Some((name.to_string(), game_type))
-        })
-        .collect()
+        };
+        if configured != spec.connection {
+            return Err(format!(
+                "GAME_MODES mode '{id}' requires {:?}, not '{connection}'",
+                spec.connection
+            ));
+        }
+        modes.push(spec);
+    }
+    Ok(modes)
 }
 
 /// Wait for SIGINT (ctrl-c) or SIGTERM, then let axum drain in-flight connections.

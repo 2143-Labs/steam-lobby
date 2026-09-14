@@ -22,7 +22,7 @@ export default function LobbyPage() {
         both, then start matchmaking in each.
       </p>
       <nav>
-        <Link className="primary" to="/leaderboard/ranked_1v1">
+        <Link className="primary" to="/leaderboard/pong_1v1">
           Leaderboard
         </Link>
       </nav>

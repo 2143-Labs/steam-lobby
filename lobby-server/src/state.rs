@@ -22,6 +22,14 @@ pub struct RuntimeConfig {
     pub public_url: Option<String>,
     /// Test auth mode: true = /auth/test-token enabled.
     pub auth_dev_mode: bool,
+    /// Restrict account creation to provider-verified Steam identities.
+    pub steam_backed_accounts_only: bool,
+    pub ranked_queue_enabled: bool,
+    pub ranked_queue_lease_secs: u64,
+    pub umvc3_trying_timeout_secs: u64,
+    pub umvc3_connect_timeout_secs: u64,
+    pub umvc3_ready_timeout_secs: u64,
+    pub umvc3_play_timeout_secs: u64,
     /// Session JWT lifetime in seconds.
     pub jwt_ttl_secs: u64,
     /// CORS allowlist origins (may be empty; same-origin always allowed).
@@ -61,7 +69,7 @@ pub struct AppState {
     /// Postgres-backed storage for all core traits.
     pub store: PostgresStore,
     /// The modes this server actually runs.
-    pub game_modes: Vec<(String, lobby_core::types::GameType)>,
+    pub game_modes: Vec<&'static lobby_core::types::ModeSpec>,
     /// Client for the external gameserver creator.
     pub gameserver: crate::gameserver::GameserverClient,
     /// Shared HTTP client — one connection pool for outbound calls.
@@ -72,8 +80,6 @@ pub struct AppState {
     pub gameserver_result_timeout_secs: u64,
     /// Config handlers need, copied once at startup (see `RuntimeConfig`).
     pub config: RuntimeConfig,
-    /// OpenID login states awaiting their callback (600s TTL, 4096 cap).
-    pub openid_states: ParkMutex<HashMap<String, OpenIdState>>,
     /// Rate limiter for /auth/ticket.
     pub ticket_limiter: RateLimiter,
     /// Rate limiter for /auth/test-token.
@@ -82,6 +88,9 @@ pub struct AppState {
     pub guest_token_limiter: RateLimiter,
     /// Bumped per connection so a reconnecting client supersedes a stale one.
     pub next_generation: AtomicU64,
+    /// Wakes `/api/events` long-pollers when the drain loop applies commands
+    /// that emitted recipient events (no-op when nothing changed).
+    pub event_notify: tokio::sync::Notify,
     /// Active pong matches: match_token -> input channel + task handle.
     pub pong_games: ParkMutex<std::collections::HashMap<String, crate::pong::ActivePong>>,
     /// Active RPS matches: match_token -> choice channel + task handle.
@@ -99,15 +108,6 @@ pub struct AppState {
     pub auth_providers: std::sync::Arc<crate::auth_providers::AuthProviderRegistry>,
 }
 
-
-pub struct OpenIdState {
-    pub return_to: String,
-    pub created_at: std::time::Instant,
-    /// Which provider issued this state (must match the callback's provider).
-    pub provider: String,
-    /// PKCE verifier for providers with `use_pkce` (au2143); None for discord.
-    pub code_verifier: Option<String>,
-}
 
 pub struct ConnectionEntry {
     pub tx: mpsc::UnboundedSender<ServerMessage>,

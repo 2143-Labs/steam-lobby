@@ -13,6 +13,7 @@ use crate::ws::{OpponentInfo, ServerMessage};
 pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     let mut shutdown = shutdown;
+    let mut reconcile_ticks = 0_u8;
     loop {
         // Either the 2s tick (run the maintenance body below) or a shutdown
         // signal from the test harness (exit the loop, dropping AppState).
@@ -28,16 +29,48 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
             _ = stop => break,
         }
 
-        // server_arena (non-P2p) stays in-process: the Temporal migration is
-        // p2p-only, so the ticker still pairs Server-type matches. P2p pairing
-        // is the pairing Schedule's job (a PairOnceWorkflow per 2s tick).
-        for (mode, game_type) in &state.game_modes {
-            if *game_type == lobby_core::types::GameType::P2p {
+        // Durable command processing is independent of Temporal signals. This
+        // poll guarantees admitted commands survive lost signals and restarts.
+        match crate::commands::drain_pending(&state).await {
+            // Only wake long-pollers when work was actually applied, so an idle
+            // tick never shortens a client's 25-second events poll.
+            Ok(applied) if applied > 0 => state.event_notify.notify_waiters(),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "ranked command drain failed"),
+        }
+
+        // Reconcile on startup and every ten seconds. Durable command draining
+        // remains every two seconds; workflow ensure traffic need not.
+        if reconcile_ticks == 0 {
+            let reconcile_state = state.clone();
+            tokio::spawn(async move {
+                match reconcile_state.store.nonterminal_umvc3_tokens().await {
+                    Ok(tokens) => {
+                        for token in tokens {
+                            crate::temporal::umvc3::reconcile_umvc3_match(&reconcile_state, &token).await;
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "UMVC3 workflow reconciliation query failed"),
+                }
+            });
+            reconcile_ticks = 4;
+        } else {
+            reconcile_ticks -= 1;
+        }
+        // Gameserver-authoritative modes stay in-process. P2P modes are owned
+        // by their Temporal pairing schedules.
+        for spec in &state.game_modes {
+            if spec.authority != lobby_core::types::ResultAuthority::Gameserver {
                 continue;
             }
             match state
                 .store
-                .pair_next_match(mode, *game_type, state.config.pair_cooldown_secs as i64)
+                .pair_next_match_with_accept_timeout(
+                    spec.id,
+                    spec,
+                    state.config.pair_cooldown_secs as i64,
+                    state.config.match_accept_timeout_secs,
+                )
                 .await
             {
                 Ok(Some(match_info)) => {
@@ -70,7 +103,7 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                                     display_name: opponent_name,
                                 },
                                 timeout_ms: 30_000,
-                                game_type: info_a.game_type,
+                                game_type: info_a.connection,
                                 game_mode: info_a.game_mode.clone(),
                             });
                         }
@@ -96,7 +129,7 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
                                     display_name: opponent_name,
                                 },
                                 timeout_ms: 30_000,
-                                game_type: info_b.game_type,
+                                game_type: info_b.connection,
                                 game_mode: info_b.game_mode.clone(),
                             });
                         }
@@ -109,7 +142,8 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
 
         // Live queue stats for the demo: best-effort, never blocks the tick on errors.
         // Leaderboard and stats are per-mode now.
-        for (mode, _game_type) in &state.game_modes {
+        for spec in &state.game_modes {
+            let mode = spec.id;
             if let Ok(queue) = state.store.get_queue(mode).await {
                 let ratings = state.store.list_ratings(mode).await.unwrap_or_default();
                 let mut leaderboard: Vec<LeaderboardEntry> = Vec::with_capacity(ratings.len());
@@ -171,14 +205,30 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
         // queued but the schedule is paused (a resume was lost), unpause it
         // so the next tick pairs them. Idle cost is the get_queue SELECT
         // above; the schedule RPC only happens when >=2 are queued.
-        for (mode, game_type) in &state.game_modes {
-            if *game_type != lobby_core::types::GameType::P2p {
+        for spec in &state.game_modes {
+            if spec.authority != lobby_core::types::ResultAuthority::ServerReferee {
                 continue;
             }
-            if let Ok(queue) = state.store.get_queue(mode).await
+            if let Ok(queue) = state.store.get_queue(spec.id).await
                 && queue.len() >= 2
             {
-                crate::temporal::schedule::ensure_running(&state, mode).await;
+                crate::temporal::schedule::ensure_running(&state, spec.id).await;
+            }
+        }
+
+        // NativeReport schedules are enabled only when queue admission is
+        // enabled. Existing leased rows remain cancellable/heartbeat-visible
+        // while disabled but cannot form new matches.
+        if state.config.ranked_queue_enabled {
+            for spec in &state.game_modes {
+                if spec.authority != lobby_core::types::ResultAuthority::NativeReport {
+                    continue;
+                }
+                if let Ok(queue) = state.store.get_queue(spec.id).await
+                    && queue.len() >= 2
+                {
+                    crate::temporal::schedule::ensure_running(&state, spec.id).await;
+                }
             }
         }
         if let Ok(removed) = lobby_core::queue::cleanup_stale(&state.store).await {
@@ -216,7 +266,7 @@ pub async fn tick_loop(state: Arc<AppState>, shutdown: Option<tokio::sync::watch
             .await;
         if let Ok(matches) = in_progress {
             for m in matches {
-                if m.game_type != lobby_core::types::GameType::Server || m.server_address.is_some()
+                if m.connection != lobby_core::types::ConnectionStrategy::Server || m.server_address.is_some()
                 {
                     continue;
                 }

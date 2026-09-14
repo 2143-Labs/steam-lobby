@@ -1,10 +1,10 @@
-// WS lobby client — port of the demo's connectWithToken + handleServer
-// (web/index.html:353-837) onto the store. Reconnect keeps the last session
-// (base + token) so a Disconnect → Reconnect cycle resumes the same account
-// (JWT TTL 86400s; auth_ok reports "still in queue").
+// WebSocket lobby client. Browser-provider sessions authenticate with the
+// HttpOnly cookie; dev/guest/native sessions use an in-memory bearer token.
 import { BALL_SPEED } from "../../../pong-sim.mjs";
 import { beginPongSession, hexToBytes, startPractice, stopGame } from "../game/pong";
 import { beginRpsRound, rpsGameOver, rpsRoundResult } from "../game/rps";
+import { fetchModes, fetchSession } from "../api";
+import type { SessionInfo } from "../types";
 import { parseServerMessage } from "./protocol";
 import {
   beginStartCountdown,
@@ -17,7 +17,7 @@ import {
   showControls,
   state,
 } from "./store";
-import type { TimerHandle } from "./store";
+import type { AuthMode, TimerHandle } from "./store";
 
 // ── connection ───────────────────────────────────────────────────────────
 
@@ -85,28 +85,21 @@ async function updateConnMetrics() {
   if (el) el.textContent = "Server: " + sv + " · " + opp;
 }
 
-/**
- * Connect the WebSocket with an already-acquired session token: populate the
- * mode list (fallback to ranked_1v1), open the WS, wire the handlers, and
- * remember the session for Reconnect.
- */
-export async function connectWithToken(base: string, token: string) {
-  // Populate the mode dropdown from the server (same base the user typed).
+async function populateModes(base: string) {
   let modes: { name: string; game_type: string }[] = [];
   try {
-    const resp = await fetch(base + "/modes");
-    if (resp.ok) {
-      const body = await resp.json();
-      modes = body.modes ?? [];
-    }
+    modes = await fetchModes(base);
   } catch (e) {
     log("sys", "modes fetch failed: " + (e as Error).message);
   }
-  if (modes.length === 0) modes = [{ name: "ranked_1v1", game_type: "p2p" }];
+  if (modes.length === 0) modes = [{ name: "pong_1v1", game_type: "p2p" }];
   setAvailableModes(modes);
-  if (!modes.some((m) => m.name === state.selectedMode)) {
-    state.selectedMode = modes[0].name;
-  }
+  state.selectedMode = modes[0].name;
+}
+
+async function connect(base: string, mode: AuthMode, token: string | null) {
+  if (state.ws && state.ws.readyState < WebSocket.CLOSING) return;
+  await populateModes(base);
 
   const wsUrl = base.replace(/^http/, "ws") + "/ws";
   let ws: WebSocket;
@@ -120,12 +113,14 @@ export async function connectWithToken(base: string, token: string) {
   state.ws = ws;
   ws.onopen = () => {
     log("sys", "WS open: " + wsUrl);
-    state.token = token; // keep for sign-out
+    state.token = token;
+    state.authMode = mode;
     state.lastBase = base;
-    state.lastToken = token;
+    state.lastAuthMode = mode;
+    state.lastToken = mode === "token" ? token : null;
     state.connected = true;
     setStatus("Connecting…");
-    send({ type: "auth", session_token: token });
+    if (mode === "token" && token) send({ type: "auth", session_token: token });
     notify();
   };
   ws.onmessage = (ev) => handleServer(ev.data);
@@ -140,6 +135,7 @@ export async function connectWithToken(base: string, token: string) {
     log("sys", "WS closed");
     state.ws = null;
     state.connected = false;
+    state.authMode = null;
     setStatus("Disconnected", "");
     showControls("connected");
     state.token = null;
@@ -148,7 +144,24 @@ export async function connectWithToken(base: string, token: string) {
   ws.onerror = () => log("sys", "WS error");
 }
 
-/** The mode dropdown contents (populated by connectWithToken). */
+/** Connect with a dev, guest, or native token retained only in memory. */
+export async function connectWithToken(base: string, token: string) {
+  await connect(base, "token", token);
+}
+
+/** Validate the HttpOnly browser session, then let its cookie authenticate WS. */
+export async function connectWithSession(base: string, session?: SessionInfo): Promise<boolean> {
+  const live = session ?? (await fetchSession(base));
+  if (!live) return false;
+  state.playerId = live.user_id;
+  state.displayName = live.display_name;
+  state.csrfToken = live.csrf_token;
+  state.authProvider = live.auth_provider;
+  await connect(base, "cookie", null);
+  return true;
+}
+
+/** The mode dropdown contents (populated for either authentication mode). */
 let availableModes: { name: string; game_type: string }[] = [];
 export function getAvailableModes(): { name: string; game_type: string }[] {
   return availableModes;
@@ -162,9 +175,7 @@ function setAvailableModes(modes: { name: string; game_type: string }[]) {
 export function disconnect() {
   log("sys", "disconnecting");
   if (state.ws) state.ws.close();
-  // Clear session state so a reconnect can't inherit a stale match. The
-  // token itself stays valid — Reconnect uses lastBase/lastToken.
-  state.playerId = null;
+  // Clear match state while retaining the authenticated account for reconnect.
   state.matchToken = null;
   state.opponentId = null;
   state.gameType = null;
@@ -172,30 +183,45 @@ export function disconnect() {
   notify();
 }
 
-/** Reconnect with the remembered session (no re-auth round-trip). */
+/** Reconnect using the remembered authentication mode. */
 export function reconnect() {
-  if (!state.lastBase || !state.lastToken) return;
-  void connectWithToken(state.lastBase, state.lastToken);
+  if (!state.lastBase || !state.lastAuthMode) return;
+  if (state.lastAuthMode === "cookie") {
+    void connectWithSession(state.lastBase).then((connected) => {
+      if (!connected) setStatus("Browser session expired", "err");
+    }).catch((e) => {
+      setStatus("Session check failed: " + (e as Error).message, "err");
+    });
+  } else if (state.lastToken) {
+    void connectWithToken(state.lastBase, state.lastToken);
+  }
 }
 
-/** Sign out: revoke the server session and forget the Reconnect token. */
+/** Revoke the current browser or bearer session, then forget local auth state. */
 export async function signout() {
   const base = state.lastBase || "";
-  if (state.token) {
+  const mode = state.authMode ?? state.lastAuthMode;
+  const headers: Record<string, string> = {};
+  if (mode === "cookie" && state.csrfToken) headers["X-CSRF-Token"] = state.csrfToken;
+  const bearer = state.token ?? state.lastToken;
+  if (mode === "token" && bearer) headers.Authorization = "Bearer " + bearer;
+  if (mode) {
     try {
-      await fetch(base + "/auth/logout", {
-        method: "POST",
-        headers: { Authorization: "Bearer " + state.token },
-      });
+      await fetch(base + "/api/logout", { method: "POST", credentials: "include", headers });
     } catch (e) {
       log("sys", "logout request failed: " + (e as Error).message);
     }
   }
   state.token = null;
-  state.lastToken = null; // explicit signout clears the Reconnect session
+  state.lastToken = null;
+  state.lastBase = null;
+  state.authMode = null;
+  state.lastAuthMode = null;
+  state.csrfToken = null;
+  state.authProvider = null;
   state.playerId = null;
   state.displayName = null;
-  if (state.ws) state.ws.close(); // onclose resets the panel
+  if (state.ws) state.ws.close();
   notify();
 }
 
@@ -369,7 +395,7 @@ function handleServer(raw: string) {
             (state.iAmPlayerA && muChange !== undefined ? " (mu change " + muChange.toFixed(2) + ")" : "");
         }
       } else {
-        txt = typeof o === "string" ? (o === "Disputed" ? "Match disputed" : o) : String(o);
+        txt = typeof o === "string" ? (o === "Disputed" ? "Match disputed" : o) : "Unrated";
       }
       setStatus("Match resolved: " + txt, "ok");
       log("sys", "match resolved: " + JSON.stringify(o));

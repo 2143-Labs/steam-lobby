@@ -39,10 +39,10 @@ async fn live_temporal_full_lifecycle() {
     let (mut p1, p1_pid) = auth_client(&base, p1_id).await;
     let (mut p2, _p2_pid) = auth_client(&base, p2_id).await;
 
-    p1.begin_matchmaking("ranked_1v1", "normal")
+    p1.begin_matchmaking("pong_1v1", "normal")
         .await
         .expect("p1 queue");
-    p2.begin_matchmaking("ranked_1v1", "normal")
+    p2.begin_matchmaking("pong_1v1", "normal")
         .await
         .expect("p2 queue");
 

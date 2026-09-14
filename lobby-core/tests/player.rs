@@ -28,7 +28,7 @@ async fn enter_menus_is_idempotent_for_existing_players() {
     m.enter_menus(pid(102), &store).await.unwrap();
     // A second login must not clobber state (only first login creates).
     m.enter_menus(pid(102), &store).await.unwrap();
-    m.begin_matchmaking(pid(102), MatchDifficulty::Normal, &store)
+    m.begin_matchmaking(pid(102), "pong_1v1", MatchDifficulty::Normal, &store)
         .await
         .unwrap();
     m.enter_menus(pid(102), &store).await.unwrap();
@@ -40,7 +40,7 @@ async fn full_state_machine_walk() {
     let store = MockStore::new();
     let m = mgr();
     m.enter_menus(pid(103), &store).await.unwrap();
-    m.begin_matchmaking(pid(103), MatchDifficulty::Normal, &store)
+    m.begin_matchmaking(pid(103), "pong_1v1", MatchDifficulty::Normal, &store)
         .await
         .unwrap();
     assert_eq!(state(&store, pid(103)).await, PlayerState::Queueing);
@@ -59,7 +59,7 @@ async fn cancel_matchmaking_returns_to_menus() {
     let store = MockStore::new();
     let m = mgr();
     m.enter_menus(pid(104), &store).await.unwrap();
-    m.begin_matchmaking(pid(104), MatchDifficulty::Easy, &store)
+    m.begin_matchmaking(pid(104), "pong_1v1", MatchDifficulty::Easy, &store)
         .await
         .unwrap();
     m.cancel_matchmaking(pid(104), &store).await.unwrap();
@@ -83,11 +83,10 @@ async fn transitions_require_the_expected_prior_state() {
     ));
 
     // Queueing -> Queueing is invalid (double queue).
-    m.begin_matchmaking(pid(105), MatchDifficulty::Normal, &store)
+    m.begin_matchmaking(pid(105), "pong_1v1", MatchDifficulty::Normal, &store)
         .await
         .unwrap();
-    let err = m
-        .begin_matchmaking(pid(105), MatchDifficulty::Normal, &store)
+    let err = m.begin_matchmaking(pid(105), "pong_1v1", MatchDifficulty::Normal, &store)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -167,7 +166,7 @@ async fn queueing_refreshes_liveness() {
         .unwrap()
         .last_heartbeat;
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    m.begin_matchmaking(pid(109), MatchDifficulty::Normal, &store)
+    m.begin_matchmaking(pid(109), "pong_1v1", MatchDifficulty::Normal, &store)
         .await
         .unwrap();
     let after = store
@@ -187,7 +186,7 @@ async fn disconnect_resets_mid_match_player_to_menus() {
     let store = MockStore::new();
     let m = mgr();
     m.enter_menus(pid(108), &store).await.unwrap();
-    m.begin_matchmaking(pid(108), MatchDifficulty::Normal, &store)
+    m.begin_matchmaking(pid(108), "pong_1v1", MatchDifficulty::Normal, &store)
         .await
         .unwrap();
     m.match_accepted(pid(108), &store).await.unwrap();

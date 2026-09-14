@@ -7,6 +7,27 @@ use skillratings::Outcomes;
 
 use crate::types::OpenSkillRating;
 
+/// Outcome vocabulary exposed without leaking the rating engine dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RatingOutcome {
+    Win,
+    Loss,
+    Draw,
+}
+
+pub fn update_ratings_for_outcome(
+    player_a: &OpenSkillRating,
+    player_b: &OpenSkillRating,
+    outcome: RatingOutcome,
+) -> (OpenSkillRating, OpenSkillRating) {
+    let outcome = match outcome {
+        RatingOutcome::Win => Outcomes::WIN,
+        RatingOutcome::Loss => Outcomes::LOSS,
+        RatingOutcome::Draw => Outcomes::DRAW,
+    };
+    update_ratings(player_a, player_b, outcome)
+}
+
 /// Compute new ratings for a 1v1 match.
 /// Returns (player_a_new, player_b_new).
 pub fn update_ratings(

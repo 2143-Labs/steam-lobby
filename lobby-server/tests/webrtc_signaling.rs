@@ -65,8 +65,8 @@ async fn signaling_relay(pool: sqlx::PgPool) {
     p1.authenticate_test_token(9990, &h.base_url).await.unwrap();
     p2.authenticate_test_token(9991, &h.base_url).await.unwrap();
 
-    p1.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
-    p2.begin_matchmaking("ranked_1v1", "normal").await.unwrap();
+    p1.begin_matchmaking("pong_1v1", "normal").await.unwrap();
+    p2.begin_matchmaking("pong_1v1", "normal").await.unwrap();
     let m1 = timeout(Duration::from_secs(15), p1.wait_for_match())
         .await
         .unwrap()

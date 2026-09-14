@@ -1,7 +1,5 @@
 // /player/:playerId — profile: linked accounts, per-game MMR, match history.
-// Identities show provider + last login ONLY (never the provider_uid — the
-// server already omits it). Self-view ("this is you") when the decoded
-// #token sub matches; the maintenance hook is UI-only for now.
+// Identities show provider + last login only; provider subjects are private.
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { fetchPlayer } from "../api";
@@ -15,7 +13,7 @@ function fmtDate(iso: string | null): string {
 
 export default function PlayerPage() {
   const { playerId = "" } = useParams<{ playerId: string }>();
-  const me = jwtSub(state.token) ?? null;
+  const me = state.playerId ?? jwtSub(state.token);
 
   const q = useQuery({
     queryKey: ["player", playerId],
@@ -127,7 +125,7 @@ export default function PlayerPage() {
                       : shortId(m.opponent_id)}
                   </Link>
                 </td>
-                <td>{m.outcome ?? m.status}</td>
+                <td>{m.outcome ?? (m.ended_at ? "Unrated" : m.status)}</td>
                 <td>{m.mu_change !== null ? (m.mu_change >= 0 ? "+" : "") + m.mu_change.toFixed(2) : "—"}</td>
                 <td>{fmtDate(m.ended_at)}</td>
               </tr>
@@ -135,7 +133,7 @@ export default function PlayerPage() {
           </tbody>
         </table>
       )}
-      {isMe && <p className="sys">Account maintenance (rename, link management) coming later.</p>}
+      {isMe && <p className="sys">Account maintenance is available from the lobby.</p>}
       <p>
         <Link to="/">← Lobby</Link>
       </p>

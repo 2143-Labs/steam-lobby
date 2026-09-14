@@ -5,8 +5,8 @@ use common::{pid, queued_player, MockStore, TestCallbacks};
 use lobby_core::error::LobbyError;
 use lobby_core::traits::{MatchStore, QueueStore};
 use lobby_core::types::{
-    GameType, MatchDifficulty, MatchEvent, MatchInfo, MatchReport, MatchStatus, PlayerState,
-    QueueEntry,
+    ConnectionStrategy, MatchDifficulty, MatchEvent, MatchInfo, MatchReport, MatchStatus,
+    PlayerState, QueueEntry,
 };
 
 // ── Tests ────────────────────────────────────────────────
@@ -23,7 +23,7 @@ async fn full_match_lifecycle() {
     store
         .enqueue(&QueueEntry {
             user_id: pid(100),
-            game_mode: "ranked_1v1".into(),
+            game_mode: "pong_1v1".into(),
             difficulty: MatchDifficulty::Normal,
             mu: 25.0,
             queued_at: Utc::now(),
@@ -33,7 +33,7 @@ async fn full_match_lifecycle() {
     store
         .enqueue(&QueueEntry {
             user_id: pid(200),
-            game_mode: "ranked_1v1".into(),
+            game_mode: "pong_1v1".into(),
             difficulty: MatchDifficulty::Normal,
             mu: 25.0,
             queued_at: Utc::now(),
@@ -50,8 +50,8 @@ async fn full_match_lifecycle() {
         player_a_difficulty: MatchDifficulty::Normal,
         player_b: pid(200),
         player_b_difficulty: MatchDifficulty::Normal,
-        game_mode: "ranked_1v1".into(),
-        game_type: GameType::P2p,
+        game_mode: "pong_1v1".into(),
+        connection: ConnectionStrategy::P2p,
         status: MatchStatus::PendingAccept,
         created_at: Utc::now(),
         accepted_at: None,
@@ -150,8 +150,8 @@ async fn dispute_on_winner_mismatch() {
             player_a_difficulty: MatchDifficulty::Normal,
             player_b: pid(200),
             player_b_difficulty: MatchDifficulty::Normal,
-            game_mode: "ranked_1v1".into(),
-            game_type: GameType::P2p,
+            game_mode: "pong_1v1".into(),
+            connection: ConnectionStrategy::P2p,
             server_address: None,
             join_token: None,
             result_secret: None,
@@ -221,8 +221,8 @@ async fn winner_must_be_participant() {
             player_a_difficulty: MatchDifficulty::Normal,
             player_b: pid(200),
             player_b_difficulty: MatchDifficulty::Normal,
-            game_mode: "ranked_1v1".into(),
-            game_type: GameType::P2p,
+            game_mode: "pong_1v1".into(),
+            connection: ConnectionStrategy::P2p,
             server_address: None,
             join_token: None,
             result_secret: None,
@@ -272,8 +272,8 @@ async fn double_accept_requires_both() {
             player_a_difficulty: MatchDifficulty::Normal,
             player_b: pid(200),
             player_b_difficulty: MatchDifficulty::Normal,
-            game_mode: "ranked_1v1".into(),
-            game_type: GameType::P2p,
+            game_mode: "pong_1v1".into(),
+            connection: ConnectionStrategy::P2p,
             server_address: None,
             join_token: None,
             result_secret: None,
@@ -315,7 +315,7 @@ async fn server_result_resolves() {
             player_b: pid(200),
             player_b_difficulty: MatchDifficulty::Normal,
             game_mode: "server_arena".into(),
-            game_type: GameType::Server,
+            connection: ConnectionStrategy::Server,
             status: MatchStatus::Playing,
             created_at: Utc::now(),
             accepted_at: Some(Utc::now()),
@@ -369,8 +369,8 @@ async fn pong_resolve_declares_winner() {
             player_a_difficulty: MatchDifficulty::Normal,
             player_b: pid(200),
             player_b_difficulty: MatchDifficulty::Normal,
-            game_mode: "ranked_1v1".into(),
-            game_type: GameType::P2p,
+            game_mode: "pong_1v1".into(),
+            connection: ConnectionStrategy::P2p,
             status: MatchStatus::Reporting,
             created_at: Utc::now(),
             accepted_at: Some(Utc::now()),
@@ -401,7 +401,7 @@ async fn pong_resolve_declares_winner() {
     let rating_100 = store
         .ratings
         .lock()
-        .get(&(pid(100), "ranked_1v1".into()))
+        .get(&(pid(100), "pong_1v1".into()))
         .cloned()
         .unwrap();
     assert!(
@@ -433,7 +433,7 @@ async fn playing_match_expires() {
             player_b: pid(200),
             player_b_difficulty: MatchDifficulty::Normal,
             game_mode: "server_arena".into(),
-            game_type: GameType::Server,
+            connection: ConnectionStrategy::Server,
             status: MatchStatus::Playing,
             created_at: Utc::now(),
             accepted_at: Some(Utc::now()),
@@ -470,8 +470,8 @@ async fn duplicate_report_rejected() {
             player_a_difficulty: MatchDifficulty::Normal,
             player_b: pid(200),
             player_b_difficulty: MatchDifficulty::Normal,
-            game_mode: "ranked_1v1".into(),
-            game_type: GameType::P2p,
+            game_mode: "pong_1v1".into(),
+            connection: ConnectionStrategy::P2p,
             server_address: None,
             join_token: None,
             result_secret: None,

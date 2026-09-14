@@ -8,8 +8,7 @@ use std::sync::Arc;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 
 use lobby_core::types::{
-    GameType, MatchDifficulty, MatchEvent, MatchInfo, MatchStatus, PlayerId, PlayerState,
-    QueueEntry,
+    MatchDifficulty, MatchEvent, MatchInfo, MatchStatus, PlayerId, PlayerState, QueueEntry,
 };
 
 use lobby_core::traits::{MatchStore, PlayerStore, QueueStore};
@@ -107,7 +106,7 @@ impl LobbyActivities {
             {
                 crate::rps::spawn_game(&self.state, &m);
             } else if self.state.config.pong_enabled
-                && m.game_type == lobby_core::types::GameType::P2p
+                && m.game_mode == "pong_1v1"
                 && m.status == lobby_core::types::MatchStatus::Reporting
             {
                 crate::pong::spawn_game(&self.state, &m);
@@ -352,20 +351,30 @@ impl LobbyActivities {
         _ctx: ActivityContext,
         mode: String,
     ) -> Result<PairResult, ActivityError> {
-        let game_type = self
+        let spec = self
             .state
             .game_modes
             .iter()
-            .find(|(m, _)| *m == mode)
-            .map(|(_, t)| *t)
-            .unwrap_or(GameType::P2p);
+            .copied()
+            .find(|spec| spec.id == mode)
+            .ok_or_else(|| {
+                lobby_core::error::LobbyError::Database(format!(
+                    "unknown configured mode: {mode}"
+                ))
+            })?;
+        if spec.authority == lobby_core::types::ResultAuthority::NativeReport
+            && !self.state.config.ranked_queue_enabled
+        {
+            return Ok(PairResult { match_info: None });
+        }
         let match_info = match self
             .state
             .store
-            .pair_next_match(
+            .pair_next_match_with_accept_timeout(
                 &mode,
-                game_type,
+                spec,
                 self.state.config.pair_cooldown_secs as i64,
+                self.state.config.match_accept_timeout_secs,
             )
             .await
         {
@@ -403,16 +412,22 @@ impl LobbyActivities {
             );
         }
         if let Some(m) = &match_info {
-            // Start the P2PMatchWorkflow FIRST so the accept signals can never
-            // race ahead of the workflow's existence.
-            crate::temporal::workflows::start_p2p_match(
-                &self.state,
-                m,
-                self.state.config.match_accept_timeout_secs,
-                self.state.config.start_timeout_secs,
-                self.state.config.report_timeout_secs,
-            )
-            .await;
+            if spec.authority == lobby_core::types::ResultAuthority::NativeReport {
+                crate::temporal::umvc3::start_umvc3_match(&self.state, &m.match_token).await;
+            } else {
+                // Reference server-referee P2P lifecycle remains on its
+                // existing signal-driven workflow.
+                crate::temporal::workflows::start_p2p_match(
+                    &self.state,
+                    m,
+                    self.state.config.match_accept_timeout_secs,
+                    self.state.config.start_timeout_secs,
+                    self.state.config.report_timeout_secs,
+                )
+                .await;
+            }
+        }
+        if let Some(m) = &match_info {
             // Broadcast MatchFound to both players (mirror the in-process
             // ticker's notify, ticker.rs:44-108) and signal their sessions.
 
@@ -440,7 +455,7 @@ impl LobbyActivities {
                         display_name: opponent_name,
                     },
                     timeout_ms: 30_000,
-                    game_type: m.game_type,
+                    game_type: m.connection,
                     game_mode: m.game_mode.clone(),
                 };
                 let connections = self.state.connections.lock().await;

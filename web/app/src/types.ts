@@ -51,6 +51,21 @@ export interface AuthConfig {
   providers: string[];
   dev_mode: boolean;
   guest_login: boolean;
+  ranked_queue_enabled: boolean;
+}
+
+/** GET /api/session */
+export interface SessionInfo {
+  user_id: string;
+  display_name: string;
+  auth_provider: string;
+  csrf_token: string;
+}
+
+/** POST /api/link/intent */
+export interface LinkIntentResponse {
+  intent_id: string;
+  discord_display_name: string;
 }
 
 /** GET /modes */

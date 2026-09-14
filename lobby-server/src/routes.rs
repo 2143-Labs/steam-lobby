@@ -4,15 +4,16 @@
 //! test-token + mock creator endpoints.
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::state::{AppState, OpenIdState};
+use crate::state::AppState;
+use crate::steam_auth::ValidatedSession;
 use lobby_core::traits::{MatchStore, PlayerStore};
 
 // ── stats API response types (snake_case on the wire, mirror of web/app/src/types.ts) ──
@@ -81,729 +82,331 @@ pub async fn index() -> Html<&'static str> {
 #[derive(Deserialize)]
 pub struct LoginQuery {
     return_to: Option<String>,
+    native_handoff: Option<String>,
 }
 
-/// True if `return_to` is safe to redirect to: a same-origin path without
-/// query/fragment, or an absolute URL whose origin matches `public_url` and
-/// which has no fragment (the token fragment is appended by the server).
 fn validate_return_to(return_to: &str, public_url: Option<&str>) -> bool {
-    // Relative same-origin path: "/dashboard" ok; "//evil.com" and "/\evil.com" are not.
     if return_to.starts_with('/') && !return_to.starts_with("//") && !return_to.starts_with("/\\") {
-        // A `?` would smuggle params into the callback/redirect; a `#` would
-        // swallow the fragment token.
         return !return_to.contains('?') && !return_to.contains('#');
     }
-    // Absolute: must match the configured public origin exactly.
-    let Some(pub_url) = public_url else {
-        return false;
-    };
-    if return_to.contains('#') {
-        return false;
-    }
-    match (url::Url::parse(return_to), url::Url::parse(pub_url)) {
-        (Ok(a), Ok(b)) => a.origin() == b.origin(),
-        _ => false,
+    let Some(public_url)=public_url else { return false };
+    if return_to.contains('#') { return false }
+    match (url::Url::parse(return_to),url::Url::parse(public_url)) {
+        (Ok(a),Ok(b)) => a.origin()==b.origin(), _ => false,
     }
 }
 
-/// Append the session token as a URL fragment — never a query param (not sent
-/// in Referer, not in access logs, not in history as a server-visible value).
-fn build_token_redirect(return_to: &str, token: &str) -> String {
-    format!("{return_to}#token={token}")
+fn cookie(headers:&HeaderMap,name:&str)->Option<String>{
+    headers.get(header::COOKIE)?.to_str().ok()?.split(';').find_map(|part|{
+        let (key,value)=part.trim().split_once('=')?;
+        (key==name).then(||value.to_string())
+    })
 }
 
-pub async fn steam_login(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<LoginQuery>,
-) -> impl IntoResponse {
-    let return_to = query.return_to.unwrap_or_else(|| "/".to_string());
-    if !validate_return_to(&return_to, state.config.public_url.as_deref()) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "invalid_return_to"})),
-        )
-            .into_response();
-    }
-    // Steam requires an absolute callback URL, so OpenID login needs PUBLIC_URL.
-    let Some(public_url) = state.config.public_url.as_deref() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "public_url_required"})),
-        )
-            .into_response();
-    };
+fn secure_cookie(state:&AppState)->bool {
+    let Some(url)=state.config.public_url.as_deref().and_then(|u|url::Url::parse(u).ok()) else{return true};
+    !(url.scheme()=="http" && url.host_str().is_some_and(|host| {
+        host=="localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip|ip.is_loopback())
+    }))
+}
 
-    // Issue a one-time login state bound to this return_to.
-    let login_state = uuid::Uuid::new_v4().to_string();
-    {
-        let mut states = state.openid_states.lock();
-        states.retain(|_, s| s.created_at.elapsed() < Duration::from_secs(600));
-        if states.len() >= 4096 {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "state_limit"})),
-            )
-                .into_response();
+fn set_cookie(response:&mut Response,name:&str,value:&str,path:&str,max_age:u64,http_only:bool,state:&AppState){
+    let mut raw=format!("{name}={value}; Path={path}; Max-Age={max_age}; SameSite=Lax");
+    if http_only { raw.push_str("; HttpOnly"); }
+    if secure_cookie(state){raw.push_str("; Secure");}
+    if let Ok(value)=HeaderValue::from_str(&raw){response.headers_mut().append(header::SET_COOKIE,value);}
+}
+
+fn clear_cookie(response:&mut Response,name:&str,path:&str,state:&AppState){set_cookie(response,name,"",path,0,true,state)}
+
+fn exact_public_origin(state:&AppState,headers:&HeaderMap)->bool{
+    let Some(expected)=state.config.public_url.as_deref().and_then(|u|url::Url::parse(u).ok()).map(|u|u.origin().ascii_serialization()) else{return false};
+    headers.get(header::ORIGIN).and_then(|v|v.to_str().ok())==Some(expected.as_str())
+}
+
+pub(crate) async fn revalidate_session(state:&AppState, session:&ValidatedSession)->Option<uuid::Uuid>{
+    let claims=match session{ValidatedSession::Browser(c)|ValidatedSession::Native(c)=>c};
+    let user_id=uuid::Uuid::parse_str(&claims.sub).ok()?;
+    if state.store.get_token_version(user_id).await.ok()?!=claims.token_version{return None}
+    match session{
+        ValidatedSession::Browser(c)=>{
+            let row=state.store.live_browser_session(c.sid,user_id).await.ok()??;
+            let csrf=c.csrf.as_deref()?;
+            (c.provider.as_deref()==Some(row.auth_provider.as_str())
+                && row.csrf_hash==Sha256::digest(csrf.as_bytes()).to_vec()).then_some(user_id)
         }
-        states.insert(
-            login_state.clone(),
-            OpenIdState {
-                return_to: return_to.clone(),
-                created_at: Instant::now(),
-                provider: "steam".to_string(),
-                code_verifier: None,
+        ValidatedSession::Native(c)=>state.store.live_native_session(c.sid,user_id).await.ok()?.is_some().then_some(user_id),
+    }
+}
+
+pub(crate) async fn authenticate_token(state:&AppState, token:&str)->Option<ValidatedSession>{
+    let session=state.steam_auth.validate_session_token(token).ok()?;
+    revalidate_session(state,&session).await?;
+    Some(session)
+}
+
+pub(crate) async fn authenticate_cookie_ws(state:&AppState,headers:&HeaderMap)->Option<ValidatedSession>{
+    if !exact_public_origin(state,headers){return None}
+    let token=cookie(headers,"lobby_session")?;
+    let session=authenticate_token(state,&token).await?;
+    matches!(session,ValidatedSession::Browser(_)).then_some(session)
+}
+
+async fn validate_browser_csrf(
+    state: &AppState,
+    headers: &HeaderMap,
+    claims: &crate::steam_auth::SessionClaims,
+) -> Option<()> {
+    let csrf=headers.get("x-csrf-token").and_then(|v|v.to_str().ok())?;
+    if claims.csrf.as_deref()!=Some(csrf){return None}
+    let user_id=uuid::Uuid::parse_str(&claims.sub).ok()?;
+    let row=state.store.live_browser_session(claims.sid,user_id).await.ok()??;
+    if row.auth_provider!=claims.provider.as_deref()? || row.csrf_hash!=Sha256::digest(csrf.as_bytes()).to_vec(){return None}
+    Some(())
+}
+
+pub(crate) async fn authenticate_headers(state:&AppState,headers:&HeaderMap,mutation:bool)->Option<ValidatedSession>{
+    if let Some(token)=headers.get(header::AUTHORIZATION).and_then(|v|v.to_str().ok()).and_then(|v|v.strip_prefix("Bearer ")){
+        // A bearer token is never ambient — the browser keeps it only inside
+        // the HttpOnly cookie, so it cannot be replayed by a cross-site form.
+        // CSRF therefore applies to cookie authentication alone; requiring it
+        // here would break the documented bearer logout contract.
+        return authenticate_token(state,token).await;
+    }
+    let token=cookie(headers,"lobby_session")?;
+    if mutation && !exact_public_origin(state,headers){return None}
+    let session=authenticate_token(state,&token).await?;
+    let ValidatedSession::Browser(claims)=&session else{return None};
+    if mutation {validate_browser_csrf(state,headers,claims).await?;}
+    Some(session)
+}
+
+async fn authenticate_cookie(state:&AppState,headers:&HeaderMap)->Option<crate::steam_auth::SessionClaims>{
+    let token=cookie(headers,"lobby_session")?;
+    let ValidatedSession::Browser(claims)=authenticate_token(state,&token).await? else{return None};
+    Some(claims)
+}
+
+async fn issue_browser(state:&AppState,user_id:uuid::Uuid,provider:&str)->Result<(String,String),()> {
+    let csrf=crate::db::opaque_token();
+    let sid=state.store.create_browser_session(user_id,provider,&crate::db::token_hash(&csrf),state.config.jwt_ttl_secs).await.map_err(|_|())?;
+    let version=state.store.get_token_version(user_id).await.map_err(|_|())?;
+    let token=state.steam_auth.generate_browser_token(user_id,sid,provider,&csrf,version,state.config.jwt_ttl_secs).map_err(|_|())?;
+    Ok((token,csrf))
+}
+
+async fn issue_native(state:&AppState,user_id:uuid::Uuid)->Result<String,()> {
+    let sid=state.store.create_native_session(user_id).await.map_err(|_|())?;
+    let version=state.store.get_token_version(user_id).await.map_err(|_|())?;
+    state.steam_auth.generate_native_token(user_id,sid,version).map_err(|_|())
+}
+
+async fn begin_login(state:&AppState,provider:&str,return_to:String,verifier:Option<String>)->Result<(String,String),Response>{
+    if !validate_return_to(&return_to,state.config.public_url.as_deref()) {return Err((StatusCode::BAD_REQUEST,Json(serde_json::json!({"error":"invalid_return_to"}))).into_response())}
+    if state.config.public_url.is_none(){return Err((StatusCode::BAD_REQUEST,Json(serde_json::json!({"error":"public_url_required"}))).into_response())}
+    let login_state=crate::db::opaque_token();
+    let nonce=crate::db::opaque_token();
+    state.store.create_oauth_login_state(&login_state,&nonce,provider,&return_to,verifier.as_deref()).await.map_err(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+    Ok((login_state,nonce))
+}
+
+pub async fn steam_login(State(state):State<Arc<AppState>>,Query(query):Query<LoginQuery>)->Response{
+    let return_to=query.return_to.unwrap_or_else(||"/".into());
+    let (login_state,nonce)=match begin_login(&state,"steam",return_to,None).await{Ok(v)=>v,Err(r)=>return r};
+    let url=state.steam_auth.openid_redirect_url(state.config.public_url.as_deref().unwrap(),&login_state,"/");
+    let mut response=Redirect::temporary(&url).into_response();
+    set_cookie(&mut response,"oauth_login_nonce",&nonce,"/auth",600,true,&state); response
+}
+
+pub async fn steam_callback(State(state):State<Arc<AppState>>,headers:HeaderMap,Query(query):Query<HashMap<String,String>>)->Response{
+    let state_param=query.get("state").cloned().unwrap_or_default();
+    let nonce=cookie(&headers,"oauth_login_nonce").unwrap_or_default();
+    let mut failure=StatusCode::UNAUTHORIZED.into_response();
+    clear_cookie(&mut failure,"oauth_login_nonce","/auth",&state);
+    let Some(stored)=state.store.consume_oauth_login_state(&state_param,&nonce,"steam").await.ok().flatten() else{return failure};
+    let steam_id=match state.steam_auth.verify_openid(&query).await{Ok(v)=>v,Err(_)=>return failure};
+    let display_name=state.steam_auth.get_player_summary(steam_id).await.unwrap_or_else(|_|"Unknown".into());
+    let user_id=match state.store.find_or_create_user("steam",&steam_id.to_string(),&display_name,true).await{Ok(v)=>v,Err(_)=>return failure};
+    let (token,_csrf)=match issue_browser(&state,user_id,"steam").await{Ok(v)=>v,Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    let mut response=Redirect::temporary(&stored.return_to).into_response();
+    clear_cookie(&mut response,"oauth_login_nonce","/auth",&state);
+    set_cookie(&mut response,"lobby_session",&token,"/",state.config.jwt_ttl_secs,true,&state); response
+}
+
+pub async fn auth_login(State(state):State<Arc<AppState>>,Path(provider):Path<String>,Query(query):Query<LoginQuery>)->Response{
+    let Some(cfg)=state.auth_providers.get(&provider) else{return StatusCode::NOT_FOUND.into_response()};
+    if state.config.steam_backed_accounts_only && provider!="discord" {return StatusCode::NOT_FOUND.into_response()}
+    if state.config.steam_backed_accounts_only && provider=="discord" && let Some(handoff)=query.native_handoff {
+        if state.store.peek_oauth_handoff(&handoff).await.ok().flatten().is_none(){return StatusCode::UNAUTHORIZED.into_response()}
+        let Some(public)=state.config.public_url.as_deref() else{return StatusCode::SERVICE_UNAVAILABLE.into_response()};
+        let callback=format!("{}/auth/{provider}/callback",public.trim_end_matches('/'));
+        let url=crate::auth_providers::authorization_url(cfg,&callback,&handoff,None,"");
+        return Redirect::temporary(&url).into_response();
+    }
+    let (verifier,challenge)=if cfg.use_pkce{let(v,c)=crate::auth_providers::pkce_pair();(Some(v),c)}else{(None,String::new())};
+    let return_to=query.return_to.unwrap_or_else(||"/".into());
+    let (login_state,nonce)=match begin_login(&state,&provider,return_to,verifier.clone()).await{Ok(v)=>v,Err(r)=>return r};
+    let callback=format!("{}/auth/{provider}/callback",state.config.public_url.as_deref().unwrap().trim_end_matches('/'));
+    let url=crate::auth_providers::authorization_url(cfg,&callback,&login_state,verifier.as_deref(),&challenge);
+    let mut response=Redirect::temporary(&url).into_response(); set_cookie(&mut response,"oauth_login_nonce",&nonce,"/auth",600,true,&state); response
+}
+
+async fn provider_identity(state:&AppState,provider:&str,code:&str,verifier:Option<&str>)->Option<(String,String,serde_json::Value)>{
+    let cfg=state.auth_providers.get(provider)?;
+    let public=state.config.public_url.as_deref()?;
+    let callback=format!("{}/auth/{provider}/callback",public.trim_end_matches('/'));
+    let mut form=vec![("grant_type","authorization_code"),("code",code),("redirect_uri",callback.as_str()),("client_id",cfg.client_id.as_str()),("client_secret",cfg.client_secret.as_str())];
+    if let Some(v)=verifier{form.push(("code_verifier",v));}
+    let token:serde_json::Value=state.http.post(&cfg.token_endpoint).form(&form).send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
+    let access=token["access_token"].as_str()?;
+    let info:serde_json::Value=state.http.get(&cfg.userinfo_endpoint).bearer_auth(access).send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
+    Some((info[&cfg.id_field].as_str()?.to_string(),crate::auth_providers::userinfo_name(&info,cfg),info))
+}
+
+pub async fn auth_callback(State(state):State<Arc<AppState>>,Path(provider):Path<String>,headers:HeaderMap,Query(query):Query<HashMap<String,String>>)->Response{
+    if state.auth_providers.get(&provider).is_none(){return StatusCode::NOT_FOUND.into_response()}
+    let state_param=query.get("state").cloned().unwrap_or_default();
+    let code=query.get("code").cloned().unwrap_or_default();
+    if state.config.steam_backed_accounts_only && provider=="discord"
+        && state.store.peek_oauth_handoff(&state_param).await.ok().flatten().is_some()
+    {
+        let Some((uid,name,_))=provider_identity(&state,&provider,&code,None).await else{return StatusCode::UNAUTHORIZED.into_response()};
+        let intent=match state.store.complete_native_handoff(&state_param,&uid,&name).await{
+            Ok(Some(v))=>v,
+            Ok(None)=>return StatusCode::UNAUTHORIZED.into_response(),
+            Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        return Redirect::temporary(&format!("/link/native-complete?intent_id={intent}")).into_response();
+    }
+    let nonce=cookie(&headers,"oauth_login_nonce").unwrap_or_default();
+    let mut failure=StatusCode::UNAUTHORIZED.into_response();
+    clear_cookie(&mut failure,"oauth_login_nonce","/auth",&state);
+    let Some(stored)=state.store.consume_oauth_login_state(&state_param,&nonce,&provider).await.ok().flatten() else{return failure};
+    let Some((provider_uid,display_name,info))=provider_identity(&state,&provider,&code,stored.code_verifier.as_deref()).await else{return failure};
+    if state.config.steam_backed_accounts_only {
+        let mut response=match state.store.login_linked_account("discord",&provider_uid,&display_name).await {
+            Ok(Some(owner))=>match issue_browser(&state,owner,"discord").await {
+                Ok((token,_))=>{let mut r=Redirect::temporary(&stored.return_to).into_response();set_cookie(&mut r,"lobby_session",&token,"/",state.config.jwt_ttl_secs,true,&state);r},
+                Err(_)=>StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             },
-        );
-    }
-
-    let redirect_url = state
-        .steam_auth
-        .openid_redirect_url(public_url, &login_state, &return_to);
-    Redirect::temporary(&redirect_url).into_response()
-}
-
-pub async fn steam_callback(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let return_to = query
-        .get("return_to")
-        .cloned()
-        .unwrap_or_else(|| "/".to_string());
-    let state_param = query.get("state").cloned().unwrap_or_default();
-
-    // Consume the one-time login state (prevents replay of a callback).
-    let stored = {
-        let mut states = state.openid_states.lock();
-        states.remove(&state_param)
-    };
-    let Some(stored) = stored else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "invalid_state"})),
-        )
-            .into_response();
-    };
-    if stored.created_at.elapsed() >= Duration::from_secs(600) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "state_expired"})),
-        )
-            .into_response();
-    }
-    if stored.return_to != return_to {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "invalid_return_to"})),
-        )
-            .into_response();
-    }
-    // Defense in depth: re-validate the (now state-bound) return_to.
-    if !validate_return_to(&return_to, state.config.public_url.as_deref()) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "invalid_return_to"})),
-        )
-            .into_response();
-    }
-
-    tracing::info!("OpenID callback: {:?}", query.keys());
-
-    let steam_id = match state.steam_auth.verify_openid(&query).await {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::error!("OpenID verification failed: {e}");
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
-    };
-
-    // Upsert player
-    let display_name = state
-        .steam_auth
-        .get_player_summary(steam_id)
-        .await
-        .unwrap_or_else(|_| "Unknown".into());
-
-    // Find or create the account; the Steam ID is genuinely verified here, so
-    // the ('steam', steam_id) identity row is attached. DB error fails closed.
-    let user_id = match state
-        .store
-        .find_or_create_user("steam", &steam_id.to_string(), &display_name, true)
-        .await
-    {
-        Ok(uid) => uid,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
-    };
-
-    // Generate JWT bound to the current token_version (DB error fails closed).
-    let version = match state.store.get_token_version(user_id).await {
-        Ok(v) => v,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
-    };
-    let token = match state.steam_auth.generate_session_token(
-        user_id,
-        version,
-        state.config.jwt_ttl_secs,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("JWT generation failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
-    };
-
-    Redirect::temporary(&build_token_redirect(&return_to, &token)).into_response()
-}
-
-/// Generic OAuth2/OIDC login start: 307 to the provider's authorization
-/// endpoint with a one-time state (and, for PKCE providers, a code challenge).
-pub async fn auth_login(
-    State(state): State<Arc<AppState>>,
-    Path(provider): Path<String>,
-    Query(query): Query<LoginQuery>,
-) -> impl IntoResponse {
-    let Some(cfg) = state.auth_providers.get(&provider) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "provider_not_found"})),
-        )
-            .into_response();
-    };
-    let return_to = query.return_to.unwrap_or_else(|| "/".to_string());
-    if !validate_return_to(&return_to, state.config.public_url.as_deref()) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "invalid_return_to"})),
-        )
-            .into_response();
-    }
-    let Some(public_url) = state.config.public_url.as_deref() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "public_url_required"})),
-        )
-            .into_response();
-    };
-
-    let (verifier, challenge) = if cfg.use_pkce {
-        let (v, c) = crate::auth_providers::pkce_pair();
-        (Some(v), c)
-    } else {
-        (None, String::new())
-    };
-
-    // Issue a one-time login state bound to this return_to + provider.
-    let login_state = uuid::Uuid::new_v4().to_string();
-    {
-        let mut states = state.openid_states.lock();
-        states.retain(|_, s| s.created_at.elapsed() < Duration::from_secs(600));
-        if states.len() >= 4096 {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "state_limit"})),
-            )
-                .into_response();
-        }
-        states.insert(
-            login_state.clone(),
-            OpenIdState {
-                return_to: return_to.clone(),
-                created_at: Instant::now(),
-                provider: provider.clone(),
-                code_verifier: verifier.clone(),
+            Ok(None)=>match state.store.create_provider_proof(&provider_uid,&display_name).await {
+                Ok(proof)=>{let mut r=Redirect::temporary("/link").into_response();set_cookie(&mut r,"discord_link_proof",&proof,"/api/link",300,true,&state);r},
+                Err(_)=>StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             },
-        );
+            Err(_)=>StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        clear_cookie(&mut response,"oauth_login_nonce","/auth",&state); return response
     }
-
-    let callback_url = format!("{public_url}/auth/{provider}/callback");
-    let redirect_url = crate::auth_providers::authorization_url(
-        cfg,
-        &callback_url,
-        &login_state,
-        verifier.as_deref(),
-        &challenge,
-    );
-    Redirect::temporary(&redirect_url).into_response()
+    let user_id=match state.store.find_or_create_user(&provider,&provider_uid,&display_name,true).await{Ok(v)=>v,Err(_)=>return failure};
+    if provider=="au2143" {let admin=info["groups"].as_array().is_some_and(|g|g.iter().any(|v|v.as_str()==Some("pvp_admin")));let _=state.store.set_admin_flag(user_id,admin).await;}
+    let (token,_)=match issue_browser(&state,user_id,&provider).await{Ok(v)=>v,Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    let mut response=Redirect::temporary(&stored.return_to).into_response();clear_cookie(&mut response,"oauth_login_nonce","/auth",&state);set_cookie(&mut response,"lobby_session",&token,"/",state.config.jwt_ttl_secs,true,&state);response
 }
 
-/// Generic OAuth2/OIDC callback: consume the state, exchange the code,
-/// fetch userinfo, find-or-create the account, mint the JWT, and 307 to
-/// `return_to#token=...`. All failures fail closed with 401 auth_failed.
-pub async fn auth_callback(
-    State(state): State<Arc<AppState>>,
-    Path(provider): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let Some(cfg) = state.auth_providers.get(&provider) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "provider_not_found"})),
-        )
-            .into_response();
-    };
-    let return_to = query
-        .get("return_to")
-        .cloned()
-        .unwrap_or_else(|| "/".to_string());
-    let state_param = query.get("state").cloned().unwrap_or_default();
-    let code = query.get("code").cloned().unwrap_or_default();
+#[derive(Deserialize)] pub struct TicketAuthBody{ticket:String}
 
-    // Consume the one-time login state (prevents replay of a callback).
-    let stored = {
-        let mut states = state.openid_states.lock();
-        states.remove(&state_param)
-    };
-    let Some(stored) = stored else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "auth_failed"})),
-        )
-            .into_response();
-    };
-    if stored.created_at.elapsed() >= Duration::from_secs(600) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "auth_failed"})),
-        )
-            .into_response();
-    }
-    if stored.provider != provider {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "auth_failed"})),
-        )
-            .into_response();
-    }
-    if stored.return_to != return_to {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "auth_failed"})),
-        )
-            .into_response();
-    }
-    if !validate_return_to(&return_to, state.config.public_url.as_deref()) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "auth_failed"})),
-        )
-            .into_response();
-    }
-    let Some(public_url) = state.config.public_url.as_deref() else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "auth_failed"})),
-        )
-            .into_response();
-    };
-
-    // Exchange the authorization code for an access token.
-    let callback_url = format!("{public_url}/auth/{provider}/callback");
-    let mut form = vec![
-        ("grant_type", "authorization_code"),
-        ("code", &code),
-        ("redirect_uri", &callback_url),
-        ("client_id", &cfg.client_id),
-        ("client_secret", &cfg.client_secret),
-    ];
-    if let Some(verifier) = &stored.code_verifier {
-        form.push(("code_verifier", verifier));
-    }
-    let token_resp = state
-        .http
-        .post(&cfg.token_endpoint)
-        .form(&form)
-        .send()
-        .await;
-    let token_json: serde_json::Value = match token_resp {
-        Ok(r) if r.status().is_success() => match r.json().await {
-            Ok(v) => v,
-            Err(_) => {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({"error": "auth_failed"})),
-                )
-                    .into_response();
-            }
-        },
-        _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "auth_failed"})),
-            )
-                .into_response();
-        }
-    };
-    let access_token = token_json["access_token"]
-        .as_str()
-        .ok_or_else(|| ())
-        .map(|s| s.to_string());
-    let Ok(access_token) = access_token else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "auth_failed"})),
-        )
-            .into_response();
-    };
-
-    // Fetch the userinfo document with the access token.
-    let userinfo_resp = state
-        .http
-        .get(&cfg.userinfo_endpoint)
-        .bearer_auth(&access_token)
-        .send()
-        .await;
-    let userinfo: serde_json::Value = match userinfo_resp {
-        Ok(r) if r.status().is_success() => match r.json().await {
-            Ok(v) => v,
-            Err(_) => {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({"error": "auth_failed"})),
-                )
-                    .into_response();
-            }
-        },
-        _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "auth_failed"})),
-            )
-                .into_response();
-        }
-    };
-    let Some(provider_uid) = userinfo[&cfg.id_field].as_str() else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "auth_failed"})),
-        )
-            .into_response();
-    };
-    let display_name = crate::auth_providers::userinfo_name(&userinfo, cfg);
-
-    // Find or create the account; the provider genuinely verified the uid, so
-    // the identity row is attached. DB error fails closed.
-    let user_id = match state
-        .store
-        .find_or_create_user(&provider, provider_uid, &display_name, true)
-        .await
-    {
-        Ok(uid) => uid,
-        Err(_) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "auth_failed"})),
-            )
-                .into_response();
-        }
-    };
-
-    // Admin flag (au.2143.me only, storage-only): record whether the Pocket ID
-    // `groups` claim contains `pvp_admin`. Written true or false on every
-    // au2143 login so group removal self-heals at the next login; a missing
-    // claim reads as false. Best-effort — a DB error logs and the login still
-    // succeeds. No endpoint/JWT/UI consumes the flag yet.
-    if provider == "au2143" {
-        let is_admin = userinfo["groups"]
-            .as_array()
-            .is_some_and(|g| g.iter().any(|v| v.as_str() == Some("pvp_admin")));
-        if let Err(e) = state.store.set_admin_flag(user_id, is_admin).await {
-            tracing::warn!("failed to record admin flag for {user_id}: {e}");
-        }
-    }
-
-    // Mint JWT bound to the current token_version (DB error fails closed).
-    let version = match state.store.get_token_version(user_id).await {
-        Ok(v) => v,
-        Err(_) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "auth_failed"})),
-            )
-                .into_response();
-        }
-    };
-    let token = match state
-        .steam_auth
-        .generate_session_token(user_id, version, state.config.jwt_ttl_secs)
-    {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("JWT generation failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
-    };
-
-    Redirect::temporary(&build_token_redirect(&return_to, &token)).into_response()
+async fn ticket_token(state:&AppState,ip:std::net::IpAddr,ticket:&str)->Result<String,Response>{
+    if !state.ticket_limiter.check(ip){return Err((StatusCode::TOO_MANY_REQUESTS,Json(serde_json::json!({"error":"rate_limited"}))).into_response())}
+    if ticket.is_empty()||ticket.len()>8192||ticket.len()%2!=0||!ticket.bytes().all(|b|b.is_ascii_hexdigit()){return Err((StatusCode::BAD_REQUEST,Json(serde_json::json!({"error":"malformed_ticket"}))).into_response())}
+    let steam_id=match state.steam_auth.verify_ticket(ticket,"matchmaking").await{Ok(v)=>v,Err(lobby_core::error::LobbyError::SteamAuthFailed(e)) if e=="provider_unavailable"=>return Err((StatusCode::SERVICE_UNAVAILABLE,Json(serde_json::json!({"error":"provider_unavailable"}))).into_response()),Err(_)=>return Err(StatusCode::UNAUTHORIZED.into_response())};
+    let user_id=state.store.find_or_create_user("steam",&steam_id.to_string(),"",true).await.map_err(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+    issue_native(state,user_id).await.map_err(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-#[derive(Deserialize)]
-pub struct TicketAuthBody {
-    ticket: String,
+pub async fn ticket_auth(State(state):State<Arc<AppState>>,ConnectInfo(ip):ConnectInfo<std::net::SocketAddr>,Json(body):Json<TicketAuthBody>)->Response{
+    match ticket_token(&state,ip.ip(),&body.ticket).await{Ok(token)=>(StatusCode::OK,Json(serde_json::json!({"token":token}))).into_response(),Err(r)=>r}
+}
+pub async fn api_ticket(State(state):State<Arc<AppState>>,ConnectInfo(ip):ConnectInfo<std::net::SocketAddr>,Json(body):Json<TicketAuthBody>)->Response{
+    match ticket_token(&state,ip.ip(),&body.ticket).await{Ok(token)=>(StatusCode::OK,Json(serde_json::json!({"access_token":token,"expires_in":3600}))).into_response(),Err(r)=>r}
 }
 
-#[derive(Serialize)]
-pub struct TokenResponse {
-    token: String,
+#[derive(Deserialize)] pub struct TestTokenBody{steam_id:u64}
+pub async fn test_token(State(state):State<Arc<AppState>>,ConnectInfo(ip):ConnectInfo<std::net::SocketAddr>,Json(body):Json<TestTokenBody>)->Response{
+    if !state.config.auth_dev_mode||state.config.steam_backed_accounts_only{return StatusCode::NOT_FOUND.into_response()}
+    if !state.test_token_limiter.check(ip.ip()){return StatusCode::TOO_MANY_REQUESTS.into_response()}
+    let user=match state.store.find_or_create_user("steam",&body.steam_id.to_string(),"",false).await{Ok(v)=>v,Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    let (token,_)=match issue_browser(&state,user,"test").await{Ok(v)=>v,Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    (StatusCode::OK,Json(serde_json::json!({"token":token}))).into_response()
 }
 
-pub async fn ticket_auth(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(ip): ConnectInfo<std::net::SocketAddr>,
-    Json(body): Json<TicketAuthBody>,
-) -> impl IntoResponse {
-    if !state.ticket_limiter.check(ip.ip()) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({"error": "rate_limited"})),
-        )
-            .into_response();
-    }
-
-    let steam_id = match state.steam_auth.verify_ticket(&body.ticket).await {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::error!("Ticket verification failed: {e}");
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "auth_failed"})),
-            )
-                .into_response();
-        }
-    };
-
-    // Find or create the account; the ticket is genuinely verified, so the
-    // ('steam', steam_id) identity row is attached. DB error fails closed.
-    let user_id = match state.store.find_or_create_user("steam", &steam_id.to_string(), "", true).await {
-        Ok(uid) => uid,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
-    };
-
-    // DB error fails closed — never mint with version 0.
-    let version = match state.store.get_token_version(user_id).await {
-        Ok(v) => v,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
-    };
-    let token = match state.steam_auth.generate_session_token(
-        user_id,
-        version,
-        state.config.jwt_ttl_secs,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("JWT generation failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
-    };
-
-    (StatusCode::OK, Json(TokenResponse { token })).into_response()
+pub async fn guest_token(State(state):State<Arc<AppState>>,ConnectInfo(ip):ConnectInfo<std::net::SocketAddr>)->Response{
+    if state.config.steam_backed_accounts_only{return StatusCode::NOT_FOUND.into_response()}
+    if !state.guest_token_limiter.check(ip.ip()){return StatusCode::TOO_MANY_REQUESTS.into_response()}
+    let name=format!("Guest-{:06x}",(uuid::Uuid::new_v4().as_u128()&0xffffff)as u32);
+    let user=match state.store.create_guest_user(&name).await{Ok(v)=>v,Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    let (token,_)=match issue_browser(&state,user,"guest").await{Ok(v)=>v,Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    (StatusCode::OK,Json(serde_json::json!({"token":token}))).into_response()
 }
 
-#[derive(Deserialize)]
-pub struct TestTokenBody {
-    // Dev-only: a numeric Steam ID, supplied directly. Plain u64 field — the
-    // old string/number-tolerant serde helper no longer exists.
-    steam_id: u64,
+pub async fn api_session(State(state):State<Arc<AppState>>,headers:HeaderMap)->Response{
+    let Some(claims)=authenticate_cookie(&state,&headers).await else{return no_store(StatusCode::UNAUTHORIZED.into_response())};
+    let user=uuid::Uuid::parse_str(&claims.sub).unwrap();
+    let name=state.store.get_display_name(user).await.ok().flatten().unwrap_or_else(||"Unknown".into());
+    let body=Json(serde_json::json!({"user_id":user,"display_name":name,"auth_provider":claims.provider.unwrap_or_default(),"csrf_token":claims.csrf.unwrap_or_default()})).into_response(); no_store(body)
+}
+fn no_store(mut response:Response)->Response{response.headers_mut().insert(header::CACHE_CONTROL,HeaderValue::from_static("no-store"));response}
+
+pub async fn logout(State(state):State<Arc<AppState>>,headers:HeaderMap)->Response{
+    let Some(session)=authenticate_headers(&state,&headers,true).await else{return StatusCode::UNAUTHORIZED.into_response()};
+    let (browser,result)=match session{
+        ValidatedSession::Browser(c)=>{let user=uuid::Uuid::parse_str(&c.sub).unwrap();(true,state.store.revoke_browser_session(c.sid,user).await)},
+        ValidatedSession::Native(c)=>{let user=uuid::Uuid::parse_str(&c.sub).unwrap();(false,state.store.revoke_native_session(c.sid,user).await)},
+    };
+    if result.is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response()}
+    let mut response=StatusCode::NO_CONTENT.into_response();if browser{clear_cookie(&mut response,"lobby_session","/",&state)}response
+}
+pub async fn logout_all(State(state):State<Arc<AppState>>,headers:HeaderMap)->Response{
+    let Some(session)=authenticate_headers(&state,&headers,true).await else{return StatusCode::UNAUTHORIZED.into_response()};
+    let claims=match session{ValidatedSession::Browser(c)|ValidatedSession::Native(c)=>c};let user=uuid::Uuid::parse_str(&claims.sub).unwrap();
+    if state.store.revoke_all_sessions(user).await.is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response()}
+    let mut response=StatusCode::NO_CONTENT.into_response();clear_cookie(&mut response,"lobby_session","/",&state);response
 }
 
-pub async fn test_token(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(ip): ConnectInfo<std::net::SocketAddr>,
-    Json(body): Json<TestTokenBody>,
-) -> impl IntoResponse {
-    if !state.test_token_limiter.check(ip.ip()) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({"error": "rate_limited"})),
-        )
-            .into_response();
-    }
-
-    // Find or create the account (dev test-token: NOT genuinely verified, so
-    // no identity row is attached). DB error fails closed.
-    let user_id = match state
-        .store
-        .find_or_create_user("steam", &body.steam_id.to_string(), "", false)
-        .await
-    {
-        Ok(uid) => uid,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
+#[derive(Deserialize)] pub struct IntentBody{intent_id:uuid::Uuid}
+pub async fn browser_link_intent(State(state):State<Arc<AppState>>,headers:HeaderMap)->Response{
+    let Some(ValidatedSession::Browser(c))=authenticate_headers(&state,&headers,true).await else{return StatusCode::UNAUTHORIZED.into_response()};
+    let user=uuid::Uuid::parse_str(&c.sub).unwrap();
+    let Some(proof)=cookie(&headers,"discord_link_proof") else{return StatusCode::UNAUTHORIZED.into_response()};
+    let result=state.store.create_browser_link_intent(user,c.sid,&proof).await;
+    let mut response=match result{
+        Ok(Ok((id,name)))=>(StatusCode::CREATED,Json(serde_json::json!({"intent_id":id,"discord_display_name":name}))).into_response(),
+        Ok(Err(crate::db::LinkIntentError::Expired))=>StatusCode::GONE.into_response(),
+        Ok(Err(crate::db::LinkIntentError::Replayed))=>StatusCode::CONFLICT.into_response(),
+        Ok(Err(crate::db::LinkIntentError::SessionMismatch))=>StatusCode::UNAUTHORIZED.into_response(),
+        Ok(Err(crate::db::LinkIntentError::SteamRequired))=>StatusCode::FORBIDDEN.into_response(),
+        Err(_)=>StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-
-    let version = match state.store.get_token_version(user_id).await {
-        Ok(v) => v,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
-    };
-    let token = match state.steam_auth.generate_session_token(
-        user_id,
-        version,
-        state.config.jwt_ttl_secs,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("JWT generation failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
-    };
-
-    (StatusCode::OK, Json(TokenResponse { token })).into_response()
+    clear_cookie(&mut response,"discord_link_proof","/api/link",&state);
+    response
 }
-
-/// Ephemeral "No account" login: mint a brand-new identity-less guest
-/// account (steam_id NULL, primary_provider 'guest', no identity row) and
-/// return a session JWT — the token is the only handle to the account.
-/// Every call is a fresh account; losing the token loses the account.
-pub async fn guest_token(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(ip): ConnectInfo<std::net::SocketAddr>,
-) -> impl IntoResponse {
-    if !state.guest_token_limiter.check(ip.ip()) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({"error": "rate_limited"})),
-        )
-            .into_response();
-    }
-    // Guest suffix from the low 24 bits of a fresh UUID (1/16M collision
-    // chance per pair; harmless — display_name has no uniqueness constraint).
-    let display_name = format!(
-        "Guest-{:06x}",
-        (uuid::Uuid::new_v4().as_u128() & 0x00ff_ffff) as u32
-    );
-    let user_id = match state.store.create_guest_user(&display_name).await {
-        Ok(uid) => uid,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
-    };
-    let version = match state.store.get_token_version(user_id).await {
-        Ok(v) => v,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
-    };
-    let token = match state
-        .steam_auth
-        .generate_session_token(user_id, version, state.config.jwt_ttl_secs)
-    {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("JWT generation failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
-    };
-    (StatusCode::OK, Json(TokenResponse { token })).into_response()
+pub async fn browser_link_confirm(State(state):State<Arc<AppState>>,headers:HeaderMap,Json(body):Json<IntentBody>)->Response{
+    let Some(ValidatedSession::Browser(c))=authenticate_headers(&state,&headers,true).await else{return StatusCode::UNAUTHORIZED.into_response()};
+    let user=uuid::Uuid::parse_str(&c.sub).unwrap();
+    match state.store.confirm_discord_link(body.intent_id,user,"browser",c.sid).await{Ok(Ok(()))=>StatusCode::NO_CONTENT.into_response(),Ok(Err("expired"))=>StatusCode::GONE.into_response(),Ok(Err(_))=>StatusCode::CONFLICT.into_response(),Err(_)=>StatusCode::INTERNAL_SERVER_ERROR.into_response()}
 }
-
-/// Revoke the session token presented in `Authorization: Bearer <token>` by
-/// bumping the player's token_version (all previously minted tokens die).
-pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    let Some(auth) = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "unauthorized"})),
-        )
-            .into_response();
-    };
-    let Some(token) = auth.strip_prefix("Bearer ") else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "unauthorized"})),
-        )
-            .into_response();
-    };
-    let (user_id, _) = match state.steam_auth.validate_session_token(token) {
-        Ok(pair) => pair,
-        Err(_) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "unauthorized"})),
-            )
-                .into_response();
-        }
-    };
-    match state.store.bump_token_version(user_id).await {
-        Ok(()) => (),
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
-    }
-    StatusCode::NO_CONTENT.into_response()
+pub async fn native_link_start(State(state):State<Arc<AppState>>,headers:HeaderMap)->Response{
+    let Some(ValidatedSession::Native(c))=authenticate_headers(&state,&headers,true).await else{return StatusCode::UNAUTHORIZED.into_response()};
+    let Some(_cfg)=state.auth_providers.get("discord") else{return StatusCode::NOT_FOUND.into_response()};
+    let Some(public)=state.config.public_url.as_deref() else{return StatusCode::SERVICE_UNAVAILABLE.into_response()};
+    let handoff=match state.store.create_oauth_handoff(c.sid).await{Ok(v)=>v,Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    let url=format!("{}/auth/discord/login?native_handoff={}",public.trim_end_matches('/'),url::form_urlencoded::byte_serialize(handoff.as_bytes()).collect::<String>());
+    (StatusCode::CREATED,Json(serde_json::json!({"authorization_url":url}))).into_response()
+}
+pub async fn native_link_confirm(State(state):State<Arc<AppState>>,headers:HeaderMap,Json(body):Json<IntentBody>)->Response{
+    let Some(ValidatedSession::Native(c))=authenticate_headers(&state,&headers,true).await else{return StatusCode::UNAUTHORIZED.into_response()};
+    let user=uuid::Uuid::parse_str(&c.sub).unwrap();
+    match state.store.confirm_discord_link(body.intent_id,user,"native",c.sid).await{Ok(Ok(()))=>StatusCode::NO_CONTENT.into_response(),Ok(Err("expired"))=>StatusCode::GONE.into_response(),Ok(Err(_))=>StatusCode::CONFLICT.into_response(),Err(_)=>StatusCode::INTERNAL_SERVER_ERROR.into_response()}
+}
+pub async fn revoke_link(State(state):State<Arc<AppState>>,headers:HeaderMap)->Response{
+    let Some(ValidatedSession::Browser(c))=authenticate_headers(&state,&headers,true).await else{return StatusCode::UNAUTHORIZED.into_response()};
+    let user=uuid::Uuid::parse_str(&c.sub).unwrap();
+    if !state.store.has_account(user,"steam").await.unwrap_or(false){return StatusCode::FORBIDDEN.into_response()}
+    match state.store.revoke_discord_link(user).await{Ok(())=>StatusCode::NO_CONTENT.into_response(),Err(_)=>StatusCode::INTERNAL_SERVER_ERROR.into_response()}
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_token_redirect, validate_return_to};
+    use super::validate_return_to;
 
     #[test]
     fn validate_return_to_table() {
@@ -816,52 +419,15 @@ mod tests {
             ("javascript:alert(1)", None, false),
             ("/x?a=b", None, false),
             ("/x#frag", None, false),
-            (
-                "https://evil.com/x",
-                Some("https://lobby.example.com"),
-                false,
-            ),
-            (
-                "https://lobby.example.com/cb",
-                Some("https://lobby.example.com"),
-                true,
-            ),
+            ("https://evil.com/x", Some("https://lobby.example.com"), false),
+            ("https://lobby.example.com/cb", Some("https://lobby.example.com"), true),
             ("https://lobby.example.com/cb", None, false),
-            (
-                "https://lobby.example.com/cb",
-                Some("https://lobby.example.com/"),
-                true,
-            ),
-            (
-                "https://lobby.example.com/cb?x=1",
-                Some("https://lobby.example.com"),
-                true,
-            ),
-            (
-                "https://lobby.example.com/cb#frag",
-                Some("https://lobby.example.com"),
-                false,
-            ),
+            ("https://lobby.example.com/cb?x=1", Some("https://lobby.example.com"), true),
+            ("https://lobby.example.com/cb#frag", Some("https://lobby.example.com"), false),
         ];
         for (return_to, public_url, expected) in cases {
-            assert_eq!(
-                validate_return_to(return_to, *public_url),
-                *expected,
-                "return_to={return_to:?}, public_url={public_url:?}"
-            );
+            assert_eq!(validate_return_to(return_to, *public_url), *expected);
         }
-    }
-
-    #[test]
-    fn token_redirect_uses_fragment() {
-        assert_eq!(
-            build_token_redirect("/dashboard", "abc"),
-            "/dashboard#token=abc"
-        );
-        assert_eq!(
-            build_token_redirect("https://lobby.example.com/cb", "xyz"),
-            "https://lobby.example.com/cb#token=xyz"
-        );
     }
 }
 
@@ -924,13 +490,13 @@ pub async fn game_result(
 #[derive(Serialize)]
 pub struct ModeInfo {
     pub name: String,
-    pub game_type: lobby_core::types::GameType,
+    pub game_type: lobby_core::types::ConnectionStrategy,
 }
 
 /// The modes the server actually runs — the demo populates its dropdown from this.
 pub async fn modes(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(
-        serde_json::json!({ "modes": state.game_modes.iter().map(|(n, t)| ModeInfo { name: n.clone(), game_type: *t }).collect::<Vec<_>>() }),
+        serde_json::json!({ "modes": state.game_modes.iter().map(|spec| ModeInfo { name: spec.id.to_owned(), game_type: spec.connection }).collect::<Vec<_>>() }),
     )
 }
 
@@ -940,7 +506,7 @@ pub async fn api_leaderboard(
     State(state): State<Arc<AppState>>,
     Path(game_mode): Path<String>,
 ) -> Response {
-    let known = state.game_modes.iter().any(|(n, _)| n == &game_mode);
+    let known = state.game_modes.iter().any(|spec| spec.id == game_mode);
     if !known {
         return (
             StatusCode::NOT_FOUND,
@@ -996,7 +562,7 @@ pub async fn api_player(
             .into_response();
     };
 
-    let identities = match state.store.user_identities(user_id).await {
+    let identities = match state.store.accounts_for_user(user_id).await {
         Ok(rows) => rows
             .into_iter()
             .map(|(provider, last_login_at)| PlayerIdentity {
@@ -1094,13 +660,18 @@ pub async fn auth_config(State(state): State<Arc<AppState>>) -> Json<serde_json:
     if state.config.public_url.is_some() {
         providers.push("steam");
     }
-    providers.extend(state.auth_providers.ids());
+    if state.config.steam_backed_accounts_only {
+        if state.auth_providers.get("discord").is_some() {
+            providers.push("discord");
+        }
+    } else {
+        providers.extend(state.auth_providers.ids());
+    }
     Json(serde_json::json!({
+        "ranked_queue_enabled": state.config.ranked_queue_enabled,
         "providers": providers,
-        "dev_mode": state.config.auth_dev_mode,
-        // Guests are NOT a provider-registry entry (their flow is a POST to
-        // /auth/guest, not an OAuth redirect), so they're a separate boolean.
-        "guest_login": true,
+        "dev_mode": state.config.auth_dev_mode && !state.config.steam_backed_accounts_only,
+        "guest_login": !state.config.steam_backed_accounts_only,
     }))
 }
 

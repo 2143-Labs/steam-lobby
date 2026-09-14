@@ -20,7 +20,8 @@ FROM rust:1.97.1-alpine AS builder
 # Keep openssl-dev/pkgconfig even though nothing links openssl: removing them
 # risks breaking a transitive build dep and the layer is cached anyway.
 RUN apk add --no-cache musl-dev pkgconfig openssl-dev protobuf protobuf-dev ca-certificates \
- && addgroup -S app && adduser -S -G app app
+ && addgroup -S -g 10001 app \
+ && adduser -S -D -H -u 10001 -G app app
 WORKDIR /app
 
 # Layer 1 — bake the dependency graph. Only manifests + stub sources are copied,
@@ -61,10 +62,11 @@ COPY --from=1 /app/lobby-server/migrations /migrations
 # rustls bundles webpki-roots, so the binary works without these — kept as
 # belt-and-braces for any future rustls-native-certs use.
 COPY --from=1 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-# scratch has no users; the app user from the builder lets USER app resolve.
+# scratch has no users; retain passwd/group for diagnostics while enforcing the
+# same fixed numeric identity even when name resolution is unavailable.
 COPY --from=1 /etc/passwd /etc/passwd
 COPY --from=1 /etc/group /etc/group
-USER app
+USER 10001:10001
 EXPOSE 8080
 # No HEALTHCHECK: scratch has no shell; the k8s Deployment probes /health already.
 CMD ["/usr/local/bin/lobby-server"]

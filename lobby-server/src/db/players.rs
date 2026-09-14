@@ -175,77 +175,175 @@ impl PostgresStore {
         display_name: &str,
         verified: bool,
     ) -> Result<uuid::Uuid> {
-        // Identity already linked -> update the display name and return.
-        let existing = sqlx::query_as::<_, (uuid::Uuid,)>(
-            "SELECT user_id FROM user_identities WHERE provider = $1 AND provider_uid = $2",
+        if self.steam_backed_accounts_only && (!verified || provider != "steam") {
+            return Err(LobbyError::SteamAuthFailed(
+                "account creation is restricted to verified Steam identities".into(),
+            ));
+        }
+        let steam_id = if provider == "steam" {
+            Some(provider_uid.parse::<i64>().map_err(|_| {
+                LobbyError::SteamAuthFailed("invalid Steam identity".into())
+            })?)
+        } else {
+            None
+        };
+
+        // The accounts row is the ownership authority. Lock it before touching
+        // either the user or login timestamps so concurrent logins cannot
+        // create or reassign the same provider subject.
+        let mut tx = self.pool.begin().await.map_err(map_db_error)?;
+        if let Some((user_id,)) = sqlx::query_as::<_, (uuid::Uuid,)>(
+            "SELECT user_id FROM accounts WHERE provider=$1 AND provider_uid=$2 FOR UPDATE",
         )
         .bind(provider)
         .bind(provider_uid)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(map_db_error)?;
-        if let Some((user_id,)) = existing {
+        .map_err(map_db_error)?
+        {
             sqlx::query(
-                "UPDATE users SET display_name = $1, last_login_at = NOW() WHERE id = $2",
+                "UPDATE users SET display_name=CASE WHEN $1='' THEN display_name ELSE $1 END, last_login_at=NOW() WHERE id=$2",
             )
             .bind(display_name)
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(map_db_error)?;
+            sqlx::query(
+                "UPDATE accounts SET last_login_at=NOW() WHERE provider=$1 AND provider_uid=$2",
+            )
+            .bind(provider)
+            .bind(provider_uid)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_error)?;
+            tx.commit().await.map_err(map_db_error)?;
             return Ok(user_id);
         }
 
-        let user_id: uuid::Uuid = if provider == "steam" {
-            // The uid is a decimal SteamID64 — the users.steam_id column holds
-            // the Steam identity, so upsert by it.
+        let user_id = if let Some(steam_id) = steam_id {
             sqlx::query_as::<_, (uuid::Uuid,)>(
-                "INSERT INTO users (steam_id, display_name, primary_provider) \
-                 VALUES ($1, $2, 'steam') \
-                 ON CONFLICT (steam_id) DO UPDATE SET display_name = EXCLUDED.display_name, last_login_at = NOW() \
-                 RETURNING id",
+                "INSERT INTO users (steam_id,display_name,primary_provider) VALUES ($1,$2,'steam') ON CONFLICT (steam_id) DO UPDATE SET display_name=CASE WHEN EXCLUDED.display_name='' THEN users.display_name ELSE EXCLUDED.display_name END,last_login_at=NOW() RETURNING id",
             )
-            .bind(provider_uid.parse::<i64>().unwrap_or(0))
+            .bind(steam_id)
             .bind(display_name)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(map_db_error)?
             .0
         } else {
-            // Discord/au2143: steam_id stays NULL; primary_provider = provider.
             sqlx::query_as::<_, (uuid::Uuid,)>(
-                "INSERT INTO users (display_name, primary_provider) \
-                 VALUES ($1, $2) \
-                 RETURNING id",
+                "INSERT INTO users (display_name,primary_provider) VALUES ($1,$2) RETURNING id",
             )
             .bind(display_name)
             .bind(provider)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(map_db_error)?
             .0
         };
 
         if verified {
-            sqlx::query(
-                "INSERT INTO user_identities (provider, provider_uid, user_id, last_login_at) \
-                 VALUES ($1, $2, $3, NOW()) \
-                 ON CONFLICT (provider, provider_uid) DO UPDATE SET last_login_at = NOW()",
+            let inserted = sqlx::query(
+                "INSERT INTO accounts (provider,provider_uid,user_id,last_login_at,linked_at) VALUES ($1,$2,$3,NOW(),NOW()) ON CONFLICT (provider,provider_uid) DO NOTHING",
             )
             .bind(provider)
             .bind(provider_uid)
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(map_db_error)?;
+            if inserted.rows_affected() == 0 {
+                // A concurrent transaction won the subject. Roll back our
+                // provisional user, then return the canonical owner.
+                tx.rollback().await.map_err(map_db_error)?;
+                let (owner,) = sqlx::query_as::<_, (uuid::Uuid,)>(
+                    "SELECT user_id FROM accounts WHERE provider=$1 AND provider_uid=$2",
+                )
+                .bind(provider)
+                .bind(provider_uid)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(map_db_error)?;
+                return Ok(owner);
+            }
         }
+        tx.commit().await.map_err(map_db_error)?;
         Ok(user_id)
     }
 
     /// Brand-new identity-less account: steam_id NULL, primary_provider
-    /// 'guest', no user_identities row. Plain INSERT — every call is a fresh
-    /// account; losing the session JWT loses the account (by design).
+    /// 'guest', no accounts row. Plain INSERT — every call is a fresh account;
+    pub async fn login_linked_account(
+        &self,
+        provider: &str,
+        provider_uid: &str,
+        display_name: &str,
+    ) -> Result<Option<uuid::Uuid>> {
+        let mut tx = self.pool.begin().await.map_err(map_db_error)?;
+        let row = sqlx::query_as::<_, (uuid::Uuid,)>(
+            "SELECT a.user_id FROM accounts a WHERE a.provider=$1 AND a.provider_uid=$2 AND EXISTS(SELECT 1 FROM accounts steam WHERE steam.user_id=a.user_id AND steam.provider='steam') FOR UPDATE",
+        )
+        .bind(provider)
+        .bind(provider_uid)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+        let Some((user_id,)) = row else {
+            tx.rollback().await.map_err(map_db_error)?;
+            return Ok(None);
+        };
+        sqlx::query(
+            "UPDATE users SET display_name=CASE WHEN $1='' THEN display_name ELSE $1 END,last_login_at=NOW() WHERE id=$2",
+        )
+        .bind(display_name)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+        sqlx::query(
+            "UPDATE accounts SET last_login_at=NOW() WHERE provider=$1 AND provider_uid=$2 AND user_id=$3",
+        )
+        .bind(provider)
+        .bind(provider_uid)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+        tx.commit().await.map_err(map_db_error)?;
+        Ok(Some(user_id))
+    }
+
+    pub async fn account_owner(&self, provider: &str, provider_uid: &str) -> Result<Option<uuid::Uuid>> {
+        sqlx::query_as::<_, (uuid::Uuid,)>(
+            "SELECT user_id FROM accounts WHERE provider=$1 AND provider_uid=$2",
+        )
+        .bind(provider)
+        .bind(provider_uid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_db_error)
+        .map(|row| row.map(|r| r.0))
+    }
+
+    pub async fn has_account(&self, user_id: uuid::Uuid, provider: &str) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE user_id=$1 AND provider=$2)",
+        )
+        .bind(user_id)
+        .bind(provider)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_db_error)
+    }
+
+    /// losing the session JWT loses the account (by design).
     pub async fn create_guest_user(&self, display_name: &str) -> Result<uuid::Uuid> {
+        if self.steam_backed_accounts_only {
+            return Err(LobbyError::SteamAuthFailed(
+                "guest accounts are disabled".into(),
+            ));
+        }
         let row = sqlx::query_as::<_, (uuid::Uuid,)>(
             "INSERT INTO users (display_name, primary_provider) VALUES ($1, 'guest') RETURNING id",
         )
@@ -311,12 +409,12 @@ impl PostgresStore {
 
     /// The player's linked identities (provider + last login). The
     /// provider_uid is deliberately NOT returned — it never leaves the server.
-    pub async fn user_identities(
+    pub async fn accounts_for_user(
         &self,
         user_id: uuid::Uuid,
     ) -> Result<Vec<(String, DateTime<Utc>)>> {
         let rows = sqlx::query_as::<_, (String, DateTime<Utc>)>(
-            "SELECT provider, last_login_at FROM user_identities \
+            "SELECT provider, last_login_at FROM accounts \
              WHERE user_id = $1 ORDER BY last_login_at DESC",
         )
         .bind(user_id)

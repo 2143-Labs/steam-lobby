@@ -11,7 +11,7 @@
 //! println!("Logged in as {} ({})", auth.display_name, auth.player_id);
 //!
 //! // Enter queue
-//! client.begin_matchmaking("ranked_1v1", "normal").await?;
+//! client.begin_matchmaking("pong_1v1", "normal").await?;
 //!
 //! // Wait for a match
 //! if let Some(m) = client.wait_for_match().await? {
@@ -183,7 +183,7 @@ pub enum ServerEvent {
         match_token: String,
         opponent: OpponentInfo,
         timeout_ms: u64,
-        game_type: lobby_core::types::GameType,
+        game_type: lobby_core::types::ConnectionStrategy,
     },
     #[serde(rename = "game_server_ready")]
     GameServerReady {
@@ -321,7 +321,7 @@ pub struct MatchFound {
     pub match_token: String,
     pub opponent: OpponentInfo,
     pub timeout_ms: u64,
-    pub game_type: lobby_core::types::GameType,
+    pub game_type: lobby_core::types::ConnectionStrategy,
 }
 
 #[derive(Debug, thiserror::Error)]

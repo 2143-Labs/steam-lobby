@@ -77,7 +77,7 @@ impl<CB: GameCallbacks> MatchManager<CB> {
         if m.status != MatchStatus::InProgress {
             return Err(LobbyError::MatchStateMismatch(token.to_string()));
         }
-        if m.game_type == crate::types::GameType::Server {
+        if m.connection == crate::types::ConnectionStrategy::Server {
             return Err(LobbyError::MatchStateMismatch(token.to_string()));
         }
         if user_id != m.player_a && user_id != m.player_b {

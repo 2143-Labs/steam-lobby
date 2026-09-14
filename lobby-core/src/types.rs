@@ -43,9 +43,50 @@ pub enum MatchStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum GameType {
+pub enum ConnectionStrategy {
     P2p,
     Server,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultAuthority {
+    ServerReferee,
+    Gameserver,
+    NativeReport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeSpec {
+    pub id: &'static str,
+    pub connection: ConnectionStrategy,
+    pub authority: ResultAuthority,
+}
+
+pub static MODE_SPECS: [ModeSpec; 4] = [
+    ModeSpec {
+        id: "pong_1v1",
+        connection: ConnectionStrategy::P2p,
+        authority: ResultAuthority::ServerReferee,
+    },
+    ModeSpec {
+        id: "rps_1v1",
+        connection: ConnectionStrategy::P2p,
+        authority: ResultAuthority::ServerReferee,
+    },
+    ModeSpec {
+        id: "server_arena",
+        connection: ConnectionStrategy::Server,
+        authority: ResultAuthority::Gameserver,
+    },
+    ModeSpec {
+        id: "umvc3_1v1",
+        connection: ConnectionStrategy::P2p,
+        authority: ResultAuthority::NativeReport,
+    },
+];
+
+pub fn mode_spec(id: &str) -> Option<&'static ModeSpec> {
+    MODE_SPECS.iter().find(|spec| spec.id == id)
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,7 +140,7 @@ pub struct MatchInfo {
     pub player_b: PlayerId,
     pub player_b_difficulty: MatchDifficulty,
     pub game_mode: String,
-    pub game_type: GameType,
+    pub connection: ConnectionStrategy,
     pub status: MatchStatus,
     pub created_at: DateTime<Utc>,
     pub accepted_at: Option<DateTime<Utc>>,
@@ -155,8 +196,6 @@ pub struct QueueEntry {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use serde_json::json;
-
 
     #[test]
     fn snake_case_enums_serialize_lowercase() {
@@ -168,9 +207,12 @@ mod tests {
             serde_json::to_string(&PlayerState::MatchAccepted).unwrap(),
             "\"match_accepted\""
         );
-        assert_eq!(serde_json::to_string(&GameType::P2p).unwrap(), "\"p2p\"");
         assert_eq!(
-            serde_json::to_string(&GameType::Server).unwrap(),
+            serde_json::to_string(&ConnectionStrategy::P2p).unwrap(),
+            "\"p2p\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ConnectionStrategy::Server).unwrap(),
             "\"server\""
         );
         assert_eq!(
@@ -230,8 +272,8 @@ mod tests {
             player_a_difficulty: MatchDifficulty::Normal,
             player_b: uuid::Uuid::from_u128(402),
             player_b_difficulty: MatchDifficulty::Easy,
-            game_mode: "ranked_1v1".to_string(),
-            game_type: GameType::Server,
+            game_mode: "pong_1v1".to_string(),
+            connection: ConnectionStrategy::Server,
             status: MatchStatus::PendingAccept,
             created_at: Utc::now(),
             accepted_at: None,
@@ -256,7 +298,7 @@ mod tests {
         assert_eq!(back.match_token, m.match_token);
         assert_eq!(back.player_a, m.player_a);
         assert_eq!(back.player_b, m.player_b);
-        assert_eq!(back.game_type, m.game_type);
+        assert_eq!(back.connection, m.connection);
         assert_eq!(back.status, m.status);
         assert_eq!(back.join_token, m.join_token);
         assert_eq!(back.accepted_a, m.accepted_a);

@@ -11,6 +11,7 @@ pub mod activities;
 pub mod schedule;
 pub mod signals;
 pub mod workflows;
+pub mod umvc3;
 // The SDK worker runs workflow tasks on an internal `tokio::task::LocalSet`
 // (workflow state uses `Rc<RefCell>` — not `Send`), so `Worker::run()` cannot
 // be driven from a multi-threaded runtime via `tokio::spawn`. It runs on its
@@ -103,7 +104,11 @@ async fn run_worker_inner(
         .register_workflow::<workflows::UserSessionWorkflow>()?
         .register_workflow::<workflows::PairOnceWorkflow>()?
         .register_workflow::<workflows::P2PMatchWorkflow>()?
+        .register_workflow::<umvc3::UMVC3MatchWorkflow>()?
         .register_activities(activities::LobbyActivities {
+            state: state.clone(),
+        })
+        .register_activities(umvc3::Umvc3Activities {
             state: state.clone(),
         })
         .build();
@@ -114,16 +119,22 @@ async fn run_worker_inner(
     // the server appends a timestamp to each scheduled workflow ID, so Skip —
     // not the `pair-{mode}` prefix — prevents concurrent pairing runs (the
     // `FOR UPDATE` in `pair_next_match` is the second line of defense).
-    // server_arena (GameType::Server) stays in-process — the ticker still
+    // server_arena (Gameserver authority) stays in-process — the ticker still
     // pairs it. Schedules survive restarts by design (creating an existing ID
     // is an error, handled below); the worker deletes only the schedules THIS
     // boot created on shutdown, so tests don't accumulate schedules on the
     // dev Temporal while production (which never stops the worker) persists.
     let mut created_schedules: Vec<String> = Vec::new();
-    for (mode, game_type) in &state.game_modes {
-        if *game_type != lobby_core::types::GameType::P2p {
+    for spec in &state.game_modes {
+        let pairing_enabled = match spec.authority {
+            lobby_core::types::ResultAuthority::ServerReferee => true,
+            lobby_core::types::ResultAuthority::NativeReport => state.config.ranked_queue_enabled,
+            lobby_core::types::ResultAuthority::Gameserver => false,
+        };
+        if !pairing_enabled {
             continue;
         }
+        let mode = spec.id;
         let schedule_id = format!("matchmaker-{mode}-{}", state.config.temporal_task_queue);
         match client
             .create_schedule(
@@ -131,7 +142,7 @@ async fn run_worker_inner(
                 temporalio_client::schedules::CreateScheduleOptions::builder()
                     .action(temporalio_client::schedules::ScheduleAction::start_workflow(
                         workflows::PairOnceWorkflow::run,
-                        workflows::PairOnceArgs { mode: mode.clone() },
+                        workflows::PairOnceArgs { mode: mode.to_owned() },
                         &state.config.temporal_task_queue,
                         // The task queue suffix keeps parallel workers' runs
                         // distinct: Temporal appends only a 1-second-resolution
@@ -182,6 +193,11 @@ async fn run_worker_inner(
         state.config.temporal_namespace
     );
     worker.run().await?;
+    // A stopped worker must not leave readiness or lifecycle callers holding a
+    // stale client that can no longer make progress.
+    if let Ok(mut slot) = state.temporal.write() {
+        *slot = None;
+    }
     // Worker stopped (the test harness fired the shutdown handle): delete the
     // schedules this boot created so tests don't accumulate schedules on the
     // dev Temporal. Production never stops the worker, so this is a no-op

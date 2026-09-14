@@ -48,6 +48,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
     pub async fn begin_matchmaking(
         &self,
         user_id: PlayerId,
+        game_mode: &str,
         difficulty: MatchDifficulty,
         player_store: &dyn PlayerStore,
     ) -> Result<()> {
@@ -63,7 +64,7 @@ impl<CB: GameCallbacks> PlayerManager<CB> {
             });
         }
         self.callbacks
-            .on_player_queueing(user_id, "ranked_1v1", difficulty)
+            .on_player_queueing(user_id, game_mode, difficulty)
             .await?;
         player_store
             .set_player_state(user_id, PlayerState::Queueing)

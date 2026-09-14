@@ -16,6 +16,7 @@ use tokio::time::{Duration, timeout};
 
 use crate::pong::{PongInput, RollbackHealth};
 use crate::state::{AppState, ConnectionEntry};
+use crate::steam_auth::ValidatedSession;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -36,6 +37,48 @@ pub enum ClientMessage {
     DeclineMatch { match_token: String },
     /// Click START = my P2P connection is established; begin the match.
     StartMatch { match_token: String },
+    /// Durable ranked command variants use a client-generated command ID.
+    Queue {
+        command_id: uuid::Uuid,
+        mode: String,
+        difficulty: MatchDifficulty,
+    },
+    CancelQueue { command_id: uuid::Uuid },
+    Accept { command_id: uuid::Uuid, match_token: String },
+    Decline { command_id: uuid::Uuid, match_token: String },
+    Trying {
+        command_id: uuid::Uuid,
+        match_token: String,
+        attempt_id: uuid::Uuid,
+        role: crate::commands::LobbyRole,
+        lobby_id: Option<String>,
+    },
+    Connect {
+        command_id: uuid::Uuid,
+        match_token: String,
+        attempt_id: uuid::Uuid,
+        local_reached: bool,
+        peer_reached: bool,
+    },
+    Ready {
+        command_id: uuid::Uuid,
+        match_token: String,
+        attempt_id: uuid::Uuid,
+    },
+    Report {
+        command_id: uuid::Uuid,
+        match_token: String,
+        outcome: crate::commands::RelativeOutcome,
+        score: Option<String>,
+        checksum: Option<String>,
+        end_frame: Option<u64>,
+    },
+    Abandon {
+        command_id: uuid::Uuid,
+        match_token: String,
+        target: crate::commands::AbandonTarget,
+    },
+    RankedHeartbeat { command_id: uuid::Uuid },
     /// Pong paddle target (normalized paddle-center Y, 0..1), frame-stamped.
     /// `frame` is the sim frame this input applies to (the client's
     /// `session.frame + 1`). No `#[serde(default)]` — clean cutover, the demo
@@ -120,7 +163,7 @@ pub enum ServerMessage {
         match_token: String,
         opponent: OpponentInfo,
         timeout_ms: u64,
-        game_type: lobby_core::types::GameType,
+        game_type: lobby_core::types::ConnectionStrategy,
         game_mode: String,
     },
     /// Both players accepted — the START window of `start_timeout_secs` is open.
@@ -246,6 +289,12 @@ pub enum ServerMessage {
     MatchExpired { match_token: String },
     /// The player's queue entry was dropped (stale heartbeat).
     QueueExpired,
+    /// Admission receipt for a durable ranked command.
+    CommandReceipt {
+        receipt: uuid::Uuid,
+        status: crate::commands::CommandStatus,
+        error_code: Option<String>,
+    },
     /// Protocol-level error.
     Error { code: String, message: String },
 }
@@ -265,36 +314,73 @@ pub async fn ws_route(
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    if let Some(origin) = headers.get(axum::http::header::ORIGIN) {
-        let s = origin.to_str().unwrap_or_default();
-        // Allowed if the origin is in the CORS allowlist, is the
-        // file:// null origin in dev mode, or is the same origin
-        // that served the page (the demo is embedded at /).
-        let same_origin = headers
+    let cookie_session = crate::routes::authenticate_cookie_ws(&app_state, &headers).await;
+    let origin = headers.get(axum::http::header::ORIGIN).and_then(|v|v.to_str().ok());
+    // Token/bearer handshakes keep the historical same-host allowance (the page
+    // served by this very host), plus the configured CORS allowlist and the
+    // dev-only null origin. Cookie credentials never take this path.
+    let same_host_origin = origin.is_some_and(|value| {
+        let Ok(parsed) = url::Url::parse(value) else {
+            return false;
+        };
+        headers
             .get(axum::http::header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .is_some_and(|host| s == format!("http://{host}") || s == format!("https://{host}"));
-        let allowed = app_state.config.cors_origins.iter().any(|a| a == s)
-            || (app_state.config.auth_dev_mode && origin.as_bytes() == b"null")
-            || same_origin;
-        if !allowed {
-            return axum::http::StatusCode::FORBIDDEN.into_response();
-        }
+            .and_then(|v|v.to_str().ok())
+            .is_some_and(|host| {
+                parsed.host_str().is_some_and(|h| {
+                    let port = parsed.port().or_else(|| parsed.port_or_known_default());
+                    host == h || port.is_some_and(|p| host == format!("{h}:{p}"))
+                })
+            })
+    });
+    let bearer_origin_allowed = origin.is_none_or(|s| {
+        same_host_origin
+            || app_state.config.cors_origins.iter().any(|a|a==s)
+            || (app_state.config.auth_dev_mode && s=="null")
+    });
+    // A cookie credential is ambient, so it may only ever upgrade from the
+    // exact PUBLIC_URL origin (enforced in `authenticate_cookie_ws`). The CORS
+    // allowlist authorizes bearer/token handshakes only, never a cookie one: a
+    // cookie sent from a merely allowlisted origin must not authenticate.
+    let presents_cookie = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v|v.to_str().ok())
+        .is_some_and(|raw| raw.split(';').any(|part| {
+            part.trim()
+                .split_once('=')
+                .is_some_and(|(key,_)|key=="lobby_session")
+        }));
+    let authorized = if presents_cookie {
+        cookie_session.is_some()
+    } else {
+        bearer_origin_allowed
+    };
+    if !authorized {
+        return axum::http::StatusCode::FORBIDDEN.into_response();
     }
     ws.max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
-        .on_upgrade(move |socket| handle_ws(socket, app_state, peer))
+        .on_upgrade(move |socket| handle_ws(socket, app_state, peer, cookie_session))
 }
 /// Run a WebSocket session: authenticate, then pump client commands and
 /// server broadcasts until either side closes.
-pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::SocketAddr) {
+pub async fn handle_ws(
+    ws: WebSocket,
+    state: Arc<AppState>,
+    peer_ip: std::net::SocketAddr,
+    cookie_session: Option<ValidatedSession>,
+) {
     let (mut sender, mut receiver) = ws.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-    // Auth phase
-    let user_id = match authenticate(&mut receiver, &mut sender, &state, peer_ip).await {
-        Ok(user_id) => user_id,
-        Err(_) => return,
+    let (user_id, auth_session) = if let Some(session)=cookie_session {
+        let Some(user_id)=crate::routes::revalidate_session(&state,&session).await else{return};
+        (user_id,Some(session))
+    } else {
+        match authenticate(&mut receiver, &mut sender, &state, peer_ip).await {
+            Ok(result) => result,
+            Err(_) => return,
+        }
     };
 
     // Send auth ok — include the player's persisted state so a reconnecting
@@ -393,6 +479,12 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
                                 continue;
                             }
                         };
+                        if let Some(session)=&auth_session
+                            && crate::routes::revalidate_session(&state,session).await.is_none()
+                        {
+                            disconnect_reason = "session revoked";
+                            break;
+                        }
                         handle_client_message(
                             cm,
                             user_id,
@@ -438,19 +530,27 @@ pub async fn handle_ws(ws: WebSocket, state: Arc<AppState>, peer_ip: std::net::S
             .map(|e| e.generation == my_gen)
             .unwrap_or(false)
     };
-    // Temporal path: end THIS connection's session workflow — unconditionally,
-    // because with per-connection sessions a connection that ends (including
-    // one replaced by a newer connection for the same player) must end its own
-    // workflow. The `is_current` guard below still decides the player-state
-    // reset (only the current connection's death resets the player).
+    // Ending a socket only ends its connection workflow. Ranked queue leases
+    // and canonical match state are driven by durable commands and deadlines;
+    // transport loss is never evidence of decline, abandonment, or a result.
     crate::temporal::signals::signal_disconnect(&state, user_id, &session_id).await;
     if is_current {
-        // A brief drop keeps the player queued: the queue entry lives until
-        // the stale sweep evicts it (30s without heartbeat), so a reconnect
-        // within that window must still report "queueing". Only a disconnect
-        // with no queue entry resets the player to the menus.
         let still_queued = state.store.is_queued(user_id).await.unwrap_or(false);
-        if !still_queued {
+        let has_live_match = state
+            .store
+            .get_player_state(user_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|player| {
+                matches!(
+                    player.state,
+                    lobby_core::types::PlayerState::MatchAccepted
+                        | lobby_core::types::PlayerState::InMatch
+                        | lobby_core::types::PlayerState::Reporting
+                )
+            });
+        if !still_queued && !has_live_match {
             let _ = state
                 .player_manager
                 .handle_disconnect(user_id, &state.store)
@@ -469,7 +569,7 @@ async fn authenticate(
     sender: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
     state: &Arc<AppState>,
     peer_ip: std::net::SocketAddr,
-) -> Result<uuid::Uuid, ()> {
+) -> Result<(uuid::Uuid,Option<ValidatedSession>), ()> {
     let first_msg = timeout(Duration::from_secs(10), receiver.next()).await;
     let text = match first_msg {
         Ok(Some(Ok(Message::Text(t)))) => t.to_string(),
@@ -510,63 +610,26 @@ async fn authenticate(
     // ── Auth ──
     match cm {
         ClientMessage::Auth { session_token } => {
-            let (user_id, ver) = match state.steam_auth.validate_session_token(&session_token) {
-                Ok(v) => v,
-                Err(_) => {
-                    tracing::warn!("auth failed (invalid session token) from {peer_ip}");
-                    return Err(());
-                }
+            let Some(session)=crate::routes::authenticate_token(state,&session_token).await else{
+                tracing::warn!("auth failed (invalid or revoked session) from {peer_ip}");return Err(())
             };
-            // A token minted before a logout (or a DB error) is rejected.
-            let db_ver = match state.store.get_token_version(user_id).await {
-                Ok(v) => v,
-                Err(_) => {
-                    tracing::warn!("auth failed (token version lookup error) from {peer_ip}");
-                    return Err(());
-                }
-            };
-            if db_ver != ver {
-                tracing::warn!("auth failed (revoked or outdated token) from {peer_ip}");
-                return Err(());
-            }
-            Ok(user_id)
+            let user_id=crate::routes::revalidate_session(state,&session).await.ok_or(())?;
+            Ok((user_id,Some(session)))
         }
         ClientMessage::AuthTicket { ticket } => {
-            if !state.ticket_limiter.check(peer_ip.ip()) {
-                tracing::warn!("auth failed (ticket rate-limited) from {peer_ip}");
-                let _ = sender
-                    .send(Message::Text(
-                        serde_json::to_string(&ServerMessage::Error {
-                            code: "rate_limited".into(),
-                            message: "Too many auth attempts".into(),
-                        })
-                        .unwrap()
-                        .into(),
-                    ))
-                    .await;
-                return Err(());
-            }
-            match state.steam_auth.verify_ticket(&ticket).await {
-                Ok(steam_id) => {
-                    // Same semantics as the HTTP ticket path: a verified
-                    // ticket is a genuine login, so the account + identity
-                    // row are attached and the player_id comes from it.
-                    match state
-                        .store
-                        .find_or_create_user("steam", &steam_id.to_string(), "", true)
-                        .await
-                    {
-                        Ok(user_id) => Ok(user_id),
-                        Err(_) => {
-                            tracing::warn!("auth failed (user lookup error) from {peer_ip}");
-                            Err(())
-                        }
+            if !state.ticket_limiter.check(peer_ip.ip()) { return Err(()) }
+            match state.steam_auth.verify_ticket(&ticket,"matchmaking").await {
+                Ok(steam_id) => match state.store.find_or_create_user("steam",&steam_id.to_string(),"",true).await {
+                    Ok(user_id) => {
+                        let sid=state.store.create_native_session(user_id).await.map_err(|_|())?;
+                        let version=state.store.get_token_version(user_id).await.map_err(|_|())?;
+                        let token=state.steam_auth.generate_native_token(user_id,sid,version).map_err(|_|())?;
+                        let session=state.steam_auth.validate_native_token(&token).map_err(|_|())?;
+                        Ok((user_id,Some(ValidatedSession::Native(session))))
                     }
-                }
-                Err(_) => {
-                    tracing::warn!("auth failed (invalid ticket) from {peer_ip}");
-                    Err(())
-                }
+                    Err(_) => Err(())
+                },
+                Err(_) => Err(()),
             }
         }
         _ => {
@@ -591,9 +654,47 @@ async fn handle_client_message(
     user_id: uuid::Uuid,
     session_id: &str,
     state: &Arc<AppState>,
-    _tx: &mpsc::UnboundedSender<ServerMessage>,
+    tx: &mpsc::UnboundedSender<ServerMessage>,
 ) {
     match cm {
+        ClientMessage::Queue { command_id, mode, difficulty } => {
+            dispatch_ranked(
+                state,
+                user_id,
+                session_id,
+                command_id,
+                crate::commands::RankedCommand::Queue { mode, difficulty },
+                tx,
+            )
+            .await;
+        }
+        ClientMessage::CancelQueue { command_id } => {
+            dispatch_ranked(state, user_id, session_id, command_id, crate::commands::RankedCommand::CancelQueue, tx).await;
+        }
+        ClientMessage::Accept { command_id, match_token } => {
+            dispatch_ranked(state, user_id, session_id, command_id, crate::commands::RankedCommand::Accept { match_token }, tx).await;
+        }
+        ClientMessage::Decline { command_id, match_token } => {
+            dispatch_ranked(state, user_id, session_id, command_id, crate::commands::RankedCommand::Decline { match_token }, tx).await;
+        }
+        ClientMessage::Trying { command_id, match_token, attempt_id, role, lobby_id } => {
+            dispatch_ranked(state, user_id, session_id, command_id, crate::commands::RankedCommand::Trying { match_token, attempt_id, role, lobby_id }, tx).await;
+        }
+        ClientMessage::Connect { command_id, match_token, attempt_id, local_reached, peer_reached } => {
+            dispatch_ranked(state, user_id, session_id, command_id, crate::commands::RankedCommand::Connect { match_token, attempt_id, local_reached, peer_reached }, tx).await;
+        }
+        ClientMessage::Ready { command_id, match_token, attempt_id } => {
+            dispatch_ranked(state, user_id, session_id, command_id, crate::commands::RankedCommand::Ready { match_token, attempt_id }, tx).await;
+        }
+        ClientMessage::Report { command_id, match_token, outcome, score, checksum, end_frame } => {
+            dispatch_ranked(state, user_id, session_id, command_id, crate::commands::RankedCommand::Report { match_token, outcome, score, checksum, end_frame }, tx).await;
+        }
+        ClientMessage::Abandon { command_id, match_token, target } => {
+            dispatch_ranked(state, user_id, session_id, command_id, crate::commands::RankedCommand::Abandon { match_token, target }, tx).await;
+        }
+        ClientMessage::RankedHeartbeat { command_id } => {
+            dispatch_ranked(state, user_id, session_id, command_id, crate::commands::RankedCommand::Heartbeat, tx).await;
+        }
         // ── Matchmaking ──
         ClientMessage::BeginMatchmaking { mode, difficulty } => {
             let diff = match difficulty.as_str() {
@@ -621,7 +722,7 @@ async fn handle_client_message(
             // is p2p-only; they have no START phase and resolve via the
             // gameserver webhook (out of scope).
             let is_server = match state.store.get_match(&match_token).await {
-                Ok(Some(m)) => m.game_type == lobby_core::types::GameType::Server,
+                Ok(Some(m)) => m.connection == lobby_core::types::ConnectionStrategy::Server,
                 _ => false,
             };
             if is_server {
@@ -818,6 +919,43 @@ async fn handle_client_message(
     }
 }
 
+async fn dispatch_ranked(
+    state: &Arc<AppState>,
+    user_id: uuid::Uuid,
+    connection_id: &str,
+    command_id: uuid::Uuid,
+    command: crate::commands::RankedCommand,
+    tx: &mpsc::UnboundedSender<ServerMessage>,
+) {
+    let Ok(session_id) = uuid::Uuid::parse_str(connection_id) else {
+        let _ = tx.send(ServerMessage::Error {
+            code: "invalid_session".into(),
+            message: "Invalid WebSocket session".into(),
+        });
+        return;
+    };
+    let actor = crate::commands::CommandActor {
+        user_id,
+        session_kind: crate::commands::SessionKind::Websocket,
+        session_id,
+    };
+    match crate::commands::dispatch(state, actor, command_id, command).await {
+        Ok(receipt) => {
+            let _ = tx.send(ServerMessage::CommandReceipt {
+                receipt: receipt.receipt,
+                status: receipt.status,
+                error_code: receipt.error_code,
+            });
+        }
+        Err(error) => {
+            let code = crate::commands::error_code(&error).to_owned();
+            let _ = tx.send(ServerMessage::Error {
+                code,
+                message: error.to_string(),
+            });
+        }
+    }
+}
 /// Send `msg` to both players of a match (best-effort; skips disconnected).
 pub async fn notify_match_players(state: &Arc<AppState>, token: &str, msg: ServerMessage) {
     if let Ok(Some(m)) = state.store.get_match(token).await {

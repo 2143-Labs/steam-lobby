@@ -2,9 +2,17 @@ name: server
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Deployment repository to promote
+        required: true
+        type: choice
+        default: none
+        options: [none, reference, timestone]
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,51 +24,193 @@ jobs:
     runs-on: [self-hosted, nixos]
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     permissions:
-      contents: write
+      contents: read
       packages: write
     outputs:
-      image_tag: ${{ steps.meta.outputs.version }}
+      image_tag: ${{ steps.image.outputs.tag }}
+      image_digest: ${{ steps.image.outputs.digest }}
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Docker login
-      run: |
-        echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Docker login
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-    - name: Build and push
-      run: |
-        IMAGE="${{ env.registry }}/${{ env.repo }}:${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_number }}"
-        # Cross-run layer cache on the self-hosted (podman/buildah) runner:
-        # buildx's type=gha cache is unavailable there, so cache to a ghcr tag
-        # instead. The login above covers the cache pull/push. Shared between
-        # push and PR builds; survives runner storage pruning.
-        CACHE_REF="${{ env.registry }}/${{ env.repo }}:buildcache"
-        docker build \
-          --cache-from="type=registry,ref=${CACHE_REF}" \
-          --cache-to="type=registry,ref=${CACHE_REF},mode=max" \
-          -t "$IMAGE" .
-        docker push "$IMAGE"
+      - name: Build, push, and resolve digest
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_number }}"
+          IMAGE="${{ env.registry }}/${{ env.repo }}:${TAG}"
+          CACHE_REF="${{ env.registry }}/${{ env.repo }}:buildcache"
+          docker build \
+            --cache-from="type=registry,ref=${CACHE_REF}" \
+            --cache-to="type=registry,ref=${CACHE_REF},mode=max" \
+            -t "$IMAGE" .
+          digest_file="$(mktemp "${RUNNER_TEMP:-/tmp}/steam-lobby-digest.XXXXXX")"
+          trap 'rm -f "$digest_file"' EXIT
+          # The self-hosted Podman runner writes the digest returned by the
+          # registry for the pushed top-level manifest to this file.
+          docker push --digestfile "$digest_file" "$IMAGE"
+          digest="$(tr -d '\r\n' < "$digest_file")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "Push did not return a valid top-level image digest" >&2
+            exit 1
+          }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
-    - name: Set image tag output
-      id: meta
-      run: echo "version=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
-
-  update-argo:
+  promote-reference:
     needs: build
-    if: github.event_name == 'push'
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'reference'
     runs-on: ubuntu-latest
-    environment: ${{ !contains(github.event.head_commit.message, '[direct-prod]') && 'production' || '' }}
+    environment: production
+    permissions:
+      contents: read
     env:
+      DEPLOY_KEY: ${{ secrets.DEPLOY_KEY_ARGO }}
       NEW_TAG: ${{ needs.build.outputs.image_tag }}
+      IMAGE_DIGEST: ${{ needs.build.outputs.image_digest }}
     steps:
-    - uses: actions/checkout@v4
-      with:
-        repository: 2143-Labs/argo
-        ssh-key: ${{ secrets.DEPLOY_KEY_ARGO }}
+      - name: Validate promotion inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_KEY" || { echo "DEPLOY_KEY_ARGO is required" >&2; exit 1; }
+          [[ "$NEW_TAG" =~ ^[0-9]+$ ]] || { echo "Invalid image tag" >&2; exit 1; }
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Invalid image digest" >&2; exit 1; }
 
-    - name: Update image tag in deployment YAML
-      run: |
-        sed -i "s|\(ghcr\.io/2143-labs/steam-lobby:\)[0-9]*|\1${{ env.NEW_TAG }}|g" workloads/steam-lobby/deployment.yaml
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        git diff --quiet && echo "No changes" || (git commit -am "bump steam-lobby image to ${{ env.NEW_TAG }}" && git push)
+      - uses: actions/checkout@v4
+        with:
+          repository: 2143-Labs/argo
+          ssh-key: ${{ secrets.DEPLOY_KEY_ARGO }}
+
+      - name: Update reference deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$NEW_TAG" <<'PY'
+          import os, re, sys, tempfile
+          from pathlib import Path
+
+          path = Path("workloads/steam-lobby/deployment.yaml")
+          tag = sys.argv[1]
+          lines = path.read_text().splitlines(keepends=True)
+          image = re.compile(r"^(\s*image:\s*)ghcr\.io/2143-labs/steam-lobby(?::[^\s]+|@sha256:[0-9a-f]{64})(\s*)$")
+          hits = [i for i, line in enumerate(lines) if image.match(line.rstrip("\n"))]
+          if len(hits) != 1:
+              raise SystemExit(f"expected one steam-lobby image scalar, found {len(hits)}")
+          match = image.match(lines[hits[0]].rstrip("\n"))
+          lines[hits[0]] = f"{match.group(1)}ghcr.io/2143-labs/steam-lobby:{tag}{match.group(2)}\n"
+
+          names = [i for i, line in enumerate(lines) if re.match(r"^\s*- name:\s*GAME_MODES\s*$", line.rstrip("\n"))]
+          if len(names) != 1:
+              raise SystemExit(f"expected one GAME_MODES entry, found {len(names)}")
+          value = next((i for i in range(names[0] + 1, min(names[0] + 5, len(lines)))
+                        if re.match(r"^\s+value:\s*", lines[i])), None)
+          if value is None:
+              raise SystemExit("GAME_MODES has no nearby value scalar")
+          indent = re.match(r"^(\s*)value:", lines[value]).group(1)
+          lines[value] = f'{indent}value: "pong_1v1:p2p,rps_1v1:p2p"\n'
+
+          strategies = [i for i, line in enumerate(lines) if re.match(r"^  strategy:\s*$", line.rstrip("\n"))]
+          if len(strategies) > 1:
+              raise SystemExit("multiple top-level deployment strategies found")
+          if strategies:
+              start = strategies[0]
+              end = next((i for i in range(start + 1, len(lines))
+                          if re.match(r"^  [A-Za-z][A-Za-z0-9]*:", lines[i])), len(lines))
+              lines[start:end] = ["  strategy:\n", "    type: Recreate\n"]
+          else:
+              selectors = [i for i, line in enumerate(lines) if re.match(r"^  selector:\s*$", line.rstrip("\n"))]
+              if len(selectors) != 1:
+                  raise SystemExit(f"expected one top-level selector, found {len(selectors)}")
+              lines[selectors[0]:selectors[0]] = ["  strategy:\n", "    type: Recreate\n"]
+
+          content = "".join(lines)
+          with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as handle:
+              handle.write(content)
+              temporary = handle.name
+          os.replace(temporary, path)
+          PY
+
+          file="workloads/steam-lobby/deployment.yaml"
+          git diff --check
+          [[ "$(git diff --name-only)" == "$file" ]] || { echo "Unexpected files changed" >&2; exit 1; }
+          if git diff --quiet -- "$file"; then
+            echo "Reference deployment already has the requested configuration"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -- "$file"
+          [[ "$(git diff --cached --name-only)" == "$file" ]] || { echo "Unexpected staged files" >&2; exit 1; }
+          git commit -m "bump steam-lobby image to ${NEW_TAG}"
+          git push
+
+  promote-timestone:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'timestone'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+    env:
+      DEPLOY_KEY: ${{ secrets.DEPLOY_KEY_TIMESTONE_ARGO }}
+      IMAGE_DIGEST: ${{ needs.build.outputs.image_digest }}
+    steps:
+      - name: Validate promotion inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_KEY" || { echo "DEPLOY_KEY_TIMESTONE_ARGO is required" >&2; exit 1; }
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Invalid image digest" >&2; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          repository: 2143-Labs/timestone-argo
+          ssh-key: ${{ secrets.DEPLOY_KEY_TIMESTONE_ARGO }}
+
+      - name: Pin Timestone deployment digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$IMAGE_DIGEST" <<'PY'
+          import os, re, sys, tempfile
+          from pathlib import Path
+
+          path = Path("base/apps/umvc3/deployment.yaml")
+          digest = sys.argv[1]
+          lines = path.read_text().splitlines(keepends=True)
+          image = re.compile(r"^(\s*image:\s*)ghcr\.io/2143-labs/steam-lobby(?:@sha256:[0-9a-f]{64}|:[^\s]+)(\s*)$")
+          hits = [i for i, line in enumerate(lines) if image.match(line.rstrip("\n"))]
+          if len(hits) != 1:
+              raise SystemExit(f"expected one ranked image scalar, found {len(hits)}")
+          match = image.match(lines[hits[0]].rstrip("\n"))
+          lines[hits[0]] = f"{match.group(1)}ghcr.io/2143-labs/steam-lobby@{digest}{match.group(2)}\n"
+          with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as handle:
+              handle.write("".join(lines))
+              temporary = handle.name
+          os.replace(temporary, path)
+          PY
+
+          file="base/apps/umvc3/deployment.yaml"
+          git diff --check
+          [[ "$(git diff --name-only)" == "$file" ]] || { echo "Unexpected files changed" >&2; exit 1; }
+          if git diff --quiet -- "$file"; then
+            echo "Timestone deployment already pins this digest"
+            exit 0
+          fi
+          [[ "$(git diff --numstat -- "$file")" == $'1\t1\t'"$file" ]] || {
+            echo "Expected exactly one image scalar replacement" >&2
+            exit 1
+          }
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -- "$file"
+          [[ "$(git diff --cached --name-only)" == "$file" ]] || { echo "Unexpected staged files" >&2; exit 1; }
+          git commit -m "pin UMVC3 image ${IMAGE_DIGEST}"
+          git push

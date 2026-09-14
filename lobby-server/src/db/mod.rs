@@ -6,18 +6,25 @@ use chrono::{DateTime, Duration, Utc};
 use lobby_core::error::{LobbyError, Result};
 use lobby_core::traits::{MatchStore, PlayerStore, QueueStore, RatingStore};
 use lobby_core::types::{
-    GameType, MatchDifficulty, MatchEvent, MatchInfo, MatchReport, MatchStatus, OpenSkillRating,
-    PlayerInfo, PlayerState, QueueEntry, SteamId,
+    ConnectionStrategy, MatchDifficulty, MatchEvent, MatchInfo, MatchReport, MatchStatus, ModeSpec,
+    OpenSkillRating, PlayerInfo, PlayerState, QueueEntry, ResultAuthority, SteamId,
 };
 use sqlx::PgPool;
 
 pub struct PostgresStore {
     pool: PgPool,
+    steam_backed_accounts_only: bool,
 }
 
 impl PostgresStore {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, steam_backed_accounts_only: bool) -> Self {
+        Self {
+            pool,
+            steam_backed_accounts_only,
+        }
+    }
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
     }
 }
 
@@ -33,10 +40,10 @@ fn parse_difficulty(s: &str) -> MatchDifficulty {
     }
 }
 
-fn parse_game_type(s: &str) -> GameType {
+fn parse_connection(s: &str) -> ConnectionStrategy {
     match s {
-        "server" => GameType::Server,
-        _ => GameType::P2p,
+        "server" => ConnectionStrategy::Server,
+        _ => ConnectionStrategy::P2p,
     }
 }
 
@@ -97,7 +104,7 @@ impl From<MatchRow> for MatchInfo {
             player_b: r.player_b,
             player_b_difficulty: parse_difficulty(&r.player_b_difficulty),
             game_mode: r.game_mode,
-            game_type: parse_game_type(&r.game_type),
+            connection: parse_connection(&r.game_type),
             status: parse_match_status(&r.status),
             created_at: r.created_at,
             accepted_at: r.accepted_at,
@@ -115,6 +122,9 @@ impl From<MatchRow> for MatchInfo {
 }
 
 mod matches;
+pub use matches::{RequeueDecision, StoredResolution, Umvc3Verdict};
 mod players;
+mod sessions;
+pub(crate) use sessions::{LinkIntentError, opaque_token, token_hash};
 mod queue;
 mod ratings;

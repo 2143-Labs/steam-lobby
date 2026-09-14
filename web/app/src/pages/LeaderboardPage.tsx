@@ -10,12 +10,12 @@ function rating(mu: number, sigma: number): number {
 }
 
 export default function LeaderboardPage() {
-  const { game = "ranked_1v1" } = useParams<{ game: string }>();
+  const { game = "pong_1v1" } = useParams<{ game: string }>();
   const navigate = useNavigate();
 
   const modes = useQuery({
     queryKey: ["modes"],
-    queryFn: fetchModes,
+    queryFn: () => fetchModes(),
     staleTime: 60_000,
   });
 

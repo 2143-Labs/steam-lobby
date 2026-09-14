@@ -11,6 +11,8 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 pub mod auth_providers;
+pub mod commands;
+pub use db::{RequeueDecision, StoredResolution, Umvc3Verdict};
 mod db;
 mod gameserver;
 mod pong;
@@ -20,6 +22,7 @@ mod routes;
 mod state;
 mod steam_auth;
 mod steam_redirect;
+mod ranked_routes;
 mod temporal;
 mod ticker;
 mod turn;
@@ -31,7 +34,7 @@ use state::DefaultCallbacks;
 use steam_auth::SteamAuthService;
 
 use lobby_core::traits::QueueStore;
-use lobby_core::types::GameType;
+use lobby_core::types::{ConnectionStrategy, ModeSpec};
 pub use state::AppState; // re-exported so integration tests can name the type
 use state::RuntimeConfig;
 
@@ -47,9 +50,16 @@ pub struct AppConfig {
     pub pair_cooldown_secs: u64, // LOBBY_PAIR_COOLDOWN_S; anti re-pair window after a match
     pub public_url: Option<String>, // PUBLIC_URL; None = relative return_to only
     pub auth_dev_mode: bool,     // AUTH_DEV_MODE; true = /auth/test-token enabled
+    pub steam_backed_accounts_only: bool, // STEAM_BACKED_ACCOUNTS_ONLY
+    pub ranked_queue_enabled: bool, // RANKED_QUEUE_ENABLED
+    pub ranked_queue_lease_secs: u64,
+    pub umvc3_trying_timeout_secs: u64,
+    pub umvc3_connect_timeout_secs: u64,
+    pub umvc3_ready_timeout_secs: u64,
+    pub umvc3_play_timeout_secs: u64,
     pub jwt_ttl_secs: u64,
     pub cors_origins: Vec<String>,
-    pub game_modes: Vec<(String, GameType)>,
+    pub game_modes: Vec<&'static ModeSpec>,
     pub gameserver_creator_url: Option<String>,
     pub gameserver_alloc_timeout_secs: u64,
     pub gameserver_result_timeout_secs: u64,
@@ -118,7 +128,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         .await
         .expect("database migrations failed");
 
-    let store = PostgresStore::new(pool);
+    let store = PostgresStore::new(pool, config.steam_backed_accounts_only);
 
     // Server-authoritative modes need a gameserver creator. With AUTH_DEV_MODE
     // and no explicit URL, fall back to the built-in dev mock creator.
@@ -128,7 +138,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
             && config
                 .game_modes
                 .iter()
-                .any(|(_, t)| *t == GameType::Server) =>
+                .any(|spec| spec.connection == ConnectionStrategy::Server) =>
         {
             (
                 Some(format!(
@@ -143,7 +153,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
     if config
         .game_modes
         .iter()
-        .any(|(_, t)| *t == GameType::Server)
+        .any(|spec| spec.connection == ConnectionStrategy::Server)
         && creator_url.is_none()
     {
         tracing::warn!(
@@ -157,7 +167,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
     if config
         .game_modes
         .iter()
-        .any(|(_, t)| *t == GameType::Server)
+        .any(|spec| spec.connection == ConnectionStrategy::Server)
         && config.public_url.is_none()
     {
         tracing::warn!(
@@ -230,6 +240,13 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         config: RuntimeConfig {
             public_url: config.public_url.clone(),
             auth_dev_mode: config.auth_dev_mode,
+            steam_backed_accounts_only: config.steam_backed_accounts_only,
+            ranked_queue_enabled: config.ranked_queue_enabled,
+            ranked_queue_lease_secs: config.ranked_queue_lease_secs,
+            umvc3_trying_timeout_secs: config.umvc3_trying_timeout_secs,
+            umvc3_connect_timeout_secs: config.umvc3_connect_timeout_secs,
+            umvc3_ready_timeout_secs: config.umvc3_ready_timeout_secs,
+            umvc3_play_timeout_secs: config.umvc3_play_timeout_secs,
             jwt_ttl_secs: config.jwt_ttl_secs,
             cors_origins: config.cors_origins.clone(),
             pong_enabled: config.pong_enabled,
@@ -244,7 +261,6 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
             temporal_namespace: config.temporal_namespace.clone(),
             temporal_task_queue: config.temporal_task_queue.clone(),
         },
-        openid_states: parking_lot::Mutex::new(std::collections::HashMap::new()),
         pong_games: parking_lot::Mutex::new(std::collections::HashMap::new()),
         rps_games: parking_lot::Mutex::new(std::collections::HashMap::new()),
         ticket_limiter: RateLimiter::new(10, std::time::Duration::from_secs(60)),
@@ -253,6 +269,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         next_generation: std::sync::atomic::AtomicU64::new(0),
         temporal: std::sync::RwLock::new(None),
         temporal_shutdown: std::sync::RwLock::new(None),
+        event_notify: tokio::sync::Notify::new(),
     });
 
     tokio::spawn(ticker::tick_loop(state.clone(), config.ticker_shutdown));
@@ -286,10 +303,13 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         )
         .route("/", get(routes::index))
         .route("/leaderboard/{game_mode}", get(routes::index))
+        .route("/link", get(routes::index))
+        .route("/link/native-complete", get(routes::index))
         .route("/player/{player_id}", get(routes::index))
         .route("/api/leaderboard/{game_mode}", get(routes::api_leaderboard))
         .route("/api/player/{player_id}", get(routes::api_player))
         .route("/health", get(routes::health))
+        .route("/ready", get(ranked_routes::ready))
         .route("/modes", get(routes::modes))
         .route("/auth/config", get(routes::auth_config))
         .route(
@@ -299,17 +319,29 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
         .route("/auth/steam/login", get(routes::steam_login))
         .route("/auth/steam/callback", get(routes::steam_callback))
         .route("/auth/ticket", axum::routing::post(routes::ticket_auth))
+        .route("/api/ticket", axum::routing::post(routes::api_ticket))
+        .route("/api/session", get(routes::api_session))
+        .route("/api/logout", axum::routing::post(routes::logout))
+        .route("/api/logout-all", axum::routing::post(routes::logout_all))
+        .route("/api/link/intent", axum::routing::post(routes::browser_link_intent))
+        .route("/api/link/confirm", axum::routing::post(routes::browser_link_confirm))
+        .route("/api/link/native/start", axum::routing::post(routes::native_link_start))
+        .route("/api/link/native/confirm", axum::routing::post(routes::native_link_confirm))
+        .route("/api/link/revoke", axum::routing::post(routes::revoke_link))
+        .route("/api/command", axum::routing::post(ranked_routes::api_command))
+        .route("/api/events", get(ranked_routes::api_events))
+        .route("/api/ranked/state", get(ranked_routes::api_ranked_state))
         .route("/internal/turn-credentials", get(routes::turn_credentials))
         .route("/auth/logout", axum::routing::post(routes::logout))
         .route("/ws", get(ws::ws_route))
         .route("/steam/{*rest}", get(steam_redirect::steam_redirect));
 
-    if config.auth_dev_mode {
+    if config.auth_dev_mode && !config.steam_backed_accounts_only {
         router = router.route("/auth/test-token", axum::routing::post(routes::test_token));
     }
-
-    // Guest login is always on (the per-IP limiter is the abuse control).
-    router = router.route("/auth/guest", axum::routing::post(routes::guest_token));
+    if !config.steam_backed_accounts_only {
+        router = router.route("/auth/guest", axum::routing::post(routes::guest_token));
+    }
 
     if mock_enabled {
         router = router.route(
@@ -346,6 +378,9 @@ fn cors_layer(config: &AppConfig) -> CorsLayer {
         .allow_headers([
             axum::http::header::CONTENT_TYPE,
             axum::http::header::AUTHORIZATION,
+            // Cookie-authenticated browser mutations are CSRF-protected; the
+            // preflight must not block the header the routes require.
+            axum::http::HeaderName::from_static("x-csrf-token"),
         ])
         .allow_origin(tower_http::cors::AllowOrigin::predicate(
             move |origin: &axum::http::HeaderValue, _| {

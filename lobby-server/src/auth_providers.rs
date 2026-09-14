@@ -159,9 +159,8 @@ pub fn pkce_pair() -> (String, String) {
     (verifier, challenge)
 }
 
-/// Build the provider's authorization URL. `verifier` is Some only when
-/// `cfg.use_pkce` — the challenge param is appended then. The caller stores
-/// the verifier in the OpenIdState for the callback's token exchange.
+/// Build the provider authorization URL. The caller persists any verifier in
+/// `oauth_login_states`; it never leaves the server.
 pub fn authorization_url(
     cfg: &ProviderConfig,
     redirect_uri: &str,
