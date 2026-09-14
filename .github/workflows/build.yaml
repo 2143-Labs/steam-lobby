@@ -45,11 +45,11 @@ jobs:
           set -euo pipefail
           TAG="${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_number }}"
           IMAGE="${{ env.registry }}/${{ env.repo }}:${TAG}"
-          CACHE_REF="${{ env.registry }}/${{ env.repo }}:buildcache"
-          docker build \
-            --cache-from="type=registry,ref=${CACHE_REF}" \
-            --cache-to="type=registry,ref=${CACHE_REF},mode=max" \
-            -t "$IMAGE" .
+          # No registry cache flags: the self-hosted runner's `docker` is a
+          # Podman/buildah shim that rejects buildx's `type=registry,...,mode=max`
+          # syntax ("invalid repo"), which broke every build on this branch. The
+          # builder keeps a persistent local layer cache on the runner instead.
+          docker build -t "$IMAGE" .
           digest_file="$(mktemp "${RUNNER_TEMP:-/tmp}/steam-lobby-digest.XXXXXX")"
           trap 'rm -f "$digest_file"' EXIT
           # The self-hosted Podman runner writes the digest returned by the
