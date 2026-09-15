@@ -302,6 +302,7 @@ pub async fn build_app(config: AppConfig) -> (Router, Arc<AppState>) {
             get(routes::auth_callback),
         )
         .route("/", get(routes::index))
+        .route("/leaderboard", get(routes::index))
         .route("/leaderboard/{game_mode}", get(routes::index))
         .route("/link", get(routes::index))
         .route("/link/native-complete", get(routes::index))
