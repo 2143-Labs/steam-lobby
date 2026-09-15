@@ -4,8 +4,7 @@
 // any other mode shows the pong practice canvas.
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { getAvailableModes } from "../lobby/client";
-import { notify, send, setStatus, showControls, shortId, state } from "../lobby/store";
+import { notify, queueEnabledFor, send, setStatus, showControls, shortId, state } from "../lobby/store";
 import { startQueuePreview } from "../game/pong";
 import { useLobby } from "../hooks/useLobby";
 
@@ -13,7 +12,7 @@ const DIFFICULTIES = ["easy", "normal", "hard"];
 
 export default function QueuePanel() {
   const st = useLobby();
-  const modes = getAvailableModes();
+  const modes = st.modes;
   const [difficulty, setDifficulty] = useState("normal");
 
   function startQueue() {
@@ -89,32 +88,39 @@ export default function QueuePanel() {
   return (
     <section>
       <div id="ctrl-connected">
-        <label>Mode</label>
-        <select
-          value={st.selectedMode}
-          onChange={(e) => {
-            state.selectedMode = e.target.value;
-            notify();
-          }}
-        >
-          {modes.map((m) => (
-            <option key={m.name} value={m.name}>
-              {m.name} ({m.game_type})
-            </option>
-          ))}
-        </select>
+        {modes.length === 0 && (
+          <p className="sys">No game modes advertised by this server.</p>
+        )}
+        {modes.length > 1 && (
+          <>
+            <label>Mode</label>
+            <select
+              value={st.selectedMode}
+              onChange={(e) => {
+                state.selectedMode = e.target.value;
+                notify();
+              }}
+            >
+              {modes.map((m) => (
+                <option key={m.name} value={m.name}>
+                  {m.name} ({m.game_type})
+                </option>
+              ))}
+            </select>
+          </>
+        )}
         <label>Difficulty</label>
         <select value={difficulty} onChange={(e) => setDifficulty(e.target.value)}>
           {DIFFICULTIES.map((d) => (
             <option key={d}>{d}</option>
           ))}
         </select>
-        {!st.rankedQueueEnabled && st.selectedMode === "umvc3_1v1" && (
-          <p className="sys">The production UMVC3 ranked queue is not enabled yet.</p>
+        {!queueEnabledFor(st.selectedMode) && (
+          <p className="sys">This mode&apos;s queue is not enabled yet.</p>
         )}
         <button
           className="primary"
-          disabled={!st.rankedQueueEnabled && st.selectedMode === "umvc3_1v1"}
+          disabled={!st.selectedMode || !queueEnabledFor(st.selectedMode)}
           onClick={startQueue}
         >
           Start Matchmaking

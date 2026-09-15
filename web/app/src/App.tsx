@@ -8,6 +8,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/" element={<LobbyPage />} />
+      <Route path="/leaderboard" element={<LeaderboardPage />} />
       <Route path="/leaderboard/:game" element={<LeaderboardPage />} />
       <Route path="/player/:playerId" element={<PlayerPage />} />
       <Route path="/link" element={<LinkPage />} />

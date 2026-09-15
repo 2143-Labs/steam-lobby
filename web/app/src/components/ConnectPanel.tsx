@@ -9,7 +9,7 @@ import {
   reconnect,
   signout,
 } from "../lobby/client";
-import { jwtSub, log, setStatus, state } from "../lobby/store";
+import { jwtSub, log, setStatus } from "../lobby/store";
 import type { AuthConfig } from "../types";
 import { useLobby } from "../hooks/useLobby";
 
@@ -29,9 +29,6 @@ export default function ConnectPanel() {
     const initialBase = serverBase.trim().replace(/\/+$/, "");
     void Promise.all([fetchAuthConfig(), fetchSession(initialBase)]).then(([config, session]) => {
       setCfg(config);
-      if (config) {
-        state.rankedQueueEnabled = config.ranked_queue_enabled;
-      }
       if (session) {
         void connectWithSession(initialBase, session);
       }

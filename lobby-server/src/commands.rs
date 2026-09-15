@@ -1080,6 +1080,14 @@ async fn resolve_evidence(
         (winner, score, checksum, end_frame)
     }).collect::<Vec<_>>();
 
+    // RATIFIED RULE (2026-09-14): a missing or conflicting report resolves as
+    // `Disputed` with no MMR change. Do not turn a lone report or a transport
+    // loss into a forfeit: transport loss is never evidence (see ws.rs), and a
+    // rated loss requires corroboration from the other participant.
+    // PLANNED: on game close the client will send an explicit
+    // intentional-close-vs-crash signal. When it lands, it becomes an extra
+    // field on the report/abandon command and feeds this same chain — it does
+    // NOT replace the corroboration requirement.
     let verdict = if normalized.len() >= 2 {
         let same = normalized[0].0 == normalized[1].0
             && normalized[0].1 == normalized[1].1

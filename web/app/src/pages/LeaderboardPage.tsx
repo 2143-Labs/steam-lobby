@@ -1,8 +1,8 @@
 // /leaderboard/:game — all players by rating (mu - 3*sigma), via the read-only
 // API. TanStack Query handles loading/error; unknown games get a 404 state.
 import { useQuery } from "@tanstack/react-query";
-import { Link, useNavigate, useParams } from "react-router-dom";
-import { fetchLeaderboard, fetchModes } from "../api";
+import { Link, Navigate, useNavigate, useParams } from "react-router-dom";
+import { ApiError, fetchLeaderboard, fetchModes } from "../api";
 import { shortId } from "../lobby/store";
 
 function rating(mu: number, sigma: number): number {
@@ -10,7 +10,7 @@ function rating(mu: number, sigma: number): number {
 }
 
 export default function LeaderboardPage() {
-  const { game = "pong_1v1" } = useParams<{ game: string }>();
+  const { game: routeGame } = useParams<{ game: string }>();
   const navigate = useNavigate();
 
   const modes = useQuery({
@@ -19,32 +19,63 @@ export default function LeaderboardPage() {
     staleTime: 60_000,
   });
 
+  // The bare /leaderboard route carries no :game, so the host's first
+  // advertised mode resolves it. `enabled` keeps the board query from firing
+  // while that is still unknown.
+  const game = routeGame ?? modes.data?.[0]?.name;
+
   const board = useQuery({
     queryKey: ["leaderboard", game],
-    queryFn: () => fetchLeaderboard(game),
+    queryFn: () => {
+      if (!game) throw new Error("no game resolved");
+      return fetchLeaderboard(game);
+    },
+    enabled: !!game,
     retry: 1,
   });
+
+  // Order matters: the advertised modes resolve the game — and whether there is
+  // one at all — before the board is rendered.
+  if (modes.isPending || modes.isError) return <p>Loading…</p>;
+
+  const modesList = modes.data ?? [];
+  if (modesList.length === 0) {
+    return (
+      <>
+        <h2>Leaderboard</h2>
+        <p className="sys">This server advertises no game modes.</p>
+        <p>
+          <Link to="/">← Lobby</Link>
+        </p>
+      </>
+    );
+  }
+
+  // Bare /leaderboard: redirect to the host's first advertised mode, so no
+  // game name is chosen by this component.
+  if (routeGame === undefined) {
+    return <Navigate replace to={"/leaderboard/" + modesList[0].name} />;
+  }
 
   if (board.isLoading) return <p>Loading leaderboard…</p>;
 
   if (board.error) {
-    const status = board.error instanceof Error && "status" in board.error
-      ? (board.error as { status?: number }).status
-      : undefined;
+    const status = board.error instanceof ApiError ? board.error.status : undefined;
+    const detail = board.error instanceof Error ? board.error.message : String(board.error);
     return (
       <>
         <h2>Leaderboard</h2>
-        {status === 404 || modes.isError ? (
+        {status === 404 ? (
           <p className="err">Unknown game: {game}</p>
         ) : (
-          <p className="err">Failed to load leaderboard: {(board.error as Error).message}</p>
+          <p className="err">Failed to load leaderboard: {detail}</p>
         )}
-        {modes.data && modes.data.length > 0 && (
+        {modesList.length > 1 && (
           <select
             value={game}
             onChange={(e) => navigate("/leaderboard/" + e.target.value)}
           >
-            {modes.data.map((m) => (
+            {modesList.map((m) => (
               <option key={m.name} value={m.name}>
                 {m.name} ({m.game_type})
               </option>
@@ -62,11 +93,11 @@ export default function LeaderboardPage() {
   return (
     <>
       <h2>Leaderboard — {game}</h2>
-      {modes.data && modes.data.length > 0 && (
+      {modesList.length > 1 && (
         <label>
           Game{" "}
           <select value={game} onChange={(e) => navigate("/leaderboard/" + e.target.value)}>
-            {modes.data.map((m) => (
+            {modesList.map((m) => (
               <option key={m.name} value={m.name}>
                 {m.name} ({m.game_type})
               </option>

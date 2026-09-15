@@ -1,5 +1,6 @@
 // The lobby page — composes the demo's sections into one page: header + nav,
 // connect panel, status, controls (queue / match), game area, log.
+import { useEffect } from "react";
 import { Link } from "react-router-dom";
 import ConnectPanel from "../components/ConnectPanel";
 import GameArea from "../components/GameArea";
@@ -7,10 +8,18 @@ import MatchPanel from "../components/MatchPanel";
 import QueuePanel from "../components/QueuePanel";
 import StatusBar from "../components/StatusBar";
 import { useLobby } from "../hooks/useLobby";
+import { loadModes } from "../lobby/client";
 
 export default function LobbyPage() {
   const st = useLobby();
   const inMatch = st.controls === "match" || st.controls === "inmatch";
+
+  // Populate the mode control before any WebSocket connects: the socket's own
+  // loadModes only runs on connect, so without this the selector is empty until
+  // the user clicks Connect.
+  useEffect(() => {
+    void loadModes("");
+  }, []);
 
   return (
     <>
@@ -22,7 +31,7 @@ export default function LobbyPage() {
         both, then start matchmaking in each.
       </p>
       <nav>
-        <Link className="primary" to="/leaderboard/pong_1v1">
+        <Link className="primary" to="/leaderboard">
           Leaderboard
         </Link>
       </nav>

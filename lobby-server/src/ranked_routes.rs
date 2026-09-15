@@ -179,9 +179,10 @@ fn service_unavailable(code: &str) -> Response {
 /// Liveness (`/health`) only proves the process is up. Readiness additionally
 /// proves the canonical store answers, the in-process Temporal worker is
 /// connected (its client is cleared when the worker exits, so a stale handle
-/// can never report ready), and no UMVC3 match is left non-terminal while its
-/// durable workflow is already closed. Steam/Discord are deliberately not part
-/// of readiness: a provider outage must not take the service out of rotation.
+/// can never report ready), the client's configured Temporal namespace is
+/// actually usable, and no UMVC3 match is left non-terminal while its durable
+/// workflow is already closed. Steam/Discord are deliberately not part of
+/// readiness: a provider outage must not take the service out of rotation.
 pub async fn ready(State(state): State<Arc<AppState>>) -> Response {
     if let Err(error) = sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(state.store.pool())
@@ -194,6 +195,18 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> Response {
     let Some(client) = state.temporal.read().ok().and_then(|slot| slot.clone()) else {
         return service_unavailable("temporal_worker_unavailable");
     };
+
+    // A connected client is not proof the namespace exists: every call still
+    // fails when the namespace was never created, which is exactly the state
+    // the worker's poll loop swallows. Count in the configured namespace so a
+    // missing/renamed namespace takes the pod out of rotation.
+    if let Err(error) = client
+        .count_workflows("", temporalio_client::WorkflowCountOptions::default())
+        .await
+    {
+        tracing::error!(%error, "readiness: temporal namespace unusable");
+        return service_unavailable("temporal_namespace_unavailable");
+    }
 
     let tokens = match state.store.nonterminal_umvc3_tokens().await {
         Ok(tokens) => tokens,

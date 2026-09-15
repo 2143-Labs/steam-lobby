@@ -491,12 +491,21 @@ pub async fn game_result(
 pub struct ModeInfo {
     pub name: String,
     pub game_type: lobby_core::types::ConnectionStrategy,
+    /// False when this mode's queue is gated off — a NativeReport mode while
+    /// RANKED_QUEUE_ENABLED=false. The web UI disables its queue button from
+    /// this field instead of matching on a game name.
+    pub queue_enabled: bool,
 }
 
 /// The modes the server actually runs — the demo populates its dropdown from this.
 pub async fn modes(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(
-        serde_json::json!({ "modes": state.game_modes.iter().map(|spec| ModeInfo { name: spec.id.to_owned(), game_type: spec.connection }).collect::<Vec<_>>() }),
+        serde_json::json!({ "modes": state.game_modes.iter().map(|spec| ModeInfo {
+            name: spec.id.to_owned(),
+            game_type: spec.connection,
+            queue_enabled: spec.authority != lobby_core::types::ResultAuthority::NativeReport
+                || state.config.ranked_queue_enabled,
+        }).collect::<Vec<_>>() }),
     )
 }
 

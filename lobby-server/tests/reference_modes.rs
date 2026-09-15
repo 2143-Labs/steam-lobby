@@ -83,14 +83,64 @@ async fn advertised_modes_preserve_the_public_game_type_contract(pool: PgPool) {
         body,
         serde_json::json!({
             "modes": [
-                {"name": "pong_1v1", "game_type": "p2p"},
-                {"name": "rps_1v1", "game_type": "p2p"},
-                {"name": "server_arena", "game_type": "server"},
-                {"name": "umvc3_1v1", "game_type": "p2p"}
+                {"name": "pong_1v1", "game_type": "p2p", "queue_enabled": true},
+                {"name": "rps_1v1", "game_type": "p2p", "queue_enabled": true},
+                {"name": "server_arena", "game_type": "server", "queue_enabled": true},
+                {"name": "umvc3_1v1", "game_type": "p2p", "queue_enabled": true}
             ]
         }),
         "the compatibility wire field stays game_type with p2p/server values"
     );
+}
+
+/// The UI disables its queue button from `queue_enabled`, so the gated case must
+/// be on the wire: a NativeReport mode while the ranked queue is off reports
+/// false, and every other authority reports true (their queues are not gated).
+#[sqlx::test]
+async fn gated_modes_report_queue_disabled(pool: PgPool) {
+    let h = setup_with_config(
+        pool,
+        TestConfig {
+            game_modes: vec![
+                lobby_core::types::mode_spec("pong_1v1").unwrap(),
+                lobby_core::types::mode_spec("rps_1v1").unwrap(),
+                lobby_core::types::mode_spec("server_arena").unwrap(),
+                lobby_core::types::mode_spec("umvc3_1v1").unwrap(),
+            ],
+            ranked_queue_enabled: false,
+            ..TestConfig::default()
+        },
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{}/modes", h.base_url))
+        .send()
+        .await
+        .expect("GET /modes");
+    assert!(response.status().is_success());
+    let body: serde_json::Value = response.json().await.expect("modes JSON");
+    let modes = body["modes"].as_array().expect("modes array");
+
+    let queue_enabled = |name: &str| -> bool {
+        modes
+            .iter()
+            .find(|m| m["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing from /modes"))["queue_enabled"]
+            .as_bool()
+            .expect("queue_enabled is a bool")
+    };
+
+    assert!(
+        !queue_enabled("umvc3_1v1"),
+        "a NativeReport mode reports queue_enabled=false while the ranked queue is off"
+    );
+    for mode in ["pong_1v1", "rps_1v1", "server_arena"] {
+        assert!(
+            queue_enabled(mode),
+            "{mode} is not queue-gated, so it must report queue_enabled=true"
+        );
+    }
 }
 
 async fn seed_pair(pool: &PgPool, mode: &str, suffix: i64) -> (Uuid, Uuid) {

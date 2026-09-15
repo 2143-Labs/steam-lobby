@@ -72,4 +72,10 @@ export interface LinkIntentResponse {
 export interface ModeInfo {
   name: string;
   game_type: string;
+  /**
+   * Whether the server accepts queue commands for this mode. Optional because
+   * an older server image omits it; treat an absent value as enabled (the
+   * server is authoritative and rejects a gated queue itself).
+   */
+  queue_enabled?: boolean;
 }

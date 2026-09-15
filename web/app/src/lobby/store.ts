@@ -8,6 +8,7 @@ import type { WrtcLink } from "../../../pong-wrtc.mjs";
 import type { PongSim, PongSnapshot } from "../../../pong-sim.mjs";
 import type { RollbackSession } from "../../../pong-rollback.mjs";
 import type { ClientMessage, LeaderboardEntry } from "./protocol";
+import type { ModeInfo } from "../types";
 
 /** Browser interval handle — owned here so consumers import the name. */
 export type TimerHandle = ReturnType<typeof setInterval>;
@@ -84,7 +85,8 @@ export interface LobbyState {
   connected: boolean;
   /** The currently selected matchmaking mode. */
   selectedMode: string;
-  rankedQueueEnabled: boolean;
+  /** Modes advertised by the connected server; the only source of game names. */
+  modes: ModeInfo[];
 }
 
 export const state: LobbyState = {
@@ -145,8 +147,8 @@ export const state: LobbyState = {
     leaderboard: [],
   },
   connected: false,
-  selectedMode: "pong_1v1",
-  rankedQueueEnabled: true,
+  selectedMode: "",
+  modes: [],
 };
 
 // ── subscription (React) ─────────────────────────────────────────────────
@@ -166,6 +168,28 @@ export function showControls(name: ControlsPanel) {
 /** UI-facing change — re-render React. NOT called on the 30Hz frame path. */
 export function notify() {
   for (const fn of listeners) fn();
+}
+
+// ── advertised modes ─────────────────────────────────────────────────────
+
+/** Adopt the server's advertised modes; keep a valid selection or take the first. */
+export function setModes(modes: ModeInfo[]) {
+  state.modes = modes;
+  if (modes.length > 0 && !modes.some((m) => m.name === state.selectedMode)) {
+    state.selectedMode = modes[0].name;
+  }
+  notify();
+}
+
+/**
+ * Whether the server currently accepts queue commands for this mode.
+ *
+ * Defaults to `true` when the server omits the field (an older image, e.g. the
+ * reference deployment): the server is authoritative and rejects a gated queue
+ * itself, so the UI hint must never disable a queue the server would accept.
+ */
+export function queueEnabledFor(mode: string): boolean {
+  return state.modes.find((m) => m.name === mode)?.queue_enabled ?? true;
 }
 
 export function setStatus(text: string, cls = "") {

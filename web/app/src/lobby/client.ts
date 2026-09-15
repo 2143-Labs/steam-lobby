@@ -13,6 +13,7 @@ import {
   log,
   notify,
   send,
+  setModes,
   setStatus,
   showControls,
   state,
@@ -85,21 +86,24 @@ async function updateConnMetrics() {
   if (el) el.textContent = "Server: " + sv + " · " + opp;
 }
 
-async function populateModes(base: string) {
-  let modes: { name: string; game_type: string }[] = [];
+/**
+ * Adopt the server's advertised modes. On failure the list is emptied rather
+ * than fabricated: inventing a game the server is not running is exactly the
+ * bug this replaces, so an unreachable API shows "No game modes advertised by
+ * this server." instead of degrading into a demo mode.
+ */
+export async function loadModes(base: string) {
   try {
-    modes = await fetchModes(base);
+    setModes(await fetchModes(base));
   } catch (e) {
     log("sys", "modes fetch failed: " + (e as Error).message);
+    setModes([]);
   }
-  if (modes.length === 0) modes = [{ name: "pong_1v1", game_type: "p2p" }];
-  setAvailableModes(modes);
-  state.selectedMode = modes[0].name;
 }
 
 async function connect(base: string, mode: AuthMode, token: string | null) {
   if (state.ws && state.ws.readyState < WebSocket.CLOSING) return;
-  await populateModes(base);
+  await loadModes(base);
 
   const wsUrl = base.replace(/^http/, "ws") + "/ws";
   let ws: WebSocket;
@@ -159,16 +163,6 @@ export async function connectWithSession(base: string, session?: SessionInfo): P
   state.authProvider = live.auth_provider;
   await connect(base, "cookie", null);
   return true;
-}
-
-/** The mode dropdown contents (populated for either authentication mode). */
-let availableModes: { name: string; game_type: string }[] = [];
-export function getAvailableModes(): { name: string; game_type: string }[] {
-  return availableModes;
-}
-function setAvailableModes(modes: { name: string; game_type: string }[]) {
-  availableModes = modes;
-  notify();
 }
 
 /** Disconnect: clean close handshake; the server sweeps the queue entry. */
