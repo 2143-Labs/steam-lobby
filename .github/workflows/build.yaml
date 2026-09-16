@@ -199,11 +199,14 @@ jobs:
 
           file="base/apps/umvc3/deployment.yaml"
           git diff --check
-          [[ "$(git diff --name-only)" == "$file" ]] || { echo "Unexpected files changed" >&2; exit 1; }
+          # Nothing to do is a success, and this must come first: an unchanged
+          # digest leaves an empty diff, so the single-file guard below would
+          # see no filename at all and report a false hard failure.
           if git diff --quiet -- "$file"; then
             echo "Timestone deployment already pins this digest"
             exit 0
           fi
+          [[ "$(git diff --name-only)" == "$file" ]] || { echo "Unexpected files changed" >&2; exit 1; }
           [[ "$(git diff --numstat -- "$file")" == $'1\t1\t'"$file" ]] || {
             echo "Expected exactly one image scalar replacement" >&2
             exit 1
