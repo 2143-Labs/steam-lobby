@@ -3,6 +3,7 @@ use lobby_server::commands::{
     Umvc3Phase,
 };
 use lobby_server::{RequeueDecision, Umvc3Verdict};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 mod common;
@@ -352,4 +353,359 @@ async fn readiness_gates_on_store_worker_and_workflow_invariant(pool: sqlx::PgPo
         reqwest::StatusCode::SERVICE_UNAVAILABLE,
         "a closed workflow under non-terminal state must fail readiness"
     );
+}
+
+// ── the two-client lifecycle ─────────────────────────────────────────────
+
+/// POST one ranked command; returns the status and whatever body came back.
+async fn post(
+    h: &TestHarness,
+    token: &str,
+    body: Value,
+) -> (reqwest::StatusCode, Value) {
+    let response = common::post_command(h, token, body).await;
+    let status = response.status();
+    (status, response.json().await.unwrap_or(Value::Null))
+}
+
+/// Wait until a receipt settles, and return its terminal status. Receipts are
+/// caller-local, so the snapshot must be read with the requesting token.
+async fn await_receipt(h: &TestHarness, token: &str, receipt: &Value) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let snapshot = common::ranked_state(h, token).await;
+        let settled = snapshot["receipts"].as_array().and_then(|receipts| {
+            receipts
+                .iter()
+                .find(|entry| entry["receipt"] == *receipt)
+                .map(|entry| entry["status"].clone())
+        });
+        if let Some(status) = settled.as_ref().and_then(Value::as_str) {
+            if status != "pending" {
+                return status.to_owned();
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "receipt {receipt} never settled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// POST a command that must be both admitted and applied.
+async fn send_applied(h: &TestHarness, token: &str, body: Value) {
+    let (status, accepted) = post(h, token, body).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::ACCEPTED,
+        "command refused at admission: {accepted}"
+    );
+    let settled = await_receipt(h, token, &accepted["receipt"]).await;
+    assert_eq!(settled, "applied", "command was admitted but not applied");
+}
+
+/// Wait until this client's snapshot reports `phase`. Asserting per stage is
+/// what makes a stalled lifecycle fail at the stage rather than at the MMR
+/// assertion at the end.
+async fn await_phase(h: &TestHarness, token: &str, phase: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let snapshot = common::ranked_state(h, token).await;
+        let seen = snapshot["active_match"]["phase"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if seen == phase {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected phase {phase}, last saw {seen}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Two compliant native clients drive the entire durable HTTP lifecycle —
+/// queue, real Temporal pairing, accept/trying/connect/ready, bilateral report —
+/// with MMR changing exactly once. That is the ranked baseline's completion
+/// criterion. Its sibling
+/// `matching_reports_rate_exactly_once_and_metadata_conflicts_never_rate` proves
+/// the finalizer invariant against a seeded match; this proves the wire and the
+/// matchmaker, which `seed_match` bypasses.
+#[sqlx::test]
+async fn two_native_clients_complete_a_paired_ranked_lifecycle(pool: sqlx::PgPool) {
+    // Pairing is Temporal's job: the per-mode matchmaker schedule is created at
+    // worker boot, and the ticker unpauses it once two clients are queued. So
+    // the worker and the ticker must both be on; `ticker_enabled` stays default.
+    let mut config = ranked_config();
+    config.temporal_enabled = true;
+    let h = setup_with_config(pool, config).await;
+    let (a, _sa, token_a) = h.native_principal(93001).await;
+    let (b, _sb, token_b) = h.native_principal(93002).await;
+    let clients = [token_a.as_str(), token_b.as_str()];
+
+    // 1. both clients queue over HTTP
+    for token in clients {
+        send_applied(
+            &h,
+            token,
+            json!({
+                "command_id": Uuid::new_v4(),
+                "type": "queue",
+                "mode": "umvc3_1v1",
+                "difficulty": "normal",
+            }),
+        )
+        .await;
+    }
+    for token in clients {
+        // an applied queue command is not the same as being queued: the row is
+        // the observable state the matchmaker reads
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if common::ranked_state(&h, token).await["queue"]["mode"] == "umvc3_1v1" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a client that queue'd never appeared in the queue"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    // 2. the real matchmaker pairs them into one match. The schedule fires every
+    //    two seconds, so 30s is roughly 15x headroom.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (match_token, attempt_id, role_a, role_b) = loop {
+        let snap_a = common::ranked_state(&h, &token_a).await;
+        let snap_b = common::ranked_state(&h, &token_b).await;
+        let paired = (
+            snap_a["active_match"]["match_token"]
+                .as_str()
+                .filter(|token| !token.is_empty()),
+            snap_b["active_match"]["match_token"]
+                .as_str()
+                .filter(|token| !token.is_empty()),
+        );
+        if let (Some(ta), Some(tb)) = paired {
+            assert_eq!(ta, tb, "both clients must be paired into the same match");
+            assert_eq!(snap_a["active_match"]["opponent"], b.to_string());
+            assert_eq!(snap_b["active_match"]["opponent"], a.to_string());
+            break (
+                ta.to_owned(),
+                snap_a["active_match"]["attempt_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                snap_a["active_match"]["role"].as_str().unwrap().to_owned(),
+                snap_b["active_match"]["role"].as_str().unwrap().to_owned(),
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the matchmaker never paired the two queued clients"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
+    // `role` follows which side of the match the caller occupies, so a client
+    // cannot assume it: read it from the snapshot, and exactly one creates.
+    assert_ne!(
+        role_a, role_b,
+        "one client creates the lobby and the other joins it"
+    );
+
+    // 3. accept -> trying -> connect -> ready, all over the wire
+    for token in clients {
+        send_applied(
+            &h,
+            token,
+            json!({
+                "command_id": Uuid::new_v4(),
+                "type": "accept",
+                "match_token": match_token,
+            }),
+        )
+        .await;
+    }
+    for token in clients {
+        await_phase(&h, token, "AwaitingTrying").await;
+    }
+
+    for (token, role) in [(&token_a, &role_a), (&token_b, &role_b)] {
+        send_applied(
+            &h,
+            token,
+            json!({
+                "command_id": Uuid::new_v4(),
+                "type": "trying",
+                "match_token": match_token,
+                "attempt_id": attempt_id,
+                "role": role,
+                "lobby_id": (role == "create").then_some("109775242781234567"),
+            }),
+        )
+        .await;
+    }
+    for token in clients {
+        await_phase(&h, token, "AwaitingConnect").await;
+    }
+
+    for token in clients {
+        send_applied(
+            &h,
+            token,
+            json!({
+                "command_id": Uuid::new_v4(),
+                "type": "connect",
+                "match_token": match_token,
+                "attempt_id": attempt_id,
+                "local_reached": true,
+                "peer_reached": true,
+            }),
+        )
+        .await;
+    }
+    for token in clients {
+        await_phase(&h, token, "AwaitingReady").await;
+    }
+
+    for token in clients {
+        send_applied(
+            &h,
+            token,
+            json!({
+                "command_id": Uuid::new_v4(),
+                "type": "ready",
+                "match_token": match_token,
+                "attempt_id": attempt_id,
+            }),
+        )
+        .await;
+    }
+    for token in clients {
+        await_phase(&h, token, "Playing").await;
+    }
+
+    // 4. both report; the outcome is relative to the reporter, and a rating only
+    //    lands if the two reports agree on the winner AND on the metadata.
+    for (token, outcome) in [(&token_a, "win"), (&token_b, "loss")] {
+        send_applied(
+            &h,
+            token,
+            json!({
+                "command_id": Uuid::new_v4(),
+                "type": "report",
+                "match_token": match_token,
+                "outcome": outcome,
+                "score": "2-0",
+                "checksum": "deadbeef",
+                "end_frame": 900,
+            }),
+        )
+        .await;
+    }
+
+    // 5. the match resolves. The client learns that from the event stream, not
+    //    from the snapshot: finalizing clears player_state.active_match_token
+    //    (`db/matches.rs`), so `active_match` disappears along with the match it
+    //    described and its `result` is never observable through that field.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let find_resolved = |page: &Value| {
+        page["events"].as_array().and_then(|events| {
+            events
+                .iter()
+                .find(|event| event["type"] == "resolved" && event["match_token"] == match_token)
+                .cloned()
+        })
+    };
+    let (event_a, event_b) = loop {
+        let page_a = common::event_page(&h, &token_a, 0).await;
+        let page_b = common::event_page(&h, &token_b, 0).await;
+        if let (Some(event_a), Some(event_b)) = (find_resolved(&page_a), find_resolved(&page_b)) {
+            break (event_a, event_b);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the bilateral report never resolved the match"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    // The payload is already relative to its recipient, and lowercase.
+    assert_eq!(event_a["payload"]["result"]["outcome"], "win");
+    assert_eq!(event_b["payload"]["result"]["outcome"], "loss");
+    assert!(
+        event_a["payload"]["result"]["mmr_delta"]
+            .as_f64()
+            .is_some_and(|delta| delta > 0.0),
+        "the winner's event must carry a positive delta: {event_a}"
+    );
+    assert!(
+        event_b["payload"]["result"]["mmr_delta"]
+            .as_f64()
+            .is_some_and(|delta| delta < 0.0),
+        "the loser's event must carry a negative delta: {event_b}"
+    );
+    assert!(
+        common::ranked_state(&h, &token_a).await["active_match"].is_null(),
+        "a resolved match must leave the client's active match"
+    );
+
+    let baseline: Vec<(Uuid, f64)> = sqlx::query_as(
+        "SELECT user_id,mu FROM ratings WHERE game_mode='umvc3_1v1' AND user_id=ANY($1) ORDER BY user_id",
+    )
+    .bind(&[a, b][..])
+    .fetch_all(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(baseline.len(), 2, "both clients must hold a rating row");
+    let mu_of = |user: Uuid| baseline.iter().find(|(id, _)| *id == user).unwrap().1;
+    assert!(
+        mu_of(a) > 25.0,
+        "the winner's mu must rise above the 25.0 start"
+    );
+    assert!(
+        mu_of(b) < 25.0,
+        "the loser's mu must fall below the 25.0 start"
+    );
+
+    // A fresh command_id makes this a new report rather than a dupe replay, so
+    // the once-only guarantee has to come from the finalizer, not the inbox.
+    let (replay_status, replay_body) = post(
+        &h,
+        &token_a,
+        json!({
+            "command_id": Uuid::new_v4(),
+            "type": "report",
+            "match_token": match_token,
+            "outcome": "win",
+            "score": "2-0",
+            "checksum": "deadbeef",
+            "end_frame": 900,
+        }),
+    )
+    .await;
+    if replay_status == reqwest::StatusCode::ACCEPTED {
+        await_receipt(&h, &token_a, &replay_body["receipt"]).await;
+    }
+    let after: Vec<(Uuid, f64)> = sqlx::query_as(
+        "SELECT user_id,mu FROM ratings WHERE game_mode='umvc3_1v1' AND user_id=ANY($1) ORDER BY user_id",
+    )
+    .bind(&[a, b][..])
+    .fetch_all(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        after, baseline,
+        "a second report must not apply a second MMR change"
+    );
+    let result_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM match_results WHERE match_token=$1")
+            .bind(&match_token)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(result_rows, 1, "the match must produce exactly one result row");
 }

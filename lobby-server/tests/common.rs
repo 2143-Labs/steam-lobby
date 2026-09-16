@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use lobby_server::{AppConfig, build_app};
+use serde_json::Value;
 use sqlx::ConnectOptions;
 use sqlx::PgPool;
 
@@ -99,6 +100,46 @@ impl TestHarness {
             .expect("issue native token");
         (user_id, session_id, bearer)
     }
+}
+
+/// `Authorization` header value carrying a principal's token.
+pub fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+/// POST a ranked command to `/api/command` as a principal.
+pub async fn post_command(h: &TestHarness, token: &str, body: Value) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/api/command", h.base_url))
+        .header("Authorization", bearer(token))
+        .json(&body)
+        .send()
+        .await
+        .expect("POST /api/command")
+}
+
+/// GET `/api/ranked/state` as a principal, asserting a 200.
+pub async fn ranked_state(h: &TestHarness, token: &str) -> Value {
+    let response = reqwest::Client::new()
+        .get(format!("{}/api/ranked/state", h.base_url))
+        .header("Authorization", bearer(token))
+        .send()
+        .await
+        .expect("GET /api/ranked/state");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    response.json().await.expect("ranked state JSON")
+}
+
+/// GET one page of `/api/events` after a cursor, asserting a 200.
+pub async fn event_page(h: &TestHarness, token: &str, after: i64) -> Value {
+    let response = reqwest::Client::new()
+        .get(format!("{}/api/events?after={after}", h.base_url))
+        .header("Authorization", bearer(token))
+        .send()
+        .await
+        .expect("GET /api/events");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    response.json().await.expect("event page JSON")
 }
 
 /// Public knobs for focused integration-test servers. Defaults preserve the
