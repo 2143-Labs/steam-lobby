@@ -175,7 +175,9 @@ export function notify() {
 /** Adopt the server's advertised modes; keep a valid selection or take the first. */
 export function setModes(modes: ModeInfo[]) {
   state.modes = modes;
-  if (modes.length > 0 && !modes.some((m) => m.name === state.selectedMode)) {
+  if (modes.length === 0) {
+    state.selectedMode = "";
+  } else if (!modes.some((m) => m.name === state.selectedMode)) {
     state.selectedMode = modes[0].name;
   }
   notify();
