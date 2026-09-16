@@ -67,7 +67,7 @@ jobs:
     needs: build
     if: github.event_name == 'workflow_dispatch' && inputs.target == 'reference'
     runs-on: ubuntu-latest
-    environment: production
+    environment: reference
     permissions:
       contents: read
     env:
@@ -155,7 +155,7 @@ jobs:
     needs: build
     if: github.event_name == 'workflow_dispatch' && inputs.target == 'timestone'
     runs-on: ubuntu-latest
-    environment: production
+    environment: timestone
     permissions:
       contents: read
     env:

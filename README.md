@@ -525,6 +525,22 @@ per-test database (created and dropped automatically), so tests run in
 parallel against Postgres without interfering. `just db-up` must be running or
 the tests fail fast with a connection error.
 
+## Deploying
+
+A push to `main` builds and pushes the image to GHCR, but deploys nothing:
+both promotion jobs are gated to `workflow_dispatch`. Deploy by dispatching the
+workflow with a target (Actions → **server** → *Run workflow*, or):
+
+```bash
+gh workflow run server --field target=timestone
+```
+
+`target=timestone` pins the image digest into `2143-Labs/timestone-argo`, which
+ArgoCD syncs to `umvc3-ranked.hero-rehab.xyz`. `target=reference` updates the
+image tag in `2143-Labs/argo` for `pvp.john2143.com`. Each target runs in a
+`main`-restricted GitHub Environment of the same name, so only `main` can
+deploy and each target's deploy key is scoped to its own environment.
+
 ## Web Demo
 
 `web/index.html` is a zero-dependency browser client (native `fetch` +
