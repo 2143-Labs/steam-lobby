@@ -506,8 +506,27 @@ async fn admit_user_command(
         .bind(actor.user_id)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(db_error)?
-        .ok_or(LobbyError::PlayerNotFound(actor.user_id))?;
+        .map_err(db_error)?;
+        let state_row = match state_row {
+            Some(row) => row,
+            // A native client reaches /api/command over HTTP and never sends the
+            // websocket `enter_menus` that first creates this row, so the first
+            // queue has to create it. That is also what the state machine
+            // documents ("a player who skipped enter_menus can still queue",
+            // lobby-core/src/player.rs). The row is created rather than assumed
+            // because every later phase records `active_match_token` on it.
+            None => {
+                sqlx::query(
+                    "INSERT INTO player_state (user_id,state,last_heartbeat) \
+                     VALUES($1,'InMenus',NOW()) ON CONFLICT (user_id) DO NOTHING",
+                )
+                .bind(actor.user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_error)?;
+                ("InMenus".to_string(), None)
+            }
+        };
         if state_row.1.is_some() || !matches!(state_row.0.as_str(), "InMenus" | "Queueing") {
             return Err(command_error("match_state_mismatch"));
         }
