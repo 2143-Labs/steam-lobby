@@ -1,16 +1,25 @@
 //! Reference native client for the UMVC3 ranked service.
 //!
-//! Drives the real HTTP lifecycle — ticket exchange, queue, matchmaker pairing,
-//! accept/trying/connect/ready, bilateral report, result — so the game client's
-//! work can be developed and regression-tested without the game client.
+//! Two ways to run it:
 //!
-//! By default two simulated players run in one process, because pairing needs
-//! two queued players and that is the smallest thing that exercises it.
+//! * **Interactive** (the default on a terminal) — a shell where every step is
+//!   a command, including deliberately wrong ones, and every request and
+//!   response is printed verbatim. This is the choose-your-own-adventure mode
+//!   for probing how the server behaves.
+//! * **Scripted** (`--auto`, or whenever stdin is not a terminal) — drives the
+//!   whole lifecycle and asserts that a rated match moves MMR exactly once. This
+//!   is the regression path, and it is what a pipe or CI gets.
+//!
+//! It talks to the ranked service the way the game client has to: plain HTTP
+//! against `/api/ticket`, `/api/command`, `/api/ranked/state` and `/api/events`,
+//! with no WebSocket anywhere.
 
 mod api;
 mod log;
 mod player;
+mod repl;
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -25,8 +34,9 @@ umvc3-client — reference native client for the UMVC3 ranked service
 USAGE:
     umvc3-client [OPTIONS]
 
-Drives two simulated players through a complete ranked match by default. Pass
---single to drive just one player, for a two-terminal run.
+With a terminal on stdin this starts an interactive shell (type 'help' for the
+command list). Piped or with --auto it runs the whole lifecycle once, which is
+the regression path.
 
 OPTIONS:
     --base-url <URL>        Ranked service origin     [default: http://localhost:8080]
@@ -34,8 +44,11 @@ OPTIONS:
     --difficulty <LEVEL>    easy | normal | hard      [default: normal]
     --steam-id <ID>         First player's Steam ID   [default: 76561198000000101]
     --peer-steam-id <ID>    Second player's Steam ID  [default: 76561198000000102]
-    --single                Drive only this player (run two terminals)
+    --single                Drive one player (a peer comes from a second run)
     --side <a|b>            Which side --single is    [default: a]
+    --auto                  Skip the shell; run the scripted flow once
+    --interactive           Force the shell even without a terminal on stdin
+    --tick <SECS>           Shell state poll interval [default: 2]
     --pair-timeout <SECS>   Pairing deadline          [default: 60]
     --stage-timeout <SECS>  Per-stage deadline        [default: 30]
     --result-timeout <SECS> Result deadline           [default: 30]
@@ -78,6 +91,9 @@ struct Args {
     peer_steam_id: u64,
     single: bool,
     side: Side,
+    auto: bool,
+    interactive: bool,
+    tick: Duration,
     pair_timeout: Duration,
     stage_timeout: Duration,
     result_timeout: Duration,
@@ -93,6 +109,9 @@ impl Default for Args {
             peer_steam_id: 76_561_198_000_000_102,
             single: false,
             side: Side::A,
+            auto: false,
+            interactive: false,
+            tick: Duration::from_secs(2),
             pair_timeout: Duration::from_secs(60),
             stage_timeout: Duration::from_secs(30),
             result_timeout: Duration::from_secs(30),
@@ -126,22 +145,45 @@ async fn run() -> Result<()> {
         Parsed::Run(args) => *args,
     };
 
-    let api = Api::new(&args.base_url)?;
-    log::note(format!("ranked service at {}", api.base()));
-    verify_mode(&api, &args.mode).await?;
+    let service = Api::new(&args.base_url, "---")?;
+    log::note(format!("ranked service at {}", service.base()));
+    verify_mode(&service, &args.mode).await?;
 
-    let me = Player::authenticate(&api, args.side_label(), args.steam_id).await?;
-    if args.single {
-        return drive_single(&api, &args, me).await;
+    let mut players = Vec::new();
+    players.push(Player::authenticate(&args.base_url, args.first_label(), args.steam_id).await?);
+    if !args.single {
+        players.push(Player::authenticate(&args.base_url, "P2", args.peer_steam_id).await?);
     }
-    let peer = Player::authenticate(&api, "P2", args.peer_steam_id).await?;
-    drive_pair(&api, &args, me, peer).await
+
+    // Interactive when a human is watching; scripted otherwise, so piping the
+    // binary or running it from CI keeps the old deterministic behaviour.
+    let interactive = if args.interactive {
+        true
+    } else if args.auto {
+        false
+    } else {
+        std::io::stdin().is_terminal()
+    };
+    if interactive {
+        let mut shell = repl::Shell::new(
+            players,
+            args.mode.clone(),
+            args.difficulty.clone(),
+            args.tick,
+        )
+        .await?;
+        return shell.loop_forever().await;
+    }
+
+    log::note("scripted mode (pass a terminal on stdin, or omit --auto, for the shell)");
+    if args.single {
+        return drive_single(&args, &players[0]).await;
+    }
+    drive_pair(&args, &players[0], &players[1]).await
 }
 
 impl Args {
-    /// In `--single` mode the label follows the side; otherwise P1 is the local
-    /// player and P2 is the peer created below.
-    fn side_label(&self) -> &'static str {
+    fn first_label(&self) -> &'static str {
         if self.single { self.side.label() } else { "P1" }
     }
 
@@ -152,11 +194,14 @@ impl Args {
             match flag.as_str() {
                 "-h" | "--help" => return Ok(Parsed::Help),
                 "--single" => args.single = true,
+                "--auto" => args.auto = true,
+                "--interactive" => args.interactive = true,
                 "--base-url" => args.base_url = value(&mut argv, &flag)?,
                 "--mode" => args.mode = value(&mut argv, &flag)?,
                 "--difficulty" => args.difficulty = value(&mut argv, &flag)?,
                 "--steam-id" => args.steam_id = number(&mut argv, &flag)?,
                 "--peer-steam-id" => args.peer_steam_id = number(&mut argv, &flag)?,
+                "--tick" => args.tick = Duration::from_secs(number(&mut argv, &flag)?.max(1)),
                 "--pair-timeout" => args.pair_timeout = secs(&mut argv, &flag)?,
                 "--stage-timeout" => args.stage_timeout = secs(&mut argv, &flag)?,
                 "--result-timeout" => args.result_timeout = secs(&mut argv, &flag)?,
@@ -191,8 +236,8 @@ fn secs(argv: &mut impl Iterator<Item = String>, flag: &str) -> Result<Duration>
 
 /// Fail fast, with an actionable message, when the server will not let us queue
 /// for this mode — otherwise the first symptom is a rejected command.
-async fn verify_mode(api: &Api, mode: &str) -> Result<()> {
-    let body = api.modes().await?;
+async fn verify_mode(service: &Api, mode: &str) -> Result<()> {
+    let body = service.modes().await?;
     let modes = body["modes"].as_array().cloned().unwrap_or_default();
     let Some(entry) = modes
         .iter()
@@ -224,110 +269,124 @@ async fn verify_mode(api: &Api, mode: &str) -> Result<()> {
 
 /// Two players in one process: queue both, wait for the real matchmaker, drive
 /// both sides through the lifecycle, then report bilaterally.
-async fn drive_pair(api: &Api, args: &Args, p1: Player, p2: Player) -> Result<()> {
-    log::note("both native sessions are live; queueing both players");
-    p1.queue(api, &args.mode, &args.difficulty).await?;
-    p2.queue(api, &args.mode, &args.difficulty).await?;
-    p1.await_queued(api, &args.mode, args.stage_timeout).await?;
-    p2.await_queued(api, &args.mode, args.stage_timeout).await?;
+async fn drive_pair(args: &Args, p1: &Player, p2: &Player) -> Result<()> {
+    log::note("queueing both players");
+    for (player, difficulty) in [(p1, &args.difficulty), (p2, &args.difficulty)] {
+        let body = player.queue_body(&args.mode, difficulty);
+        player.send_applied(body).await?;
+    }
+    for player in [p1, p2] {
+        player.await_queued(&args.mode, args.stage_timeout).await?;
+    }
 
     log::note(format!(
         "waiting for the matchmaker (up to {}s; its schedule fires every ~2s)",
         args.pair_timeout.as_secs()
     ));
-    let a1 = p1.await_pairing(api, args.pair_timeout).await?;
-    let a2 = p2.await_pairing(api, args.pair_timeout).await?;
-    check_pairing(&p1, &a1, &p2, &a2)?;
-    log::note(format!(
-        "paired on match {} (attempt {}…)",
-        a1.match_token,
-        truncate(&a1.attempt_id)
-    ));
-    log::line(&p1.label, format!("assigned role '{}'", a1.role));
-    log::line(&p2.label, format!("assigned role '{}'", a2.role));
+    let a1 = p1.await_pairing(args.pair_timeout).await?;
+    let a2 = p2.await_pairing(args.pair_timeout).await?;
+    check_pairing(p1, &a1, p2, &a2)?;
+    log::note(format!("paired on {}", a1.match_token));
+    log::line(&p1.label, format!("    {}", a1.summary()));
+    log::line(&p2.label, format!("    {}", a2.summary()));
 
-    p1.accept(api, &a1.match_token).await?;
-    p2.accept(api, &a2.match_token).await?;
-    p1.await_phase(api, "AwaitingTrying", args.stage_timeout)
-        .await?;
-    p2.await_phase(api, "AwaitingTrying", args.stage_timeout)
-        .await?;
+    for (player, active) in [(p1, &a1), (p2, &a2)] {
+        let body = player.accept_body(&active.match_token);
+        player.send_applied(body).await?;
+    }
+    for player in [p1, p2] {
+        player
+            .await_phase("AwaitingTrying", args.stage_timeout)
+            .await?;
+    }
 
-    p1.trying(api, &a1).await?;
-    p2.trying(api, &a2).await?;
-    p1.await_phase(api, "AwaitingConnect", args.stage_timeout)
-        .await?;
-    p2.await_phase(api, "AwaitingConnect", args.stage_timeout)
-        .await?;
+    for (player, active) in [(p1, &a1), (p2, &a2)] {
+        let body = player.trying_body(active, None);
+        player.send_applied(body).await?;
+    }
+    for player in [p1, p2] {
+        player
+            .await_phase("AwaitingConnect", args.stage_timeout)
+            .await?;
+    }
 
-    p1.connect(api, &a1).await?;
-    p2.connect(api, &a2).await?;
-    p1.await_phase(api, "AwaitingReady", args.stage_timeout)
-        .await?;
-    p2.await_phase(api, "AwaitingReady", args.stage_timeout)
-        .await?;
+    for (player, active) in [(p1, &a1), (p2, &a2)] {
+        let body = player.connect_body(active, None);
+        player.send_applied(body).await?;
+    }
+    for player in [p1, p2] {
+        player
+            .await_phase("AwaitingReady", args.stage_timeout)
+            .await?;
+    }
 
-    p1.ready(api, &a1).await?;
-    p2.ready(api, &a2).await?;
-    p1.await_phase(api, "Playing", args.stage_timeout).await?;
-    p2.await_phase(api, "Playing", args.stage_timeout).await?;
+    for (player, active) in [(p1, &a1), (p2, &a2)] {
+        let body = player.ready_body(active, None);
+        player.send_applied(body).await?;
+    }
+    for player in [p1, p2] {
+        player.await_phase("Playing", args.stage_timeout).await?;
+    }
+
     log::note("match is live; both sides reporting a 2-0 win for P1");
-
-    // Read the cursor BEFORE reporting, so the result event cannot be missed
-    // even if it is emitted before the first poll.
-    let cursor1 = p1.cursor(api).await?;
-    let cursor2 = p2.cursor(api).await?;
-
-    p1.report(api, &a1.match_token, "win").await?;
-    p2.report(api, &a2.match_token, "loss").await?;
+    let cursor1 = p1.cursor().await?;
+    let cursor2 = p2.cursor().await?;
+    for (player, outcome) in [(p1, "win"), (p2, "loss")] {
+        let body = player.report_body(&a1.match_token, outcome, "2-0", "deadbeef", 900);
+        player.send_applied(body).await?;
+    }
 
     let r1 = p1
-        .await_result(api, cursor1, &a1.match_token, args.result_timeout)
+        .await_result(cursor1, &a1.match_token, args.result_timeout)
         .await?;
     let r2 = p2
-        .await_result(api, cursor2, &a2.match_token, args.result_timeout)
+        .await_result(cursor2, &a1.match_token, args.result_timeout)
         .await?;
-    summarise(&p1, &r1, &p2, &r2)
+    summarise(p1, &r1, p2, &r2)
 }
 
-/// One player, driven from one terminal. The peer is a second run of this same
-/// binary with `--single --side b`.
-async fn drive_single(api: &Api, args: &Args, me: Player) -> Result<()> {
+/// One player, driven from one run. The peer is a second run of this binary
+/// with `--single --side b`.
+async fn drive_single(args: &Args, me: &Player) -> Result<()> {
     let peer_side = if args.side == Side::A { "b" } else { "a" };
     log::note(format!(
         "single-player mode: start `umvc3-client --single --side {peer_side}` in another terminal"
     ));
 
-    me.queue(api, &args.mode, &args.difficulty).await?;
-    me.await_queued(api, &args.mode, args.stage_timeout).await?;
+    let body = me.queue_body(&args.mode, &args.difficulty);
+    me.send_applied(body).await?;
+    me.await_queued(&args.mode, args.stage_timeout).await?;
 
     log::note(format!(
         "waiting for the matchmaker (up to {}s)",
         args.pair_timeout.as_secs()
     ));
-    let active = me.await_pairing(api, args.pair_timeout).await?;
-    log::note(format!("paired on match {}", active.match_token));
-    log::line(&me.label, format!("assigned role '{}'", active.role));
+    let active = me.await_pairing(args.pair_timeout).await?;
+    log::note(format!("paired on {}", active.match_token));
+    log::line(&me.label, format!("    {}", active.summary()));
 
-    me.accept(api, &active.match_token).await?;
-    me.await_phase(api, "AwaitingTrying", args.stage_timeout)
+    let body = me.accept_body(&active.match_token);
+    me.send_applied(body).await?;
+    me.await_phase("AwaitingTrying", args.stage_timeout).await?;
+    let body = me.trying_body(&active, None);
+    me.send_applied(body).await?;
+    me.await_phase("AwaitingConnect", args.stage_timeout)
         .await?;
-    me.trying(api, &active).await?;
-    me.await_phase(api, "AwaitingConnect", args.stage_timeout)
-        .await?;
-    me.connect(api, &active).await?;
-    me.await_phase(api, "AwaitingReady", args.stage_timeout)
-        .await?;
-    me.ready(api, &active).await?;
-    me.await_phase(api, "Playing", args.stage_timeout).await?;
+    let body = me.connect_body(&active, None);
+    me.send_applied(body).await?;
+    me.await_phase("AwaitingReady", args.stage_timeout).await?;
+    let body = me.ready_body(&active, None);
+    me.send_applied(body).await?;
+    me.await_phase("Playing", args.stage_timeout).await?;
 
     let outcome = args.side.reported_outcome();
     log::note(format!("reporting this side's result as '{outcome}'"));
-    let cursor = me.cursor(api).await?;
-    me.report(api, &active.match_token, outcome).await?;
+    let cursor = me.cursor().await?;
+    let body = me.report_body(&active.match_token, outcome, "2-0", "deadbeef", 900);
+    me.send_applied(body).await?;
 
     let result = me
-        .await_result(api, cursor, &active.match_token, args.result_timeout)
+        .await_result(cursor, &active.match_token, args.result_timeout)
         .await?;
     log::line(
         &me.label,
@@ -415,8 +474,4 @@ fn render_delta(delta: Option<f64>) -> String {
         Some(value) => format!("{value:+.2}"),
         None => "none".to_string(),
     }
-}
-
-fn truncate(text: &str) -> String {
-    text.chars().take(8).collect()
 }
