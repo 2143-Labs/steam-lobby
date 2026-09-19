@@ -1,0 +1,13 @@
+[package]
+name = "umvc3-client"
+version = "0.1.0"
+edition = "2024"
+description = "Reference native client for the UMVC3 ranked service: drives the real HTTP lifecycle so the game client's work can be developed and tested without it"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
