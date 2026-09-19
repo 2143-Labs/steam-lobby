@@ -689,3 +689,219 @@ async fn link_spa_routes_are_served_and_ticket_errors_are_mapped_without_provide
     }
 }
 
+
+/// POST a session ticket to one of the two routes backed by `ticket_token`
+/// (`/api/ticket` and `/auth/ticket`).
+async fn post_ticket(h: &TestHarness, path: &str, ticket: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}{path}", h.base_url))
+        .json(&serde_json::json!({"ticket": ticket}))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("POST {path}: {error}"))
+}
+
+/// The dev-ticket affordance is inert unless `auth_dev_mode` is on AND
+/// accounts are not restricted to Steam; the positive cases below need the
+/// gated route set open plus the ranked queue's native mode enabled.
+fn dev_ticket_config() -> TestConfig {
+    TestConfig {
+        game_modes: vec![lobby_core::types::mode_spec("umvc3_1v1").unwrap()],
+        auth_dev_mode: true,
+        steam_backed_accounts_only: false,
+        ..TestConfig::default()
+    }
+}
+
+fn queue_body() -> serde_json::Value {
+    serde_json::json!({
+        "command_id": Uuid::new_v4(),
+        "type": "queue",
+        "mode": "umvc3_1v1",
+        "difficulty": "normal",
+    })
+}
+
+/// `dev:<steam_id>` must mint the SAME native session the real Steam path
+/// mints — proven by `/api/command`, which only accepts a native session — and
+/// must stay inert when either gate is closed.
+#[sqlx::test]
+async fn dev_ticket_mints_a_native_session_only_under_the_dev_gates(pool: sqlx::PgPool) {
+    const DEV_STEAM_ID: u64 = 76_561_198_000_000_101;
+    let h = setup_with_config(pool, dev_ticket_config()).await;
+    let ticket = format!("dev:{DEV_STEAM_ID}");
+
+    // Case 1: dev on, Steam-backed off — `/api/ticket` returns a real token.
+    let response = post_ticket(&h, "/api/ticket", &ticket).await;
+    assert_eq!(response.status(), StatusCode::OK, "dev ticket on /api/ticket");
+    let body: serde_json::Value = response.json().await.unwrap();
+    let token = body["access_token"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        !token.is_empty(),
+        "the dev ticket must return a non-empty access_token"
+    );
+    assert_eq!(body["expires_in"], 3600);
+
+    // The same function backs `/auth/ticket`, so the dev ticket works there too.
+    let auth_ticket = post_ticket(&h, "/auth/ticket", &ticket).await;
+    assert_eq!(auth_ticket.status(), StatusCode::OK, "dev ticket on /auth/ticket");
+    let auth_body: serde_json::Value = auth_ticket.json().await.unwrap();
+    assert!(
+        !auth_body["token"].as_str().unwrap_or_default().is_empty(),
+        "the dev ticket must return a non-empty native token on /auth/ticket"
+    );
+
+    // Case 2: the token is NATIVE, not browser. `/api/command` resolves its
+    // actor through `native_actor`, which rejects any non-native session with
+    // 401 `native_session_required`; reaching the queue dispatcher proves the
+    // session kind. The dev ticket is also the only thing that created this
+    // user — nothing here seeds a session, token, or player row.
+    let user_id: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE steam_id=$1")
+        .bind(DEV_STEAM_ID as i64)
+        .fetch_one(&h.pool)
+        .await
+        .expect("the dev ticket must create the Steam user it mints a token for");
+
+    let admitted = common::post_command(&h, &token, queue_body()).await;
+    assert_eq!(
+        admitted.status(),
+        StatusCode::ACCEPTED,
+        "a dev ticket must mint a NATIVE session, which /api/command admits (a browser session is 401 native_session_required)"
+    );
+    let admitted_body: serde_json::Value = admitted.json().await.unwrap();
+    assert!(
+        admitted_body["receipt"].is_string(),
+        "an admitted queue command carries a receipt"
+    );
+
+    // This client never sent the websocket `enter_menus`, so no `player_state`
+    // row existed when the command arrived: the HTTP admission path has to
+    // create it itself, which is what lets an HTTP-only client queue at all.
+    let created = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT state,active_match_token FROM player_state WHERE user_id=$1",
+    )
+    .bind(user_id)
+    .fetch_optional(&h.pool)
+    .await
+    .unwrap();
+    let (state, active_match) =
+        created.expect("queue admission must create the missing player_state row itself");
+    assert!(
+        matches!(state.as_str(), "InMenus" | "Queueing"),
+        "the created row starts InMenus (the ticker may already have applied the queue): {state}"
+    );
+    assert!(
+        active_match.is_none(),
+        "admission alone must not attach a match to the player"
+    );
+
+    // Case 5: a `dev:` prefix whose payload is not a SteamID64 is a client
+    // error, not a fall-through to the ticket validator's `malformed_ticket`.
+    let malformed = post_ticket(&h, "/api/ticket", "dev:not-a-number").await;
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    let malformed_body: serde_json::Value = malformed.json().await.unwrap();
+    assert_eq!(malformed_body["error"], "malformed_dev_ticket");
+
+    // Case 6: control. The BROWSER session `/auth/test-token` mints is refused
+    // by the very same endpoint, which is what makes case 2 an assertion about
+    // the native gate rather than about "some token came back".
+    let browser = reqwest::Client::new()
+        .post(format!("{}/auth/test-token", h.base_url))
+        .json(&serde_json::json!({"steam_id": 76_561_198_000_000_102u64}))
+        .send()
+        .await
+        .expect("POST /auth/test-token");
+    assert_eq!(browser.status(), StatusCode::OK);
+    let browser_body: serde_json::Value = browser.json().await.unwrap();
+    let browser_token = browser_body["token"].as_str().unwrap_or_default();
+    assert!(!browser_token.is_empty(), "test-token must mint a token");
+
+    let rejected = common::post_command(&h, browser_token, queue_body()).await;
+    assert_eq!(
+        rejected.status(),
+        StatusCode::UNAUTHORIZED,
+        "a browser session must never satisfy /api/command's native gate"
+    );
+    let rejected_body: serde_json::Value = rejected.json().await.unwrap();
+    assert_eq!(rejected_body["error"], "native_session_required");
+}
+
+/// A `dev:` ticket is not hex, so when either dev gate is closed the branch is
+/// skipped and the ticket falls through to the hex validator's
+/// `malformed_ticket` — i.e. the affordance cannot be opened by mistake.
+#[sqlx::test]
+async fn dev_ticket_is_rejected_when_either_dev_gate_is_closed(pool: sqlx::PgPool) {
+    const DEV_STEAM_ID: u64 = 76_561_198_000_000_103;
+    let ticket = format!("dev:{DEV_STEAM_ID}");
+
+    // Case 3: dev mode off.
+    let h = setup_with_config(
+        pool.clone(),
+        TestConfig {
+            auth_dev_mode: false,
+            ..TestConfig::default()
+        },
+    )
+    .await;
+    let response = post_ticket(&h, "/api/ticket", &ticket).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"], "malformed_ticket");
+    drop(h);
+
+    // Case 4: dev mode on, but accounts are restricted to Steam.
+    let h = setup_with_config(pool, identity_config(vec![], true)).await;
+    let response = post_ticket(&h, "/api/ticket", &ticket).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"], "malformed_ticket");
+}
+
+/// The missing-`player_state` fallback must not weaken queue exclusivity: a
+/// player who already holds an active match is still refused.
+#[sqlx::test]
+async fn queue_admission_still_refuses_a_player_already_holding_an_active_match(
+    pool: sqlx::PgPool,
+) {
+    // No ticker: the rejection happens at admission, and a live ticker would
+    // otherwise mutate the seeded match state underneath the assertion.
+    let h = setup_with_config(
+        pool,
+        TestConfig {
+            ticker_enabled: false,
+            ..dev_ticket_config()
+        },
+    )
+    .await;
+    let (user_id, _, token) = h.native_principal(76_561_198_000_000_104).await;
+    let (opponent, _, _) = h.native_principal(76_561_198_000_000_105).await;
+
+    let match_token = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO matches(match_token,player_a,player_a_difficulty,player_b,player_b_difficulty,game_mode,game_type,status,created_at) \
+         VALUES($1,$2,'normal',$3,'normal','umvc3_1v1','p2p','Playing',NOW())",
+    )
+    .bind(&match_token)
+    .bind(user_id)
+    .bind(opponent)
+    .execute(&h.pool)
+    .await
+    .expect("seed the player's active match");
+    // `InMenus` plus a live match token: only the active-match half of the
+    // guard can reject this queue command, not the state half.
+    sqlx::query("UPDATE player_state SET state='InMenus',active_match_token=$1 WHERE user_id=$2")
+        .bind(&match_token)
+        .bind(user_id)
+        .execute(&h.pool)
+        .await
+        .expect("attach the active match to the player");
+
+    let response = common::post_command(&h, &token, queue_body()).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "an active match must still block a queue command (202 means the guard was skipped, 404 means the player row went missing)"
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"], "match_state_mismatch");
+}

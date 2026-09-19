@@ -307,6 +307,20 @@ pub async fn auth_callback(State(state):State<Arc<AppState>>,Path(provider):Path
 
 async fn ticket_token(state:&AppState,ip:std::net::IpAddr,ticket:&str)->Result<String,Response>{
     if !state.ticket_limiter.check(ip){return Err((StatusCode::TOO_MANY_REQUESTS,Json(serde_json::json!({"error":"rate_limited"}))).into_response())}
+    // Dev-only: `dev:<steam_id>` stands in for a real Steam auth session ticket so
+    // a local reference client can mint a native session without Steam. Gated
+    // exactly like the other dev affordances, and `find_or_create_user` below
+    // additionally refuses an unverified identity whenever
+    // STEAM_BACKED_ACCOUNTS_ONLY is set — so this is dead in any deployment that
+    // restricts accounts to Steam, even if AUTH_DEV_MODE were left on by mistake.
+    if state.config.auth_dev_mode
+        && !state.config.steam_backed_accounts_only
+        && let Some(raw)=ticket.strip_prefix("dev:")
+    {
+        let Ok(dev_steam_id)=raw.parse::<u64>() else{return Err((StatusCode::BAD_REQUEST,Json(serde_json::json!({"error":"malformed_dev_ticket"}))).into_response())};
+        let user_id=state.store.find_or_create_user("steam",&dev_steam_id.to_string(),"",false).await.map_err(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+        return issue_native(state,user_id).await.map_err(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
     if ticket.is_empty()||ticket.len()>8192||ticket.len()%2!=0||!ticket.bytes().all(|b|b.is_ascii_hexdigit()){return Err((StatusCode::BAD_REQUEST,Json(serde_json::json!({"error":"malformed_ticket"}))).into_response())}
     let steam_id=match state.steam_auth.verify_ticket(ticket,"matchmaking").await{Ok(v)=>v,Err(lobby_core::error::LobbyError::SteamAuthFailed(e)) if e=="provider_unavailable"=>return Err((StatusCode::SERVICE_UNAVAILABLE,Json(serde_json::json!({"error":"provider_unavailable"}))).into_response()),Err(_)=>return Err(StatusCode::UNAUTHORIZED.into_response())};
     let user_id=state.store.find_or_create_user("steam",&steam_id.to_string(),"",true).await.map_err(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
