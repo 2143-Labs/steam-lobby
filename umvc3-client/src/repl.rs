@@ -12,12 +12,51 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::api::compact;
+use crate::api::{compact, redact};
 use crate::log;
-use crate::player::{ActiveMatch, Player, require_match, text};
+use crate::player::{ActiveMatch, NativeUnauthorized, Player, require_match, text};
+use crate::session::RefreshFailed;
 
-/// A received event, tagged with which player received it.
-type EventMsg = (usize, Value);
+/// Why a background read failed. A fixed label, never a server-provided string.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    Transport,
+    Refresh,
+}
+
+/// What a background reader tells the shell, tagged with the player's index.
+enum EventMsg {
+    Event { index: usize, value: Value },
+    Unauthorized { index: usize },
+    Failed { index: usize, kind: FailureKind },
+    Recovered { index: usize },
+}
+
+impl EventMsg {
+    /// Classify a failed read by type, not by parsing its message.
+    fn failure(index: usize, error: &anyhow::Error) -> Self {
+        if error.downcast_ref::<NativeUnauthorized>().is_some() {
+            Self::Unauthorized { index }
+        } else if error.downcast_ref::<RefreshFailed>().is_some() {
+            Self::Failed {
+                index,
+                kind: FailureKind::Refresh,
+            }
+        } else {
+            Self::Failed {
+                index,
+                kind: FailureKind::Transport,
+            }
+        }
+    }
+}
+
+/// A player's background connection trouble; absent means healthy.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Connection {
+    Unauthorized,
+    Failed(FailureKind),
+}
 
 const HELP: &str = "\
 commands (act as the focused player unless a player is named):
@@ -58,7 +97,14 @@ deliberately abnormal
                              send with a bogus attempt_id        (expect stale_attempt)
   bad-token                  send a heartbeat with a garbage bearer (expect 401)
   steal <match_token>        accept a match token you were not given (expect a refusal)
-  logout                     revoke this session, keep polling   (expect 401s until 'poll off')
+
+session
+  logout                     end this access session only; background reads report
+                             'session unauthorized (401)' until 'refresh'
+  refresh                    exchange the saved device credential for a fresh bearer
+                             now; resumes automatic refresh after 'logout'
+  revoke-device              revoke the device credential on the server, then clear
+                             it from the token file (log in again to come back)
 
 flow
   auto                       run the whole normal flow for both players
@@ -79,6 +125,9 @@ pub struct Shell {
     last: HashMap<(usize, String), Value>,
     /// Last status line printed per player, so ticks only speak on change.
     last_status: HashMap<usize, String>,
+    /// Current connection trouble per player, so a failure is reported once
+    /// per transition rather than every poll.
+    connection: HashMap<usize, Connection>,
     cursors: Vec<i64>,
     events_tx: mpsc::UnboundedSender<EventMsg>,
     event_readers: Vec<JoinHandle<()>>,
@@ -105,6 +154,7 @@ impl Shell {
             tick,
             last: HashMap::new(),
             last_status: HashMap::new(),
+            connection: HashMap::new(),
             cursors,
             events_tx,
             event_readers: Vec::new(),
@@ -155,7 +205,7 @@ impl Shell {
                         None => break,
                     }
                 }
-                Some((index, event)) = events_rx.recv() => self.report_event(index, &event),
+                Some(message) = events_rx.recv() => self.receive(message),
                 _ = ticker.tick() => {
                     if self.polling {
                         self.poll_states().await;
@@ -189,20 +239,30 @@ impl Shell {
             let mut cursor = self.cursors[index];
             self.event_readers.push(tokio::spawn(async move {
                 loop {
-                    match player.events_quiet(cursor).await {
+                    let message = match player.events_quiet(cursor).await {
                         Ok(page) => {
                             cursor = page["next_cursor"].as_i64().unwrap_or(cursor);
-                            if let Some(events) = page["events"].as_array() {
-                                for event in events {
-                                    if tx.send((index, event.clone())).is_err() {
-                                        return;
-                                    }
+                            for value in page["events"].as_array().into_iter().flatten() {
+                                let value = value.clone();
+                                if tx.send(EventMsg::Event { index, value }).is_err() {
+                                    return;
                                 }
                             }
+                            EventMsg::Recovered { index }
                         }
-                        // A revoked or rejected session lands here; keep trying so
-                        // the resulting 401s stay visible rather than silent.
-                        Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
+                        // Keep trying, so a revoked or refused session is reported
+                        // once and its recovery is noticed; never log in from here.
+                        Err(error) => {
+                            let message = EventMsg::failure(index, &error);
+                            if tx.send(message).is_err() {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
+                    if tx.send(message).is_err() {
+                        return;
                     }
                 }
             }));
@@ -216,6 +276,19 @@ impl Shell {
         }
     }
 
+    fn receive(&mut self, message: EventMsg) {
+        match message {
+            EventMsg::Event { index, value } => self.report_event(index, &value),
+            EventMsg::Unauthorized { index } => {
+                self.report_connection(index, Some(Connection::Unauthorized));
+            }
+            EventMsg::Failed { index, kind } => {
+                self.report_connection(index, Some(Connection::Failed(kind)));
+            }
+            EventMsg::Recovered { index } => self.report_connection(index, None),
+        }
+    }
+
     fn report_event(&mut self, index: usize, event: &Value) {
         let label = self.players[index].label.clone();
         log::line(
@@ -224,9 +297,33 @@ impl Shell {
                 "event #{} {}  {}",
                 event["sequence_no"].as_i64().unwrap_or_default(),
                 event["type"].as_str().unwrap_or("?"),
-                compact(&event["payload"])
+                compact(&redact(&event["payload"]))
             ),
         );
+    }
+
+    /// Speak only when a player's background connection changes state, so a
+    /// dead session reads as one line rather than one per poll.
+    fn report_connection(&mut self, index: usize, state: Option<Connection>) {
+        if self.connection.get(&index).copied() == state {
+            return;
+        }
+        let message = match state {
+            Some(Connection::Unauthorized) => "session unauthorized (401)",
+            Some(Connection::Failed(FailureKind::Transport)) => {
+                "background read failed (transport); retrying quietly"
+            }
+            Some(Connection::Failed(FailureKind::Refresh)) => {
+                "background read failed (refresh); retrying quietly"
+            }
+            None => "session recovered",
+        };
+        match state {
+            Some(state) => self.connection.insert(index, state),
+            None => self.connection.remove(&index),
+        };
+        let label = self.players[index].label.clone();
+        log::line(&label, message);
     }
 
     /// Re-read every player's state and speak only when something changed, so
@@ -234,12 +331,16 @@ impl Shell {
     async fn poll_states(&mut self) {
         for index in 0..self.players.len() {
             let snapshot = match self.players[index].state_quiet().await {
-                Ok(snapshot) => snapshot,
-                // The poller stays silent on the wire by design: it prints the
-                // changes it observes instead of every request it makes.
-                // A failure here is already visible as a status line once the
-                // session recovers; do not repeat it every tick.
-                Err(_) => continue,
+                Ok(snapshot) => {
+                    self.report_connection(index, None);
+                    snapshot
+                }
+                // The poller stays silent on the wire by design; a failure is
+                // reported once per transition, not every tick.
+                Err(error) => {
+                    self.receive(EventMsg::failure(index, &error));
+                    continue;
+                }
             };
             let active = ActiveMatch::from_state(&snapshot);
             let summary = match &active {
@@ -437,11 +538,8 @@ impl Shell {
             "bad-token" => {
                 log::note("sending a heartbeat with a garbage bearer");
                 let player = self.focused();
-                let real = std::mem::replace(&mut player.token, "not-a-real-token".into());
                 let body = player.heartbeat_body();
-                let outcome = player.send(body).await;
-                self.focused().token = real;
-                outcome?;
+                player.send_with_token("not-a-real-token", body).await?;
             }
             "steal" => {
                 let match_token = args.first().copied().context("steal <match_token>")?;
@@ -451,9 +549,25 @@ impl Shell {
             }
             "logout" => {
                 let player = self.focused();
-                let status = player.api.logout(&player.token).await?;
+                let status = player.session.logout_access().await?;
                 log::line(&player.label, format!("    = logout {status}"));
-                log::note("session revoked — the poller will now show 401s until 'poll off'");
+                log::note(
+                    "access session revoked; automatic refresh paused, so reads return 401 \
+                     until 'refresh' (the saved device credential is untouched)",
+                );
+            }
+            "refresh" => {
+                let player = self.focused();
+                player.session.refresh_now().await?;
+                log::line(&player.label, "    = refreshed; automatic refresh resumed");
+            }
+            "revoke-device" => {
+                let player = self.focused();
+                player.session.revoke_device().await?;
+                log::line(
+                    &player.label,
+                    "    = device revoked on the server and cleared from its token file",
+                );
             }
             "auto" => self.cmd_auto().await?,
             other => log::note(format!("unknown command '{other}' (try 'help')")),
@@ -495,7 +609,8 @@ impl Shell {
 
     async fn cmd_raw(&mut self, json_text: &str) -> Result<bool> {
         let body: Value = serde_json::from_str(json_text)
-            .with_context(|| format!("raw expects one JSON object, got: {json_text}"))?;
+            .ok()
+            .context("raw expects one JSON object")?;
         self.send_raw(body).await?;
         Ok(true)
     }
@@ -507,7 +622,8 @@ impl Shell {
                 &player.label,
                 format!(
                     "{marker} steam_id={} cursor={}",
-                    player.steam_id, self.cursors[index]
+                    player.steam_id_text(),
+                    self.cursors[index]
                 ),
             );
         }
@@ -687,8 +803,10 @@ fn block(tag: &str, body: &str) {
     }
 }
 
+/// Pretty-print arbitrary server JSON, with every credential redacted first.
 fn pretty(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| compact(value))
+    let value = redact(value);
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| compact(&value))
 }
 
 fn parse_arg(raw: Option<&&str>, name: &str) -> Result<u64> {

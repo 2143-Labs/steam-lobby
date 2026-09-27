@@ -15,31 +15,39 @@
 //! with no WebSocket anywhere.
 
 mod api;
+mod ini;
 mod log;
 mod player;
 mod repl;
+mod session;
 
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
 use crate::api::Api;
+use crate::ini::StoredDevice;
 use crate::player::{ActiveMatch, Player, ResultSnapshot};
+
+const DEFAULT_BASE_URL: &str = "http://localhost:8080";
 
 const USAGE: &str = "\
 umvc3-client — reference native client for the UMVC3 ranked service
 
 USAGE:
     umvc3-client [OPTIONS]
+    umvc3-client login --token-file <PATH> [--base-url <URL>] [--dev-approve]
 
 With a terminal on stdin this starts an interactive shell (type 'help' for the
 command list). Piped or with --auto it runs the whole lifecycle once, which is
 the regression path.
 
 OPTIONS:
-    --base-url <URL>        Ranked service origin     [default: http://localhost:8080]
+    --base-url <URL>        Ranked service origin     [default: http://localhost:8080,
+                            or the RankedBaseUrl saved in a --token-file]
     --mode <MODE>           Game mode to queue for    [default: umvc3_1v1]
     --difficulty <LEVEL>    easy | normal | hard      [default: normal]
     --steam-id <ID>         First player's Steam ID   [default: 76561198000000101]
@@ -48,15 +56,35 @@ OPTIONS:
     --side <a|b>            Which side --single is    [default: a]
     --auto                  Skip the shell; run the scripted flow once
     --interactive           Force the shell even without a terminal on stdin
+    --token-file <PATH>     First player signs in with a device session saved here
+    --peer-token-file <PATH>
+                            Second player's device session file (not with --single)
+    --dev-approve           Approve a new device grant as --steam-id / --peer-steam-id
+                            instead of a browser; loopback servers only
     --tick <SECS>           Shell state poll interval [default: 2]
     --pair-timeout <SECS>   Pairing deadline          [default: 60]
     --stage-timeout <SECS>  Per-stage deadline        [default: 30]
     --result-timeout <SECS> Result deadline           [default: 30]
     -h, --help              Print this help
 
-The server must be local and dev-flavoured: AUTH_DEV_MODE=true so a dev: ticket
-is accepted, and the queue enabled (RANKED_QUEUE_ENABLED=true, the default when
-unset). Temporal must be running — pairing is one of its schedules.";
+Without a token file a player signs in with a dev:<steam_id> ticket, so the
+server must be local and dev-flavoured: AUTH_DEV_MODE=true, and the queue
+enabled (RANKED_QUEUE_ENABLED=true, the default when unset). Temporal must be
+running — pairing is one of its schedules.
+
+DEVICE LOGIN:
+    umvc3-client login --base-url https://<service-origin> --token-file <private.ini>
+    umvc3-client --token-file <private.ini> --single --interactive
+
+'login' prints a code and a URL; approve the code in a browser signed in with
+Steam, and the device credential is saved to [Settings] RankedRefreshToken and
+RankedBaseUrl in the file. Later runs exchange it for native sessions without a
+browser. It is a revocable long-lived credential: keep the file private (0600;
+a group- or world-readable file is refused) and never share it. In the shell,
+'logout' ends only the current access session, 'refresh' resumes it, and
+'revoke-device' revokes the durable grant and clears the file. --dev-approve
+stands in for the browser against a loopback dev server only. This models the
+game's credential handoff; the game itself does not read this file.";
 
 /// Which simulated player this process drives in `--single` mode.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -84,7 +112,8 @@ impl Side {
 }
 
 struct Args {
-    base_url: String,
+    /// `None` unless `--base-url` was given, so a saved origin can apply.
+    base_url: Option<String>,
     mode: String,
     difficulty: String,
     steam_id: u64,
@@ -93,6 +122,9 @@ struct Args {
     side: Side,
     auto: bool,
     interactive: bool,
+    token_file: Option<PathBuf>,
+    peer_token_file: Option<PathBuf>,
+    dev_approve: bool,
     tick: Duration,
     pair_timeout: Duration,
     stage_timeout: Duration,
@@ -102,7 +134,7 @@ struct Args {
 impl Default for Args {
     fn default() -> Self {
         Self {
-            base_url: "http://localhost:8080".into(),
+            base_url: None,
             mode: "umvc3_1v1".into(),
             difficulty: "normal".into(),
             steam_id: 76_561_198_000_000_101,
@@ -111,6 +143,9 @@ impl Default for Args {
             side: Side::A,
             auto: false,
             interactive: false,
+            token_file: None,
+            peer_token_file: None,
+            dev_approve: false,
             tick: Duration::from_secs(2),
             pair_timeout: Duration::from_secs(60),
             stage_timeout: Duration::from_secs(30),
@@ -122,6 +157,7 @@ impl Default for Args {
 enum Parsed {
     Help,
     Run(Box<Args>),
+    Login(Box<Args>),
 }
 
 #[tokio::main]
@@ -137,22 +173,45 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<()> {
-    let args = match Args::parse()? {
+    let (args, login) = match Args::parse()? {
         Parsed::Help => {
             println!("{USAGE}");
             return Ok(());
         }
-        Parsed::Run(args) => *args,
+        Parsed::Run(args) => (*args, false),
+        Parsed::Login(args) => (*args, true),
     };
+    args.validate(login)?;
 
-    let service = Api::new(&args.base_url, "---")?;
-    log::note(format!("ranked service at {}", service.base()));
-    verify_mode(&service, &args.mode).await?;
+    // Everything local — the token files and the origin they are bound to — is
+    // settled before any request, so a missing session fails even offline and
+    // no credential is ever sent to the wrong server.
+    let stored = [
+        args.token_file.as_deref().map_or(Ok(None), ini::load)?,
+        args.peer_token_file
+            .as_deref()
+            .map_or(Ok(None), ini::load)?,
+    ];
+    if login && stored[0].is_some() {
+        bail!("already linked; use the saved session or revoke-device first");
+    }
+    let base = args.resolve_base(&stored)?;
+    if args.dev_approve && !api::is_loopback(&base) {
+        bail!("--dev-approve only talks to a loopback server (localhost, 127.0.0.1, ::1)");
+    }
 
-    let mut players = Vec::new();
-    players.push(Player::authenticate(&args.base_url, args.first_label(), args.steam_id).await?);
-    if !args.single {
-        players.push(Player::authenticate(&args.base_url, "P2", args.peer_steam_id).await?);
+    if login {
+        let file = args
+            .token_file
+            .as_deref()
+            .context("login requires --token-file")?;
+        log::note(format!("device login at {base}"));
+        Player::login(&base, "P1", file, args.dev_approve.then_some(args.steam_id)).await?;
+        log::note(format!(
+            "device linked; start a session with --token-file {}",
+            file.display()
+        ));
+        return Ok(());
     }
 
     // Interactive when a human is watching; scripted otherwise, so piping the
@@ -164,6 +223,47 @@ async fn run() -> Result<()> {
     } else {
         std::io::stdin().is_terminal()
     };
+    // Nobody is watching an unattended run to approve a browser prompt.
+    for (file, saved) in [
+        (&args.token_file, &stored[0]),
+        (&args.peer_token_file, &stored[1]),
+    ] {
+        if let Some(file) = file
+            && saved.is_none()
+            && !interactive
+            && !args.dev_approve
+        {
+            bail!(
+                "no saved device session in {0}; run login --token-file {0} first",
+                file.display()
+            );
+        }
+    }
+
+    let service = Api::new(&base, "---")?;
+    log::note(format!("ranked service at {}", service.base()));
+    verify_mode(&service, &args.mode).await?;
+
+    let mut players = Vec::new();
+    let first = args.token_file.as_deref();
+    players.push(
+        args.player(
+            &base,
+            args.first_label(),
+            args.steam_id,
+            first,
+            stored[0].is_some(),
+        )
+        .await?,
+    );
+    if !args.single {
+        let peer = args.peer_token_file.as_deref();
+        players.push(
+            args.player(&base, "P2", args.peer_steam_id, peer, stored[1].is_some())
+                .await?,
+        );
+    }
+
     if interactive {
         let mut shell = repl::Shell::new(
             players,
@@ -189,14 +289,20 @@ impl Args {
 
     fn parse() -> Result<Parsed> {
         let mut args = Args::default();
-        let mut argv = std::env::args().skip(1);
+        let mut argv = std::env::args().skip(1).peekable();
+        // `login` is a subcommand only in first position; anywhere else it is
+        // an unrecognised argument like any other.
+        let login = argv.next_if(|first| first == "login").is_some();
         while let Some(flag) = argv.next() {
             match flag.as_str() {
                 "-h" | "--help" => return Ok(Parsed::Help),
                 "--single" => args.single = true,
                 "--auto" => args.auto = true,
                 "--interactive" => args.interactive = true,
-                "--base-url" => args.base_url = value(&mut argv, &flag)?,
+                "--dev-approve" => args.dev_approve = true,
+                "--base-url" => args.base_url = Some(value(&mut argv, &flag)?),
+                "--token-file" => args.token_file = Some(path(&mut argv, &flag)?),
+                "--peer-token-file" => args.peer_token_file = Some(path(&mut argv, &flag)?),
                 "--mode" => args.mode = value(&mut argv, &flag)?,
                 "--difficulty" => args.difficulty = value(&mut argv, &flag)?,
                 "--steam-id" => args.steam_id = number(&mut argv, &flag)?,
@@ -215,8 +321,124 @@ impl Args {
                 other => bail!("unrecognised argument '{other}' (try --help)"),
             }
         }
-        Ok(Parsed::Run(Box::new(args)))
+        let args = Box::new(args);
+        Ok(if login {
+            Parsed::Login(args)
+        } else {
+            Parsed::Run(args)
+        })
     }
+
+    /// Flag combinations that cannot mean anything, refused before any I/O.
+    fn validate(&self, login: bool) -> Result<()> {
+        if login {
+            if self.token_file.is_none() {
+                bail!("login requires --token-file <PATH>");
+            }
+            for (set, flag) in [
+                (self.single, "--single"),
+                (self.peer_token_file.is_some(), "--peer-token-file"),
+                (self.auto, "--auto"),
+                (self.interactive, "--interactive"),
+            ] {
+                if set {
+                    bail!("login does not take {flag}");
+                }
+            }
+        }
+        if let Some(peer) = &self.peer_token_file {
+            if self.single {
+                bail!("--peer-token-file needs a second player; drop --single");
+            }
+            if self
+                .token_file
+                .as_deref()
+                .is_some_and(|own| same_path(own, peer))
+            {
+                bail!("--peer-token-file must name a different file from --token-file");
+            }
+        }
+        if self.dev_approve && self.token_file.is_none() && self.peer_token_file.is_none() {
+            bail!("--dev-approve needs --token-file or --peer-token-file");
+        }
+        Ok(())
+    }
+
+    /// The one origin this process talks to: an explicit `--base-url`, else the
+    /// origin a saved device credential is bound to, else the default. Without
+    /// a token file the dev-ticket path keeps using the URL as given.
+    fn resolve_base(&self, stored: &[Option<StoredDevice>; 2]) -> Result<String> {
+        if self.token_file.is_none() && self.peer_token_file.is_none() {
+            return Ok(self
+                .base_url
+                .clone()
+                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()));
+        }
+        let mut bound: Option<String> = None;
+        for (saved, file) in stored.iter().zip([&self.token_file, &self.peer_token_file]) {
+            let (Some(saved), Some(file)) = (saved, file) else {
+                continue;
+            };
+            let origin = api::device_origin(&saved.base)
+                .with_context(|| format!("{}: RankedBaseUrl", file.display()))?;
+            if let Some(other) = &bound
+                && *other != origin
+            {
+                bail!(
+                    "--token-file and --peer-token-file are bound to different servers \
+                     ({other} vs {origin})"
+                );
+            }
+            bound = Some(origin);
+        }
+        let explicit = self
+            .base_url
+            .as_deref()
+            .map(api::device_origin)
+            .transpose()
+            .context("--base-url")?;
+        match (explicit, bound) {
+            (Some(explicit), Some(bound)) if explicit != bound => bail!(
+                "--base-url {explicit} does not match {bound}, the server the saved device \
+                 session is bound to; refusing to send its credential"
+            ),
+            (Some(origin), _) | (None, Some(origin)) => Ok(origin),
+            (None, None) => api::device_origin(DEFAULT_BASE_URL),
+        }
+    }
+
+    /// One player: a dev ticket without a token file; with one, its saved
+    /// device session, or a new device grant when none is saved yet.
+    async fn player(
+        &self,
+        base: &str,
+        label: &str,
+        steam_id: u64,
+        file: Option<&Path>,
+        saved: bool,
+    ) -> Result<Player> {
+        match file {
+            None => Player::authenticate(base, label, steam_id).await,
+            Some(file) if saved => Player::from_device(base, label, file).await,
+            Some(file) => {
+                Player::login(base, label, file, self.dev_approve.then_some(steam_id)).await
+            }
+        }
+    }
+}
+
+/// Whether two paths name one file, even spelled differently.
+fn same_path(a: &Path, b: &Path) -> bool {
+    let resolve = |p: &Path| p.canonicalize().or_else(|_| std::path::absolute(p)).ok();
+    a == b || matches!((resolve(a), resolve(b)), (Some(a), Some(b)) if a == b)
+}
+
+fn path(argv: &mut impl Iterator<Item = String>, flag: &str) -> Result<PathBuf> {
+    let raw = value(argv, flag)?;
+    if raw.is_empty() {
+        bail!("{flag} needs a non-empty path");
+    }
+    Ok(PathBuf::from(raw))
 }
 
 fn value(argv: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
@@ -441,7 +663,7 @@ fn summarise(p1: &Player, r1: &ResultSnapshot, p2: &Player, r2: &ResultSnapshot)
             &player.label,
             format!(
                 "steam_id={}  {}  outcome={}  mmr_delta={}",
-                player.steam_id,
+                player.steam_id_text(),
                 result.event_type,
                 result.outcome,
                 render_delta(result.mmr_delta)

@@ -4,14 +4,37 @@
 //! [`Player::send`], so the interactive shell can show, replay and deliberately
 //! corrupt exactly what went on the wire.
 
+use std::fmt;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::api::{Admission, Api};
+use crate::api::{Admission, Api, detail};
 use crate::log;
+use crate::session::Session;
+
+/// A read the server refused with 401 even after any refresh this session was
+/// allowed to make. Typed, so the shell can tell it from a transport failure.
+#[derive(Debug)]
+pub struct NativeUnauthorized {
+    pub what: &'static str,
+}
+
+impl fmt::Display for NativeUnauthorized {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} -> 401 Unauthorized: the native session was not accepted",
+            self.what
+        )
+    }
+}
+
+impl std::error::Error for NativeUnauthorized {}
 
 /// A Steam lobby id of the shape the game reports for the lobby it created.
 /// Only the creating side supplies one; the joining side reports `null`.
@@ -66,12 +89,15 @@ pub struct ResultSnapshot {
 }
 
 /// Cheap to clone: the interactive shell hands a copy to each background
-/// reader so they can poll independently of the command loop.
+/// reader so they can poll independently of the command loop. Clones share one
+/// [`Session`], so a refreshed bearer reaches every reader without a restart.
 #[derive(Clone)]
 pub struct Player {
     pub label: String,
-    pub steam_id: u64,
-    pub token: String,
+    /// Known for a dev ticket; a browser-approved device session does not
+    /// learn which Steam account approved it.
+    pub steam_id: Option<u64>,
+    pub session: Session,
     pub api: Api,
 }
 
@@ -84,14 +110,42 @@ impl Player {
     /// is the only reason this tool can run without Steam present.
     pub async fn authenticate(base: &str, label: &str, steam_id: u64) -> Result<Self> {
         let api = Api::new(base, label)?;
-        let ticket = format!("dev:{steam_id}");
-        let token = api.native_ticket(&ticket).await?;
-        Ok(Self {
+        let session = Session::dev(api.clone(), steam_id).await?;
+        Ok(Self::with_session(label, api, session, Some(steam_id)))
+    }
+
+    /// Resume the device credential saved in `file` — no browser prompt.
+    pub async fn from_device(base: &str, label: &str, file: &Path) -> Result<Self> {
+        let api = Api::new(base, label)?;
+        let session = Session::device(api.clone(), file).await?;
+        Ok(Self::with_session(label, api, session, None))
+    }
+
+    /// Start a new device grant, wait for its approval, and save it to `file`.
+    pub async fn login(
+        base: &str,
+        label: &str,
+        file: &Path,
+        dev_approve_steam_id: Option<u64>,
+    ) -> Result<Self> {
+        let api = Api::new(base, label)?;
+        let session = crate::session::device_login(&api, label, file, dev_approve_steam_id).await?;
+        Ok(Self::with_session(label, api, session, None))
+    }
+
+    fn with_session(label: &str, api: Api, session: Session, steam_id: Option<u64>) -> Self {
+        Self {
             label: label.to_string(),
             steam_id,
-            token,
+            session,
             api,
-        })
+        }
+    }
+
+    /// The Steam ID for the transcript, or `unknown` for a device session.
+    pub fn steam_id_text(&self) -> String {
+        self.steam_id
+            .map_or_else(|| "unknown".to_string(), |id| id.to_string())
     }
 
     // ── command bodies ───────────────────────────────────────────────────
@@ -205,19 +259,32 @@ impl Player {
 
     // ── sending ──────────────────────────────────────────────────────────
 
-    /// POST one command body verbatim. No interpretation, no retry.
+    /// POST one command body verbatim. No interpretation; the only retry is a
+    /// single replay of the identical body — same `command_id` — after a 401
+    /// that this session could answer with a fresh bearer.
     pub async fn send(&self, body: Value) -> Result<Admission> {
-        let command_id = body
-            .get("command_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let kind = body
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("?")
-            .to_string();
-        let admitted = self.api.command(&self.token, body).await?;
+        let bearer = self.session.access().await?;
+        let mut admitted = self.api.command(&bearer, body.clone()).await?;
+        if admitted.status == StatusCode::UNAUTHORIZED
+            && self.session.refresh_after_401(&bearer).await?
+        {
+            let bearer = self.session.access().await?;
+            admitted = self.api.command(&bearer, body.clone()).await?;
+        }
+        self.log_admission(&body, &admitted);
+        Ok(admitted)
+    }
+
+    /// POST a body with an explicit bearer, bypassing the session entirely —
+    /// the deliberate bad-token probe, which must never trigger a refresh.
+    pub async fn send_with_token(&self, token: &str, body: Value) -> Result<Admission> {
+        let admitted = self.api.command(token, body.clone()).await?;
+        self.log_admission(&body, &admitted);
+        Ok(admitted)
+    }
+
+    fn log_admission(&self, body: &Value, admitted: &Admission) {
+        let kind = body.get("type").and_then(Value::as_str).unwrap_or("?");
         if admitted.ok() {
             log::line(
                 &self.label,
@@ -237,8 +304,6 @@ impl Player {
                 ),
             );
         }
-        let _ = command_id;
-        Ok(admitted)
     }
 
     /// POST and require both admission and application — the deterministic path
@@ -309,13 +374,23 @@ impl Player {
     // ── inspection ───────────────────────────────────────────────────────
 
     pub async fn state(&self) -> Result<Value> {
-        self.api.state(&self.token).await
+        self.state_with(true).await
     }
 
     /// The same read without printing the exchange — the background poller uses
     /// this so its once-per-tick requests do not bury the user's own commands.
     pub async fn state_quiet(&self) -> Result<Value> {
-        self.api.state_quiet(&self.token).await
+        self.state_with(false).await
+    }
+
+    async fn state_with(&self, verbose: bool) -> Result<Value> {
+        let bearer = self.session.access().await?;
+        let (mut status, mut body) = self.api.state_response(&bearer, verbose).await?;
+        if status == StatusCode::UNAUTHORIZED && self.session.refresh_after_401(&bearer).await? {
+            let bearer = self.session.access().await?;
+            (status, body) = self.api.state_response(&bearer, verbose).await?;
+        }
+        checked("GET /api/ranked/state", status, body)
     }
 
     /// This caller's active match, if any.
@@ -337,12 +412,22 @@ impl Player {
 
     /// One page of this caller's events, from `after`.
     pub async fn events(&self, after: i64) -> Result<Value> {
-        self.api.events(&self.token, after).await
+        self.events_with(after, true).await
     }
 
     /// The same long-poll without printing the exchange, for the poller.
     pub async fn events_quiet(&self, after: i64) -> Result<Value> {
-        self.api.events_quiet(&self.token, after).await
+        self.events_with(after, false).await
+    }
+
+    async fn events_with(&self, after: i64, verbose: bool) -> Result<Value> {
+        let bearer = self.session.access().await?;
+        let (mut status, mut body) = self.api.events_response(&bearer, after, verbose).await?;
+        if status == StatusCode::UNAUTHORIZED && self.session.refresh_after_401(&bearer).await? {
+            let bearer = self.session.access().await?;
+            (status, body) = self.api.events_response(&bearer, after, verbose).await?;
+        }
+        checked("GET /api/events", status, body)
     }
 
     // ── waiting ──────────────────────────────────────────────────────────
@@ -427,6 +512,18 @@ impl Player {
             }
         }
     }
+}
+
+/// Judge a read's status: 401 as the typed [`NativeUnauthorized`], any other
+/// refusal with its status and error code, success as the body.
+fn checked(what: &'static str, status: StatusCode, body: Value) -> Result<Value> {
+    if status == StatusCode::UNAUTHORIZED {
+        return Err(NativeUnauthorized { what }.into());
+    }
+    if !status.is_success() {
+        bail!("{what} -> {status}{}", detail(&body));
+    }
+    Ok(body)
 }
 
 /// Find the terminal result for `match_token` in one event page, if present.
