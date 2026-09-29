@@ -93,6 +93,29 @@ need a POSIX shell. Use WSL2 or Git Bash, or run the server directly:
 | GET | `/steam/{action}/{params}` | Steam protocol hand-off: serves an interstitial that launches `steam://{action}/{params}` (allowlisted action+app only) |
 | POST | `/internal/game-result/{token}/{secret}` | Gameserver result webhook; the URL itself is the auth |
 
+Native and ranked surface (used by `umvc3-client`, not by the web demo):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/ticket` | Steam ticket -> native session `{access_token, expires_in: 3600}` (rate-limited 10/min per IP) |
+| POST | `/api/command` | Native client: one queue/match command; idempotent by `command_id` |
+| GET | `/api/events` | Native client: long-poll event feed (~25s hold) from a cursor |
+| GET | `/api/ranked/state` | Caller's queue entry, active match, and command receipts |
+| POST | `/api/logout` | Revoke the current session (browser or native) |
+| POST | `/api/logout-all` | Revoke every session for the account |
+| GET | `/api/session` | The current browser session (cookie auth) |
+| POST | `/api/link/intent`, `/api/link/confirm` | Browser-side account linking (Discord) |
+| POST | `/api/link/native/start`, `/api/link/native/confirm` | The same for a native session |
+| POST | `/api/link/revoke` | Unlink a provider |
+| GET | `/modes` | The modes the server actually runs (the demo builds its dropdown from this) |
+| GET | `/ready` | Readiness: DB reachable, so a provider outage does not drain the service |
+| GET | `/api/leaderboard/{game_mode}` | Every rated player for a mode, by `mu - 3*sigma`; 404 for an unknown mode |
+| GET | `/api/player/{player_id}` | Profile: linked providers, per-mode ratings, recent matches; 404 for an unknown id |
+
+Device login (`/api/device/*`) is **not implemented**. `umvc3-client` targets the
+proposed contract in [`docs/device-login.md`](docs/device-login.md), which also
+explains why Steam ticket auth cannot serve a third-party mod.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DATABASE_URL` | `postgres://lobby:lobby@localhost:5432/lobby` | PostgreSQL connection string |
@@ -293,6 +316,9 @@ Every pairing, accept, and decline is appended to the `match_events` audit table
 | lobby-server | `gameserver.rs` | Gameserver creator client |
 | lobby-server | `rate_limit.rs` | Rate limiter |
 | lobby-client | `lib.rs` | WS client + `ServerEvent` types (demo + integration tests) |
+| lobby-macros | `lib.rs` | Proc-macro crate backing the wire types |
+| umvc3-client | `src/main.rs`, `src/repl.rs`, `src/player.rs` | Reference native client: CLI, interactive shell, player commands |
+| umvc3-client | `src/session.rs`, `src/ini.rs`, `src/api.rs` | Refreshable credential state machine, private token file, HTTP surface |
 | tests | `lobby-core/tests/` | Common mocks + lifecycle/player/rating suites |
 | tests | `lobby-server/tests/` | Integration suite + common harness |
 
@@ -490,6 +516,13 @@ any external service. In production set `GAMESERVER_CREATOR_URL` and `PUBLIC_URL
 **Unit tests** (no Postgres needed): `just test` — the match-lifecycle /
 rating / player-state suites in `lobby-core/tests/` using in-memory mock
 stores.
+
+**Native client** (no Postgres, no Temporal, no network):
+`cargo test -p umvc3-client` — unit tests beside the code, plus
+`umvc3-client/tests/device_session.rs`, which drives the built binary against an
+in-process mock of the device-login contract and asserts that no credential ever
+reaches the transcript. The contract it encodes is in
+[`docs/device-login.md`](docs/device-login.md).
 
 **Integration tests** (Postgres + Temporal needed): `just db-up` and
 `just temporal-up`, then `cargo test -p lobby-server -- --test-threads 4` —
