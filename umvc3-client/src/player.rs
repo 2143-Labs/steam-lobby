@@ -374,23 +374,58 @@ impl Player {
     // ── inspection ───────────────────────────────────────────────────────
 
     pub async fn state(&self) -> Result<Value> {
-        self.state_with(true).await
+        self.state_with(true).await.1
     }
 
     /// The same read without printing the exchange — the background poller uses
     /// this so its once-per-tick requests do not bury the user's own commands.
     pub async fn state_quiet(&self) -> Result<Value> {
+        self.state_with(false).await.1
+    }
+
+    /// The poller's read, plus the bearer the final attempt used. That bearer
+    /// comes back even on failure, so a 401 can be attributed to the exact
+    /// credential that was refused — which is how the shell tells a stale
+    /// success (one authorized before the refusal) from a real recovery.
+    pub async fn state_watch(&self) -> (String, Result<Value>) {
         self.state_with(false).await
     }
 
-    async fn state_with(&self, verbose: bool) -> Result<Value> {
-        let bearer = self.session.access().await?;
-        let (mut status, mut body) = self.api.state_response(&bearer, verbose).await?;
-        if status == StatusCode::UNAUTHORIZED && self.session.refresh_after_401(&bearer).await? {
-            let bearer = self.session.access().await?;
-            (status, body) = self.api.state_response(&bearer, verbose).await?;
+    async fn state_with(&self, verbose: bool) -> (String, Result<Value>) {
+        let mut bearer = match self.session.access().await {
+            Ok(bearer) => bearer,
+            Err(error) => return (String::new(), Err(error)),
+        };
+        let mut response = match self.api.state_response(&bearer, verbose).await {
+            Ok(response) => response,
+            Err(error) => return (bearer, Err(error)),
+        };
+        if response.0 == StatusCode::UNAUTHORIZED {
+            match self.retry_bearer(&bearer).await {
+                Ok(Some(fresh)) => {
+                    bearer = fresh;
+                    response = match self.api.state_response(&bearer, verbose).await {
+                        Ok(response) => response,
+                        Err(error) => return (bearer, Err(error)),
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => return (bearer, Err(error)),
+            }
         }
-        checked("GET /api/ranked/state", status, body)
+        let (status, body) = response;
+        let result = checked("GET /api/ranked/state", status, body);
+        (bearer, result)
+    }
+
+    /// After a 401 made with `observed`: the credential to replay with, or
+    /// `None` when nothing refreshed — a session paused by an access-only
+    /// logout, a dev session, or another reader that got there first.
+    async fn retry_bearer(&self, observed: &str) -> Result<Option<String>> {
+        if !self.session.refresh_after_401(observed).await? {
+            return Ok(None);
+        }
+        Ok(Some(self.session.access().await?))
     }
 
     /// This caller's active match, if any.
@@ -410,24 +445,41 @@ impl Player {
         Ok(self.state().await?["cursor"].as_i64().unwrap_or(0))
     }
 
-    /// One page of this caller's events, from `after`.
     pub async fn events(&self, after: i64) -> Result<Value> {
-        self.events_with(after, true).await
+        self.events_with(after, true).await.1
     }
 
-    /// The same long-poll without printing the exchange, for the poller.
-    pub async fn events_quiet(&self, after: i64) -> Result<Value> {
+    /// The reader's long-poll plus the bearer the final attempt used; see
+    /// `state_watch` for why the bearer returns on failure too.
+    pub async fn events_watch(&self, after: i64) -> (String, Result<Value>) {
         self.events_with(after, false).await
     }
 
-    async fn events_with(&self, after: i64, verbose: bool) -> Result<Value> {
-        let bearer = self.session.access().await?;
-        let (mut status, mut body) = self.api.events_response(&bearer, after, verbose).await?;
-        if status == StatusCode::UNAUTHORIZED && self.session.refresh_after_401(&bearer).await? {
-            let bearer = self.session.access().await?;
-            (status, body) = self.api.events_response(&bearer, after, verbose).await?;
+    async fn events_with(&self, after: i64, verbose: bool) -> (String, Result<Value>) {
+        let mut bearer = match self.session.access().await {
+            Ok(bearer) => bearer,
+            Err(error) => return (String::new(), Err(error)),
+        };
+        let mut response = match self.api.events_response(&bearer, after, verbose).await {
+            Ok(response) => response,
+            Err(error) => return (bearer, Err(error)),
+        };
+        if response.0 == StatusCode::UNAUTHORIZED {
+            match self.retry_bearer(&bearer).await {
+                Ok(Some(fresh)) => {
+                    bearer = fresh;
+                    response = match self.api.events_response(&bearer, after, verbose).await {
+                        Ok(response) => response,
+                        Err(error) => return (bearer, Err(error)),
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => return (bearer, Err(error)),
+            }
         }
-        checked("GET /api/events", status, body)
+        let (status, body) = response;
+        let result = checked("GET /api/events", status, body);
+        (bearer, result)
     }
 
     // ── waiting ──────────────────────────────────────────────────────────

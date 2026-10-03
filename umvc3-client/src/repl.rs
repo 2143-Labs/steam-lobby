@@ -27,16 +27,16 @@ enum FailureKind {
 /// What a background reader tells the shell, tagged with the player's index.
 enum EventMsg {
     Event { index: usize, value: Value },
-    Unauthorized { index: usize },
+    Unauthorized { index: usize, bearer: String },
     Failed { index: usize, kind: FailureKind },
-    Recovered { index: usize },
+    Recovered { index: usize, bearer: String },
 }
 
 impl EventMsg {
     /// Classify a failed read by type, not by parsing its message.
-    fn failure(index: usize, error: &anyhow::Error) -> Self {
+    fn failure(index: usize, bearer: String, error: &anyhow::Error) -> Self {
         if error.downcast_ref::<NativeUnauthorized>().is_some() {
-            Self::Unauthorized { index }
+            Self::Unauthorized { index, bearer }
         } else if error.downcast_ref::<RefreshFailed>().is_some() {
             Self::Failed {
                 index,
@@ -52,9 +52,12 @@ impl EventMsg {
 }
 
 /// A player's background connection trouble; absent means healthy.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// `Unauthorized` remembers *which* credential was refused, because a read the
+/// server admitted before a logout still answers 200 afterwards.
+#[derive(Clone, PartialEq, Eq)]
 enum Connection {
-    Unauthorized,
+    Unauthorized { bearer: String },
     Failed(FailureKind),
 }
 
@@ -239,7 +242,8 @@ impl Shell {
             let mut cursor = self.cursors[index];
             self.event_readers.push(tokio::spawn(async move {
                 loop {
-                    let message = match player.events_quiet(cursor).await {
+                    let (bearer, outcome) = player.events_watch(cursor).await;
+                    let message = match outcome {
                         Ok(page) => {
                             cursor = page["next_cursor"].as_i64().unwrap_or(cursor);
                             for value in page["events"].as_array().into_iter().flatten() {
@@ -248,12 +252,12 @@ impl Shell {
                                     return;
                                 }
                             }
-                            EventMsg::Recovered { index }
+                            EventMsg::Recovered { index, bearer }
                         }
                         // Keep trying, so a revoked or refused session is reported
                         // once and its recovery is noticed; never log in from here.
                         Err(error) => {
-                            let message = EventMsg::failure(index, &error);
+                            let message = EventMsg::failure(index, bearer, &error);
                             if tx.send(message).is_err() {
                                 return;
                             }
@@ -279,14 +283,27 @@ impl Shell {
     fn receive(&mut self, message: EventMsg) {
         match message {
             EventMsg::Event { index, value } => self.report_event(index, &value),
-            EventMsg::Unauthorized { index } => {
-                self.report_connection(index, Some(Connection::Unauthorized));
+            EventMsg::Unauthorized { index, bearer } => {
+                self.report_connection(index, Some(Connection::Unauthorized { bearer }));
             }
             EventMsg::Failed { index, kind } => {
                 self.report_connection(index, Some(Connection::Failed(kind)));
             }
-            EventMsg::Recovered { index } => self.report_connection(index, None),
+            EventMsg::Recovered { index, bearer } => self.report_recovery(index, &bearer),
         }
+    }
+
+    /// A successful read is only a recovery when the credential it used is not
+    /// the one already refused. A read admitted before a logout — or a revoke —
+    /// still answers 200 afterwards, and claiming "recovered" there would be a
+    /// lie that the very next poll contradicts.
+    fn report_recovery(&mut self, index: usize, bearer: &str) {
+        if let Some(Connection::Unauthorized { bearer: refused }) = self.connection.get(&index)
+            && refused.as_str() == bearer
+        {
+            return;
+        }
+        self.report_connection(index, None);
     }
 
     fn report_event(&mut self, index: usize, event: &Value) {
@@ -305,11 +322,11 @@ impl Shell {
     /// Speak only when a player's background connection changes state, so a
     /// dead session reads as one line rather than one per poll.
     fn report_connection(&mut self, index: usize, state: Option<Connection>) {
-        if self.connection.get(&index).copied() == state {
+        if self.connection.get(&index).cloned() == state {
             return;
         }
         let message = match state {
-            Some(Connection::Unauthorized) => "session unauthorized (401)",
+            Some(Connection::Unauthorized { .. }) => "session unauthorized (401)",
             Some(Connection::Failed(FailureKind::Transport)) => {
                 "background read failed (transport); retrying quietly"
             }
@@ -330,15 +347,16 @@ impl Shell {
     /// the transcript shows transitions rather than a heartbeat.
     async fn poll_states(&mut self) {
         for index in 0..self.players.len() {
-            let snapshot = match self.players[index].state_quiet().await {
+            let (bearer, outcome) = self.players[index].state_watch().await;
+            let snapshot = match outcome {
                 Ok(snapshot) => {
-                    self.report_connection(index, None);
+                    self.report_recovery(index, &bearer);
                     snapshot
                 }
                 // The poller stays silent on the wire by design; a failure is
                 // reported once per transition, not every tick.
                 Err(error) => {
-                    self.receive(EventMsg::failure(index, &error));
+                    self.receive(EventMsg::failure(index, bearer, &error));
                     continue;
                 }
             };

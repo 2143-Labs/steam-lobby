@@ -63,6 +63,26 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
+  client-tests:
+    # Scoped to umvc3-client on purpose: it needs no Postgres and no Temporal,
+    # so it is the one suite that can gate every push. The workspace-wide suite
+    # (`just test`) still needs both and is not run here.
+    #
+    # Read-only, but it does execute repository code, so it keeps the build
+    # job's fork guard: a fork PR must not run on the self-hosted runner.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: [self-hosted, nixos]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test, lint and format-check the native client
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix-shell shell.nix --run "cargo test -p umvc3-client && cargo clippy -p umvc3-client --all-targets -- -D warnings && cargo fmt -p umvc3-client -- --check"
+
   promote-reference:
     needs: build
     if: github.event_name == 'workflow_dispatch' && inputs.target == 'reference'

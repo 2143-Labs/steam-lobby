@@ -22,11 +22,12 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 
 // ── canaries ─────────────────────────────────────────────────────────────
 //
@@ -91,6 +92,19 @@ struct Fixture {
     /// How `/api/device/{code}/approve` answers.
     approve: Mutex<StatusCode>,
     hits: Mutex<Vec<Hit>>,
+    /// When set, the next admitted `/api/events` response is withheld until
+    /// `Mock::release_events`, so a read the server admits can be answered
+    /// after the session that made it was ended.
+    hold_events: AtomicBool,
+    /// Set while that response is being withheld.
+    events_held: AtomicBool,
+    /// Released by the test to let the withheld response through.
+    release_events: Notify,
+    /// When set, the next admitted `/api/events` page carries one event, so
+    /// the read that follows a stale success is identifiable.
+    announce_stale: AtomicBool,
+    /// Where the refresh grant is told to redirect, when it should be.
+    redirect_token_to: Mutex<Option<String>>,
 }
 
 impl Fixture {
@@ -194,6 +208,14 @@ fn decide(
             }
             Some("refresh_token") => {
                 fixture.grants.fetch_add(1, Ordering::SeqCst);
+                if fixture
+                    .redirect_token_to
+                    .lock()
+                    .expect("read the redirect")
+                    .is_some()
+                {
+                    return (StatusCode::TEMPORARY_REDIRECT, Value::Null, None);
+                }
                 match *fixture.refresh.lock().expect("read the refresh reply") {
                     Refresh::Issue => {
                         let (status, body) = mint(fixture, None);
@@ -243,11 +265,21 @@ fn decide(
             ),
         },
         ("GET", "/api/events") => match bearer {
-            Some(bearer) if fixture.valid(bearer) => (
-                StatusCode::OK,
-                json!({ "events": [], "next_cursor": 0 }),
-                Some(Duration::from_millis(500)),
-            ),
+            Some(bearer) if fixture.valid(bearer) => {
+                // One poll can be told to carry an identifiable event, so the
+                // read that follows a stale success is visible in the
+                // transcript and can act as the barrier for an absence check.
+                let events = if fixture.announce_stale.swap(false, Ordering::SeqCst) {
+                    json!([{ "sequence_no": 4242, "type": "stale", "payload": {} }])
+                } else {
+                    json!([])
+                };
+                (
+                    StatusCode::OK,
+                    json!({ "events": events, "next_cursor": 0 }),
+                    Some(Duration::from_millis(500)),
+                )
+            }
             _ => (
                 StatusCode::UNAUTHORIZED,
                 json!({ "error": "native_session_required" }),
@@ -276,16 +308,34 @@ fn decide(
                 ),
             }
         }
+        // Only reachable if a client follows the redirect the mock handed it.
+        ("POST", "/sentinel") => (
+            StatusCode::OK,
+            json!({
+                "access_token": "ACCESS-LEAKED-VIA-REDIRECT",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            }),
+            None,
+        ),
         _ => (StatusCode::NOT_FOUND, json!({}), None),
     }
 }
 
-fn render(status: StatusCode, body: Value) -> Response {
+fn render(status: StatusCode, body: Value, location: Option<String>) -> Response {
     if status == StatusCode::NO_CONTENT {
         return status.into_response();
     }
     let bytes = serde_json::to_vec(&body).unwrap_or_default();
-    (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(location) = location {
+        builder = builder.header(header::LOCATION, location);
+    }
+    builder
+        .body(Body::from(bytes))
+        .expect("build the mock response")
 }
 
 async fn answer(
@@ -302,16 +352,31 @@ async fn answer(
     let path = uri.path().to_string();
     let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let (status, body, delay) = decide(&fixture, &method, &path, bearer.as_deref(), &request);
+    let location = if status == StatusCode::TEMPORARY_REDIRECT {
+        fixture
+            .redirect_token_to
+            .lock()
+            .expect("read the redirect")
+            .clone()
+    } else {
+        None
+    };
+    // An admitted long-poll is held, not slept on, so the test can end the
+    // session while the response is still outstanding.
+    let held = delay.is_some() && fixture.hold_events.swap(false, Ordering::SeqCst);
     fixture.hits.lock().expect("record the request").push(Hit {
         path,
         bearer,
         body: request,
         status,
     });
-    if let Some(delay) = delay {
+    if held {
+        fixture.events_held.store(true, Ordering::SeqCst);
+        fixture.release_events.notified().await;
+    } else if let Some(delay) = delay {
         tokio::time::sleep(delay).await;
     }
-    render(status, body)
+    render(status, body, location)
 }
 
 /// A loopback mock of the device contract, on its own thread and port, so no
@@ -335,6 +400,11 @@ impl Mock {
             command_401: AtomicUsize::new(0),
             approve: Mutex::new(StatusCode::FORBIDDEN),
             hits: Mutex::new(Vec::new()),
+            hold_events: AtomicBool::new(false),
+            events_held: AtomicBool::new(false),
+            release_events: Notify::new(),
+            announce_stale: AtomicBool::new(false),
+            redirect_token_to: Mutex::new(None),
         });
         let served = Arc::clone(&fixture);
         let (ready, waiting) = mpsc::channel();
@@ -391,6 +461,45 @@ impl Mock {
             .lock()
             .expect("revoke the bearer")
             .insert(bearer.to_string());
+    }
+
+    /// Withhold the next admitted `/api/events` response until released.
+    fn hold_next_event(&self) {
+        self.fixture.hold_events.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the mock is currently withholding such a response.
+    fn events_held(&self) -> bool {
+        self.fixture.events_held.load(Ordering::SeqCst)
+    }
+
+    /// Let the withheld response through.
+    fn release_events(&self) {
+        self.fixture.release_events.notify_one();
+    }
+
+    /// Accept `bearer` again after it was revoked, so the poll that follows a
+    /// stale success can carry a distinguishable event.
+    fn accept_again(&self, bearer: &str) {
+        self.fixture
+            .revoked
+            .lock()
+            .expect("restore the bearer")
+            .remove(bearer);
+    }
+
+    /// Make the next admitted `/api/events` page carry one identifiable event.
+    fn announce_stale_event(&self) {
+        self.fixture.announce_stale.store(true, Ordering::SeqCst);
+    }
+
+    /// Answer the next refresh grant with a `307` redirect to `location`.
+    fn redirect_refresh_to(&self, location: &str) {
+        *self
+            .fixture
+            .redirect_token_to
+            .lock()
+            .expect("write the redirect") = Some(location.to_string());
     }
 
     fn grants(&self) -> usize {
@@ -582,10 +691,20 @@ impl Run {
     }
 
     /// Wait until the transcript has said something exactly `want` times.
+    ///
+    /// `>= want` only waits; the answer is then held to equality, so a line
+    /// that keeps arriving — one per poll — fails here instead of passing.
     fn expect_lines(&mut self, needle: &str, want: usize) -> usize {
         let what = format!("{want}x {needle:?} in the transcript");
         until(&what, || self.count(needle) >= want);
-        self.count(needle)
+        let seen = self.count(needle);
+        assert_eq!(
+            seen,
+            want,
+            "expected {needle:?} exactly {want} time(s) in the transcript, saw {seen}:\n{}",
+            self.transcript()
+        );
+        seen
     }
 
     /// Close stdin and wait for the client to exit on its own.
@@ -1173,4 +1292,121 @@ fn dev_approve_reports_a_steam_required_refusal_without_leaking_the_browser_toke
         .expect("the grant was approved as the local user");
     assert_eq!(approve.path, format!("/api/device/{USER_CODE}/approve"));
     assert_eq!(approve.bearer.as_deref(), Some(BROWSER_TOKEN));
+}
+
+#[test]
+fn a_stale_success_admitted_before_logout_is_not_reported_as_recovery() {
+    let scratch = Scratch::new();
+    let file = scratch.ini();
+    let mock = Mock::start();
+    seed(&file, mock.base(), SEED_REFRESH);
+    // The reader's first long-poll is admitted while the session is still
+    // valid, then held, so the logout below happens strictly with it in
+    // flight: this is a read the server already accepted.
+    mock.hold_next_event();
+
+    let mut run = Run::shell(&shell_argv(&file));
+    run.expect_line("type 'help' for the full command list");
+    until("the admitted long-poll to be held", || mock.events_held());
+    assert_eq!(mock.grants(), 1, "the held read used the resumed session");
+
+    run.send("logout");
+    run.expect_line("= logout");
+    // The dead bearer is named once, by the state poller, while the admitted
+    // long-poll is still outstanding.
+    run.expect_line("session unauthorized (401)");
+
+    // Let the pre-logout read answer 200, and make the next poll carry an
+    // identifiable event: waiting for that event proves the stale 200 was
+    // processed (one sender, in order) before the absence check below.
+    mock.accept_again("ACCESS-1");
+    mock.announce_stale_event();
+    mock.release_events();
+    run.expect_line("event #4242 stale");
+
+    // A 200 on the credential the server just refused is not a recovery — the
+    // log must not claim one, and the one-line 401 stays the whole story.
+    let transcript = run.transcript();
+    absent(
+        &transcript,
+        "session recovered",
+        "a read admitted before the logout is not a recovery",
+    );
+    assert_eq!(
+        run.count("session unauthorized (401)"),
+        1,
+        "the dead session still reads as one line:\n{transcript}"
+    );
+
+    run.send("quit");
+    let (status, transcript) = run.finish();
+    assert!(status.success(), "{transcript}");
+}
+
+#[test]
+fn a_redirect_on_the_refresh_grant_is_never_followed() {
+    let scratch = Scratch::new();
+    let file = scratch.ini();
+    let mock = Mock::start();
+    // A second listener stands in for another origin: if the client followed
+    // the redirect, this is where the refresh body would be replayed.
+    let elsewhere = Mock::start();
+    seed(&file, mock.base(), SEED_REFRESH);
+    let before = ini_text(&file);
+    mock.redirect_refresh_to(&format!("{}/sentinel", elsewhere.base()));
+
+    let run = Run::once(&argv(&[
+        "--token-file",
+        &file.display().to_string(),
+        "--base-url",
+        mock.base(),
+        "--single",
+        "--stage-timeout",
+        "1",
+        "--pair-timeout",
+        "1",
+    ]));
+    let (status, transcript) = run.finish();
+
+    assert!(
+        !status.success(),
+        "a redirect must not become a session:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("307"),
+        "the refusal names the redirect it received:\n{transcript}"
+    );
+    assert_eq!(
+        mock.count("/api/device/token"),
+        1,
+        "one exchange, not a chase"
+    );
+    // The sentinel path the Location named must never be requested, on either
+    // listener: not on the origin that issued the credential, and above all not
+    // on the other origin the redirect pointed at.
+    assert_eq!(
+        elsewhere.count("/sentinel"),
+        0,
+        "the redirect target was requested"
+    );
+    assert_eq!(
+        elsewhere.total(),
+        0,
+        "the refresh credential reached another origin: {:?}",
+        elsewhere
+            .hits()
+            .into_iter()
+            .map(|hit| hit.path)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        ini_text(&file),
+        before,
+        "a refused refresh leaves the saved credential alone"
+    );
+    absent(
+        &transcript,
+        SEED_REFRESH,
+        "the saved credential is a secret",
+    );
 }

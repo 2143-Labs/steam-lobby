@@ -134,8 +134,12 @@ impl Admission {
 
 impl Api {
     pub fn new(base: &str, tag: &str) -> Result<Self> {
+        // No redirects. The device credential travels in the request body, and
+        // reqwest replays a body across a 307/308 to whatever origin the
+        // Location header names — a destination no origin check here can see.
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("build the HTTP client")?;
         Ok(Self {
