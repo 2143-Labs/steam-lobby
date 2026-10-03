@@ -179,18 +179,26 @@ any credential leaves the machine.
 
 ## Known client issues
 
-Found in review of `61581f1`, none fixed yet:
+Found in review of `61581f1`.
 
-1. **Redirects are followed.** `Api::new` sets only a timeout
-   (`umvc3-client/src/api.rs:137-140`), so `reqwest` follows up to 10 hops. A
-   `307`/`308` from `/api/device/token` would replay the refresh credential to
-   the origin named in `Location`. The fix is
-   `.redirect(reqwest::redirect::Policy::none())`.
-2. **A stale read can be reported as recovery.** A long-poll begun before
-   `logout`/`revoke-device` and answered afterwards prints `session recovered`
-   and clears the failure state, because reads carry no generation
-   (`umvc3-client/src/repl.rs:242-251`, `:307-323`). On the real 25s events hold
-   this is close to every logout.
+Fixed in `1f53725`:
+
+1. **Redirects were followed.** `reqwest` follows up to 10 hops by default, and
+   it replays a request body across a `307`/`308`, so a `Location` from
+   `/api/device/token` sent the refresh credential to a server-chosen origin —
+   a destination the origin checks cannot see. `Api::new` now sets
+   `Policy::none()` (`umvc3-client/src/api.rs:140-144`) and a test asserts the
+   credential never reaches a second listener.
+2. **A stale read could be reported as recovery.** A long-poll begun before
+   `logout`/`revoke-device` and answered afterwards printed `session recovered`
+   and cleared the failure state — close to every logout on the real 25s events
+   hold. Reads now report the bearer their final attempt used
+   (`state_watch`/`events_watch`, returned even on failure) and the shell
+   ignores a success whose bearer is the one already refused
+   (`umvc3-client/src/player.rs`, `src/repl.rs:296-307`).
+
+Still open:
+
 3. **`Admission::error_code` is unfiltered.** It returns the server's `error`
    string with no bound (`umvc3-client/src/api.rs:126-128`), unlike every other
    server string, and it is printed to stdout — so a server can forge a
@@ -206,9 +214,18 @@ second time.
 ## Test status
 
 Covered by `umvc3-client/tests/device_session.rs` against an in-process mock of
-this contract (13 subprocess tests) plus unit tests in `api.rs`, `ini.rs` and
-`session.rs`. Not covered: proactive refresh before expiry (every mock uses a
-3600s lifetime), the `slow_down` ladder beyond one step, the `--dev-approve`
-happy path, and scripted/two-player mode.
+this contract (15 subprocess tests) plus 39 unit tests in `api.rs`, `ini.rs` and
+`session.rs`. The client suite runs in CI on every push to `main` and every
+in-repo PR (`client-tests` in `.github/workflows/build.yaml`) — it needs
+neither Postgres nor Temporal, which is why it is the one suite that can gate
+every push.
+
+Not covered: proactive refresh before expiry (every mock uses a 3600s lifetime),
+the `slow_down` ladder beyond one step, the `--dev-approve` happy path, and
+scripted/two-player mode.
+
+`logout_leaves_the_401_visible_until_an_explicit_refresh` flaked once before
+issue 2 was fixed. The deterministic reproduction of that window is now
+`a_stale_success_admitted_before_logout_is_not_reported_as_recovery`.
 
 No test can validate the real server until these routes exist.

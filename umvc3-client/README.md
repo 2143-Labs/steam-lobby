@@ -105,8 +105,8 @@ cargo test -p umvc3-client
 Unit tests live beside the code (`src/api.rs`, `src/ini.rs`, `src/session.rs`);
 `tests/device_session.rs` drives the built binary against an in-process mock of
 the device contract, with canary values asserting that no credential ever reaches
-the transcript. The known client issues — including the timing that makes one of
-those tests flaky — are listed in `docs/device-login.md`.
+the transcript. The suite runs in CI on every push to `main` and every in-repo
+PR, and the review findings behind the tests are in `docs/device-login.md`.
 
 ## Source layout
 
