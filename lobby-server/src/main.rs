@@ -102,7 +102,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .filter(|s| !s.is_empty())
                     .collect()
             })
-            .unwrap_or_else(|_| vec!["turn:turn.john2143.com:3478?transport=udp".into()]),
+            .unwrap_or_else(|_| {
+                vec![
+                    "turn:s1.edge.2143.me:3478?transport=udp".into(),
+                    "turn:s2.edge.2143.me:3478?transport=udp".into(),
+                ]
+            }),
         temporal_address: std::env::var("TEMPORAL_ADDRESS")
             .unwrap_or_else(|_| "http://localhost:7233".into()),
         temporal_namespace: std::env::var("TEMPORAL_NAMESPACE").unwrap_or_else(|_| "pvp".into()),
