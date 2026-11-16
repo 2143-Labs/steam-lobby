@@ -132,7 +132,7 @@ explains why Steam ticket auth cannot serve a third-party mod.
 | `LOBBY_HOST` | `0.0.0.0` | Bind address |
 | `LOBBY_PORT` | `8080` | Bind port |
 | `PUBLIC_URL` | — | Required for Steam OpenID login (absolute public origin); login returns `400` without it |
-| `GAME_MODES` | `pong_1v1:p2p,server_arena:server` | Comma-separated `mode:type` pairs; `type` = `p2p` \| `server` |
+| `GAME_MODES` | `pong_1v1:p2p,rps_1v1:p2p,server_arena:server` | Comma-separated `mode:type` pairs; `type` = `p2p` \| `server`. An unknown mode stops startup |
 | `GAMESERVER_CREATOR_URL` | — | Absolute URL of the gameserver creator's allocate endpoint (required for server modes) |
 | `GAMESERVER_ALLOC_TIMEOUT_S` | `60` | Seconds before an unallocated server match is disputed |
 | `GAMESERVER_RESULT_TIMEOUT_S` | `300` | Seconds after the server is ready before a missing result is disputed |
@@ -570,7 +570,10 @@ gh workflow run server --field target=timestone
 
 `target=timestone` pins the image digest into `2143-Labs/timestone-argo`, which
 ArgoCD syncs to `umvc3-ranked.hero-rehab.xyz`. `target=reference` updates the
-image tag in `2143-Labs/argo` for `pvp.john2143.com`. Each target runs in a
+image tag in `2143-Labs/argo` for `pvp.john2143.com`, and on every run also
+sets that Deployment's `GAME_MODES` to `pong_1v1:p2p,rps_1v1:p2p` and its
+strategy to `Recreate`: hand edits to either in argo are overwritten by the
+next promotion, so change them in this workflow instead. Each target runs in a
 `main`-restricted GitHub Environment of the same name, so only `main` can
 deploy and each target's deploy key is scoped to its own environment.
 
