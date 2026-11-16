@@ -574,6 +574,11 @@ image tag in `2143-Labs/argo` for `pvp.john2143.com`. Each target runs in a
 `main`-restricted GitHub Environment of the same name, so only `main` can
 deploy and each target's deploy key is scoped to its own environment.
 
+The image build bakes dependencies from a stub copy of every workspace member,
+so adding a crate means adding its manifest and stub to the `Dockerfile` too.
+`scripts/check-dockerfile-members.sh` checks that layer against the workspace
+and runs as the first step of the `build` job.
+
 ## Web Demo
 
 `web/index.html` is a zero-dependency browser client (native `fetch` +
