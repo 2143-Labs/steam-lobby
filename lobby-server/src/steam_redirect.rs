@@ -31,7 +31,7 @@ fn resolve_redirect(action: &str, params: &[&str]) -> Option<String> {
 fn app_notice(app: &str) -> Option<&'static str> {
     match app {
         "357190" => Some(
-            r#"<p class="req">You need <a href="https://store.steampowered.com/app/357190/" target="_blank" rel="noopener">Ultimate Marvel vs. Capcom 3</a> and <a href="https://hero.rehab/" target="_blank" rel="noopener">Timestone</a> (hero.rehab) installed to join this game.</p>"#,
+            r#"<p class="req">You need <a href="https://store.steampowered.com/app/357190/" target="_blank" rel="noopener">Ultimate Marvel vs. Capcom 3</a> and <a href="https://hero.rehab/" target="_blank" rel="noopener">Timestone</a> installed to join this game.</p>"#,
         ),
         _ => None,
     }
