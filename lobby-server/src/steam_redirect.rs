@@ -6,7 +6,8 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 
 /// Allowlisted (steam action, permitted app ids). The hand-off target is
-/// `steam://{action}/{app}/{…params}`. Extend this list; nothing else changes.
+/// `steam://{action}/{app}/{…params}`. Extend this list. A new app gets the
+/// plain page; add it to `app_notice` for the notice and auto-open.
 const ALLOWLIST: &[(&str, &[u32])] = &[("joinlobby", &[357190])];
 
 /// Validate (action, params) against the allowlist and return the steam URI.
@@ -25,6 +26,50 @@ fn resolve_redirect(action: &str, params: &[&str]) -> Option<String> {
     Some(format!("steam://{action}/{}", params.join("/")))
 }
 
+/// What a visitor needs installed before the hand-off can work. `None` for an
+/// app without one; such an app also gets no auto-open (see AUTOJOIN).
+fn app_notice(app: &str) -> Option<&'static str> {
+    match app {
+        "357190" => Some(
+            r#"<p class="req">You need <a href="https://store.steampowered.com/app/357190/" target="_blank" rel="noopener">Ultimate Marvel vs. Capcom 3</a> and <a href="https://hero.rehab/" target="_blank" rel="noopener">Timestone</a> (hero.rehab) installed to join this game.</p>"#,
+        ),
+        _ => None,
+    }
+}
+
+/// Remembers a Join click per app in localStorage and, on later visits, opens
+/// the steam:// link on load. Only rendered for apps with an `app_notice`.
+const AUTOJOIN: &str = r#"<p class="auto" id="auto" hidden>Opening Steam&hellip;</p>
+    <script>
+    (function () {
+      var uri = "__STEAM_URI__";
+      var key = "autojoin:__APP__";
+      try {
+        if (localStorage.getItem(key) === "1") {
+          document.getElementById("auto").hidden = false;
+          location.href = uri;
+        }
+      } catch (e) {}
+      document.getElementById("join").addEventListener("click", function () {
+        try { localStorage.setItem(key, "1"); } catch (e) {}
+      });
+    })();
+    </script>"#;
+
+/// Fill INTERSTITIAL for `uri`. The per-app extras go in first because
+/// AUTOJOIN itself carries `__STEAM_URI__` and `__APP__`.
+fn render_interstitial(uri: &str, app: &str) -> String {
+    let (notice, autojoin) = match app_notice(app) {
+        Some(notice) => (notice, AUTOJOIN),
+        None => ("", ""),
+    };
+    INTERSTITIAL
+        .replace("__NOTICE__", notice)
+        .replace("__AUTOJOIN__", autojoin)
+        .replace("__STEAM_URI__", uri)
+        .replace("__APP__", app)
+}
+
 /// GET /steam/{action}/{params…} → interstitial page that launches
 /// `steam://{action}/{params…}`. Anything not on the allowlist 404s.
 pub async fn steam_redirect(Path(rest): Path<String>) -> Response {
@@ -39,7 +84,7 @@ pub async fn steam_redirect(Path(rest): Path<String>) -> Response {
     debug_assert!(uri
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == ':'));
-    let html = INTERSTITIAL.replace("__STEAM_URI__", &uri);
+    let html = render_interstitial(&uri, params[0]);
     (
         [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
         Html(html),
@@ -48,8 +93,9 @@ pub async fn steam_redirect(Path(rest): Path<String>) -> Response {
 }
 
 /// Interstitial shown before handing off to the Steam client: a Steam-styled
-/// page with a single Join button. The `__STEAM_URI__` placeholder appears
-/// once (the button href) and `.replace` swaps it.
+/// page with a Join button. Placeholders `__NOTICE__`, `__AUTOJOIN__` and
+/// `__STEAM_URI__` (the button href) are filled by `render_interstitial`,
+/// along with the `__APP__` inside AUTOJOIN.
 const INTERSTITIAL: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -63,25 +109,30 @@ const INTERSTITIAL: &str = r#"<!doctype html>
          font-family: "Motiva Sans", Arial, Helvetica, sans-serif; }
   .card { text-align: center; padding: 2rem; }
   h1 { color: #ffffff; font-size: 1.4rem; font-weight: 400;
-       letter-spacing: 0.03em; margin: 0 0 2rem; }
+       letter-spacing: 0.03em; margin: 0 0 1.25rem; }
   a.btn { display: inline-block; padding: 0.8rem 3.5rem; border-radius: 2px;
           background: linear-gradient(to bottom, #75b022, #588a1b);
           color: #ffffff; font-size: 1.1rem; text-decoration: none;
           text-shadow: 0 1px 0 rgba(0, 0, 0, 0.4); }
   a.btn:hover { filter: brightness(1.1); }
+  p.req { max-width: 28rem; margin: 0 auto 1.5rem; line-height: 1.5; }
+  p.req a { color: #66c0f4; }
+  p.auto { margin: 1.25rem 0 0; font-size: 0.9rem; }
 </style>
 </head>
 <body>
   <main class="card">
     <h1>Join the Steam lobby</h1>
-    <a class="btn" href="__STEAM_URI__">Join</a>
+    __NOTICE__
+    <a class="btn" id="join" href="__STEAM_URI__">Join</a>
+    __AUTOJOIN__
   </main>
 </body>
 </html>"#;
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_redirect;
+    use super::{app_notice, render_interstitial, resolve_redirect};
 
     #[test]
     fn resolve_redirect_table() {
@@ -126,5 +177,38 @@ mod tests {
                 "action={action:?}, params={params:?}"
             );
         }
+    }
+
+    #[test]
+    fn interstitial_umvc3_notice_and_autojoin() {
+        let html = render_interstitial(
+            "steam://joinlobby/357190/109775244080946091/76561198027378405",
+            "357190",
+        );
+        assert!(
+            html.contains(
+                r#"href="steam://joinlobby/357190/109775244080946091/76561198027378405""#
+            )
+        );
+        assert!(html.contains(
+            r#"var uri = "steam://joinlobby/357190/109775244080946091/76561198027378405";"#
+        ));
+        assert!(html.contains("https://store.steampowered.com/app/357190/"));
+        assert!(html.contains("https://hero.rehab/"));
+        assert!(html.contains("installed to join this game."));
+        assert!(html.contains(r#"var key = "autojoin:357190";"#));
+        assert!(html.contains("localStorage.setItem(key, \"1\")"));
+        assert!(!html.contains("__"), "placeholder left behind");
+    }
+
+    #[test]
+    fn interstitial_other_app_is_plain() {
+        assert!(app_notice("480").is_none());
+        let html = render_interstitial("steam://joinlobby/480/1", "480");
+        assert!(html.contains(r#"href="steam://joinlobby/480/1""#));
+        assert!(!html.contains("class=\"req\""));
+        assert!(!html.contains("<script"));
+        assert!(!html.contains("localStorage"));
+        assert!(!html.contains("__"), "placeholder left behind");
     }
 }

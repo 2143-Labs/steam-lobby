@@ -174,8 +174,10 @@ guest accounts are unrecoverable after the JWT expires.
 `/steam/{action}/{params}` is a browser-friendly bridge to the Steam client
 protocol: `https://…/steam/joinlobby/357190/109775244080946091/0` serves an
 interstitial page that launches `steam://joinlobby/357190/109775244080946091/0`.
-interstitial is a Steam-styled page with a single Join button (browsers only
-let a click open another application). Only
+The interstitial is a Steam-styled page with a Join button. For app `357190`
+it also names what to install (UMVC3 on the Steam store, Timestone at
+hero.rehab) and, in a browser where Join was clicked before, opens Steam
+automatically on load (remembered in `localStorage`). Only
 allowlisted combos resolve — currently action `joinlobby` with app `357190`;
 extend `ALLOWLIST` in `lobby-server/src/steam_redirect.rs` to enable more
 (e.g. `run`). Anything else returns `404`.
